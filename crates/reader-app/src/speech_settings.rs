@@ -736,26 +736,28 @@ impl ReaderApp {
             .find(|entry| entry.path == *model_path);
         let mut changed_model = false;
         controls::row(ui, "音声モデル", |ui, label_id| {
+            let width = ui.available_width();
+            let label = selected
+                .map(|entry| format!("{} {}", entry.info.name, entry.info.version))
+                .unwrap_or_else(|| "モデル未選択 / 取得前".into());
             egui::ComboBox::from_id_salt("native-aivis-model")
-                .width(ui.available_width())
-                .selected_text(
-                    selected
-                        .map(|entry| format!("{} {}", entry.info.name, entry.info.version))
-                        .unwrap_or_else(|| "モデル未選択 / 取得前".into()),
-                )
+                .width(width)
+                .truncate()
+                .selected_text(&label)
                 .show_ui(ui, |ui| {
+                    ui.set_width(width);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                     for entry in &catalog.models {
+                        let label = format!("{} {}", entry.info.name, entry.info.version);
                         changed_model |= ui
-                            .selectable_value(
-                                model_path,
-                                entry.path.clone(),
-                                format!("{} {}", entry.info.name, entry.info.version),
-                            )
+                            .selectable_value(model_path, entry.path.clone(), &label)
+                            .on_hover_text(label)
                             .changed();
                     }
                 })
                 .response
-                .labelled_by(label_id);
+                .labelled_by(label_id)
+                .on_hover_text(label);
         });
         let selected = catalog
             .models
@@ -769,26 +771,31 @@ impl ReaderApp {
         if let Some(entry) = selected {
             let mut changed_speaker = false;
             controls::row(ui, "話者", |ui, label_id| {
+                let width = ui.available_width();
+                let label = entry
+                    .info
+                    .speakers
+                    .iter()
+                    .find(|value| value.local_id == *speaker)
+                    .map(|value| value.name.as_str())
+                    .unwrap_or("話者を選択");
                 egui::ComboBox::from_id_salt("native-aivis-speaker")
-                    .width(ui.available_width())
-                    .selected_text(
-                        entry
-                            .info
-                            .speakers
-                            .iter()
-                            .find(|value| value.local_id == *speaker)
-                            .map(|value| value.name.as_str())
-                            .unwrap_or("話者を選択"),
-                    )
+                    .width(width)
+                    .truncate()
+                    .selected_text(label)
                     .show_ui(ui, |ui| {
+                        ui.set_width(width);
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                         for value in &entry.info.speakers {
                             changed_speaker |= ui
                                 .selectable_value(speaker, value.local_id, &value.name)
+                                .on_hover_text(&value.name)
                                 .changed();
                         }
                     })
                     .response
-                    .labelled_by(label_id);
+                    .labelled_by(label_id)
+                    .on_hover_text(label);
             });
             if let Some(voice) = entry
                 .info
@@ -800,23 +807,28 @@ impl ReaderApp {
                     *style = voice.styles[0].local_id;
                 }
                 controls::row(ui, "スタイル", |ui, label_id| {
+                    let width = ui.available_width();
+                    let label = voice
+                        .styles
+                        .iter()
+                        .find(|value| value.local_id == *style)
+                        .map(|value| value.name.as_str())
+                        .unwrap_or("スタイルを選択");
                     egui::ComboBox::from_id_salt("native-aivis-style")
-                        .width(ui.available_width())
-                        .selected_text(
-                            voice
-                                .styles
-                                .iter()
-                                .find(|value| value.local_id == *style)
-                                .map(|value| value.name.as_str())
-                                .unwrap_or("スタイルを選択"),
-                        )
+                        .width(width)
+                        .truncate()
+                        .selected_text(label)
                         .show_ui(ui, |ui| {
+                            ui.set_width(width);
+                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                             for value in &voice.styles {
-                                ui.selectable_value(style, value.local_id, &value.name);
+                                ui.selectable_value(style, value.local_id, &value.name)
+                                    .on_hover_text(&value.name);
                             }
                         })
                         .response
-                        .labelled_by(label_id);
+                        .labelled_by(label_id)
+                        .on_hover_text(label);
                 });
             }
             egui::CollapsingHeader::new("選択したモデルの利用条件").show(ui,|ui|{
@@ -886,8 +898,12 @@ impl ReaderApp {
             controls::check(ui,allow_nvidia_download,"利用条件に同意してNVIDIA GPUランタイムの取得を許可する");
             ui.add(egui::Label::new(RichText::new("未同意でも既存の互換GPUライブラリを利用できます。自動モードでGPUを利用できない場合は同じ音声モデルをCPUで実行します。").size(12.).color(p.muted)).wrap());
             controls::row(ui,"日本語BERT",|ui,label_id|{
-                ui.add(egui::Label::new(bert_dir.display().to_string()).wrap()).labelled_by(label_id);
-                if ui.button("フォルダーを選択").clicked() && let Some(path)=rfd::FileDialog::new().pick_folder() {*bert_dir=path;}
+                let (row, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 32.), egui::Sense::hover());
+                let pick = egui::Rect::from_min_size(egui::pos2(row.right()-132.,row.top()), egui::vec2(132.,32.));
+                let path = egui::Rect::from_min_max(row.min, egui::pos2((pick.left()-8.).max(row.left()), row.bottom()));
+                let full_path = bert_dir.display().to_string();
+                crate::icons::label_at(ui, path, &full_path, egui::Sense::hover()).labelled_by(label_id).on_hover_text(full_path);
+                if ui.place(pick, egui::Button::new("フォルダーを選択")).clicked() && let Some(path)=rfd::FileDialog::new().pick_folder() {*bert_dir=path;}
             });
         });
         if serde_json::to_value(&config).unwrap_or_default() != original {

@@ -3036,3 +3036,230 @@ fn appearance_hex_colors_persist_and_a_preset_clears_overrides_in_the_live_previ
     let output = fixture.panel(size, vec![], |app, ui, p| app.settings_view(ui, p));
     assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Rect(rect) if rect.fill==palette.paper && rect.rect.width()>300.)),"live native surfaces use the selected preset paper");
 }
+
+/// Metadata-only AIVMX: the real catalog reads this bounded protobuf without
+/// loading an ONNX session, neural weights, a runtime, or an audio device.
+fn native_aivis_layout_fixture() -> (TestApp, String, String, String) {
+    fn varint(mut value: usize, out: &mut Vec<u8>) {
+        while value >= 128 {
+            out.push((value as u8) | 128);
+            value >>= 7;
+        }
+        out.push(value as u8);
+    }
+    fn message(field: usize, bytes: &[u8], out: &mut Vec<u8>) {
+        varint((field << 3) | 2, out);
+        varint(bytes.len(), out);
+        out.extend_from_slice(bytes);
+    }
+    let mut fixture = TestApp::new();
+    let name = format!("UI catalog model · {}", "長い日本語モデル名".repeat(18));
+    let speaker_a = format!(
+        "UI speaker alpha · {}",
+        "落ち着いた日本語の話者名".repeat(16)
+    );
+    let speaker_b = format!("UI speaker beta · {}", "別の長い日本語の話者名".repeat(16));
+    let manifest = serde_json::json!({
+        "manifest_version":"1.0", "uuid":"12345678-1234-4234-9234-123456789abc",
+        "name":name, "version":"1.0.0-ui-geometry-fixture", "model_architecture":"Style-Bert-VITS2 (JP-Extra)",
+        "model_format":"ONNX", "license":"UI fixture terms; no real voice or model weights are included.",
+        "speakers":[
+            {"local_id":17,"name":speaker_a,"styles":[{"local_id":8,"name":"UI style alpha · 通常"},{"local_id":19,"name":"UI style alpha · 明瞭"}]},
+            {"local_id":63,"name":speaker_b,"styles":[{"local_id":104,"name":format!("UI style beta calm · {}","長いスタイル名".repeat(20))},{"local_id":209,"name":format!("UI style beta bright · {}","もう一つの長いスタイル名".repeat(16))}]}
+        ]
+    });
+    let mut entry = Vec::new();
+    message(1, b"aivm_manifest", &mut entry);
+    message(2, manifest.to_string().as_bytes(), &mut entry);
+    let mut model = vec![8, 8]; // ONNX IR 8; a graph envelope sufficient for catalog metadata parsing.
+    message(7, &[0], &mut model);
+    message(14, &entry, &mut model);
+    let path = fixture.directory.path().join("metadata-only-ui.aivmx");
+    std::fs::write(&path, model).unwrap();
+    fixture.app.speech_provider = "aivis_native".into();
+    fixture.app.setting_tab = SettingTab::Speech;
+    fixture.app.screen = Screen::Settings;
+    fixture
+        .app
+        .set_aivis_native_config(ProviderConfig::AivisNative {
+            runtime_dir: fixture.directory.path().join("unprepared-runtime"),
+            model_path: path,
+            bert_dir: fixture
+                .directory
+                .path()
+                .join("very-long-japanese-bert-folder")
+                .join("長いフォルダー名と空白を含む BERT data ".repeat(12)),
+            speaker: 17,
+            style: 8,
+            backend: "cpu".into(),
+            auto_download: false,
+            allow_nvidia_download: false,
+        });
+    (fixture, name, speaker_a, speaker_b)
+}
+
+fn native_aivis_catalog_ui(fixture: &mut TestApp, size: egui::Vec2) -> egui::FullOutput {
+    fn contains(shape: &egui::Shape) -> bool {
+        match shape {
+            egui::Shape::Text(text) => text.galley.job.text.starts_with("UI catalog model"),
+            egui::Shape::Vec(shapes) => shapes.iter().any(contains),
+            _ => false,
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let output = fixture.panel(size, vec![], ReaderApp::settings_view);
+        if output.shapes.iter().any(|shape| contains(&shape.shape)) {
+            return output;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "local metadata catalog did not reach native settings"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn native_aivis_long_catalog_names_keep_model_speaker_and_style_selection_inside_settings() {
+    fn matching_text_bounds(shape: &egui::Shape, prefix: &str, out: &mut Vec<Rect>) {
+        match shape {
+            egui::Shape::Text(text) if text.galley.job.text.starts_with(prefix) => {
+                assert_eq!(text.galley.rows.len(), 1);
+                out.push(Rect::from_min_size(text.pos, text.galley.size()));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    matching_text_bounds(shape, prefix, out);
+                }
+            }
+            _ => (),
+        }
+    }
+    for width in [820., 1280.] {
+        let (mut fixture, _, _, _) = native_aivis_layout_fixture();
+        let size = vec2(width, 1800.);
+        let output = native_aivis_catalog_ui(&mut fixture, size);
+        for prefix in ["UI catalog model", "UI speaker alpha", "UI style alpha"] {
+            let bounds = text_bounds(&output, prefix);
+            assert!(
+                bounds.left() >= 228. && bounds.right() <= width - 24. + 0.5,
+                "{prefix} escaped the native settings content at window width {width}: {bounds:?}"
+            );
+        }
+        fixture.panel(
+            size,
+            click(text_bounds(&output, "UI catalog model").center()),
+            ReaderApp::settings_view,
+        );
+        let menu = fixture.panel(size, vec![], ReaderApp::settings_view);
+        let mut choices = Vec::new();
+        for shape in &menu.shapes {
+            matching_text_bounds(&shape.shape, "UI catalog model", &mut choices);
+        }
+        assert!(
+            choices.len() >= 2,
+            "the model popup must display the actual metadata entry"
+        );
+        let choice = choices.last().unwrap();
+        assert!(
+            choice.right() <= width + 0.5,
+            "long model choices must remain inside the window"
+        );
+        fixture.panel(size, click(choice.center()), ReaderApp::settings_view);
+        let output = fixture.panel(size, vec![], ReaderApp::settings_view);
+        let selected = text_bounds(&output, "UI speaker alpha");
+        fixture.panel(size, click(selected.center()), ReaderApp::settings_view);
+        let menu = fixture.panel(size, vec![], ReaderApp::settings_view);
+        let choice = text_bounds(&menu, "UI speaker beta");
+        assert!(
+            choice.right() <= width + 0.5,
+            "long speaker choices must stay inside the window"
+        );
+        fixture.panel(size, click(choice.center()), ReaderApp::settings_view);
+        assert!(matches!(
+            fixture.app.provider_config(),
+            ProviderConfig::AivisNative {
+                speaker: 63,
+                style: 104,
+                ..
+            }
+        ));
+        let output = fixture.panel(size, vec![], ReaderApp::settings_view);
+        let selected = text_bounds(&output, "UI style beta calm");
+        assert!(selected.right() <= width - 24. + 0.5);
+        fixture.panel(size, click(selected.center()), ReaderApp::settings_view);
+        let menu = fixture.panel(size, vec![], ReaderApp::settings_view);
+        let choice = text_bounds(&menu, "UI style beta bright");
+        assert!(
+            choice.right() <= width + 0.5,
+            "long style choices must stay inside the window"
+        );
+        fixture.panel(size, click(choice.center()), ReaderApp::settings_view);
+        assert!(matches!(
+            fixture.app.provider_config(),
+            ProviderConfig::AivisNative {
+                speaker: 63,
+                style: 209,
+                ..
+            }
+        ));
+        assert!(
+            fixture.app.speech.is_none(),
+            "catalog selection must not synthesize or download models"
+        );
+        assert!(!fixture.directory.path().join("unprepared-runtime").exists());
+    }
+}
+
+#[test]
+fn native_aivis_runtime_path_and_consent_controls_stay_clickable_inside_settings() {
+    for width in [820., 1280.] {
+        let (mut fixture, _, _, _) = native_aivis_layout_fixture();
+        let size = vec2(width, 1800.);
+        let output = native_aivis_catalog_ui(&mut fixture, size);
+        let header = text_bounds(&output, "実行設定");
+        fixture.panel(size, click(header.center()), ReaderApp::settings_view);
+        let output = fixture.panel(size, vec![], ReaderApp::settings_view);
+        let pick = text_bounds(&output, "フォルダーを選択");
+        assert!(
+            pick.left() >= 228. && pick.right() <= width - 24. + 0.5,
+            "the BERT picker must remain visible beside a long path at window width {width}: {pick:?}"
+        );
+        let ProviderConfig::AivisNative { bert_dir, .. } = fixture.app.provider_config() else {
+            panic!("native provider changed")
+        };
+        let path = text_bounds(&output, &bert_dir.display().to_string());
+        assert!(
+            path.right() + 4. <= pick.left(),
+            "the clipped path must not draw underneath the picker"
+        );
+        for (prefix, nvidia) in [
+            ("不足するモデル・ランタイムを自動取得する", false),
+            (
+                "利用条件に同意してNVIDIA GPUランタイムの取得を許可する",
+                true,
+            ),
+        ] {
+            let output = fixture.panel(size, vec![], ReaderApp::settings_view);
+            let control = text_bounds(&output, prefix);
+            assert!(control.left() >= 228. && control.right() <= width - 24. + 0.5);
+            fixture.panel(size, click(control.center()), ReaderApp::settings_view);
+            let ProviderConfig::AivisNative {
+                auto_download,
+                allow_nvidia_download,
+                ..
+            } = fixture.app.provider_config()
+            else {
+                panic!("native provider changed")
+            };
+            if nvidia {
+                assert!(allow_nvidia_download);
+            } else {
+                assert!(auto_download);
+            }
+        }
+        assert!(fixture.app.speech.is_none());
+        assert!(!fixture.directory.path().join("unprepared-runtime").exists());
+    }
+}

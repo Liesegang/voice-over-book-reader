@@ -23,7 +23,7 @@ jobs:
   native:
     name: ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       # Standard hosted labels checked against GitHub's runner reference:
@@ -82,12 +82,14 @@ jobs:
         run: cargo +1.97.0 fmt --all --check
 
       - name: Workspace build
-        run: cargo +1.97.0 build --workspace --all-targets --locked --target "${{ matrix.target }}"
+        # Reuse the shipping profile for tests and packages. Building optimized
+        # Japanese dictionaries in both dev and release doubles cold CI work.
+        run: cargo +1.97.0 build --workspace --all-targets --release --locked --target "${{ matrix.target }}"
 
       - name: Offline-capable unit and fixture tests
         # The default tests never synthesize speech, download neural models,
         # open a GUI, or require an audio device. Native PDF/TTS smokes are ignored.
-        run: cargo +1.97.0 test --workspace --all-targets --locked --target "${{ matrix.target }}"
+        run: cargo +1.97.0 test --workspace --all-targets --release --locked --target "${{ matrix.target }}"
 
       - name: Release binaries
         run: cargo +1.97.0 build --workspace --release --bins --locked --target "${{ matrix.target }}"
@@ -96,7 +98,7 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           rustup target add --toolchain 1.97.0 i686-pc-windows-msvc
-          cargo +1.97.0 test -p reader-voiceroid-bridge --locked --target i686-pc-windows-msvc
+          cargo +1.97.0 test -p reader-voiceroid-bridge --release --locked --target i686-pc-windows-msvc
           cargo +1.97.0 build -p reader-voiceroid-bridge --release --locked --target i686-pc-windows-msvc
 
       - name: Packaging fixture tests
