@@ -1084,9 +1084,14 @@ fn shortcut_rows_stay_compact_and_right_aligned_at_narrow_widths() {
         let size = vec2(width, 760.0);
         fixture.panel(size, vec![], ReaderApp::key_settings);
         let output = fixture.panel(size, vec![], ReaderApp::key_settings);
-        let first = text_bounds(&output, "Ctrl+Shift+Alt+O");
-        let second = text_bounds(&output, "Ctrl+Shift+Alt+L");
-        let third = text_bounds(&output, "Ctrl+Shift+Alt+W");
+        let primary = if cfg!(target_os = "macos") {
+            "⌘"
+        } else {
+            "Ctrl"
+        };
+        let first = text_bounds(&output, &format!("{primary}+Shift+Alt+O"));
+        let second = text_bounds(&output, &format!("{primary}+Shift+Alt+L"));
+        let third = text_bounds(&output, &format!("{primary}+Shift+Alt+W"));
         let label_left = text_bounds(&output, Action::Open.label()).left();
         assert!(
             (label_left - 16.).abs() < 1.0,
