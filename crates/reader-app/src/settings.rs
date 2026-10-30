@@ -785,10 +785,6 @@ impl ReaderApp {
                 self.screen = self.previous_screen;
                 self.open_catalog_dialog();
             }
-            if ui.button("翻訳サービス").clicked() {
-                self.screen = self.previous_screen;
-                self.open_translation_settings();
-            }
         });
         controls::section(ui, "保存先", p);
         ui.add(

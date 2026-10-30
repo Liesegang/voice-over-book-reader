@@ -2,6 +2,97 @@ use super::*;
 use reader_library::BookSource;
 use tempfile::TempDir;
 
+#[test]
+fn composed_reader_pages_reuse_idle_geometry_and_invalidate_on_navigation_and_resize() {
+    let mut fixture = TestApp::new();
+    let chapter = reader_core::parse_html(
+        &format!(
+            "<html><body>{}</body></html>",
+            "<p>文字と<ruby>漢字<rt>かんじ</rt></ruby>の組版を確認します。</p>".repeat(160)
+        ),
+        0,
+        "chapter.xhtml",
+        "",
+    )
+    .unwrap();
+    fixture.use_chapter(chapter);
+    fixture.app.settings.spread = reader_library::SpreadMode::Single;
+    let extent = vec2(820., 640.);
+    fixture.render_reader(extent);
+    let first = Arc::clone(&fixture.app.composed_frame.as_ref().unwrap().page);
+    let source = first.first_locator();
+    fixture.render_reader(extent);
+    assert!(Arc::ptr_eq(
+        &first,
+        &fixture.app.composed_frame.as_ref().unwrap().page
+    ));
+    assert_eq!(first.first_locator(), source);
+    fixture.app.turn_page(true);
+    fixture.render_reader(extent);
+    let second = Arc::clone(&fixture.app.composed_frame.as_ref().unwrap().page);
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_ne!(first.first_locator(), second.first_locator());
+    fixture.render_reader(vec2(950., 700.));
+    assert!(!Arc::ptr_eq(
+        &second,
+        &fixture.app.composed_frame.as_ref().unwrap().page
+    ));
+    let resized = Arc::clone(&fixture.app.composed_frame.as_ref().unwrap().page);
+    fixture.app.settings.font_size += 4.;
+    fixture.render_reader(vec2(950., 700.));
+    assert!(!Arc::ptr_eq(
+        &resized,
+        &fixture.app.composed_frame.as_ref().unwrap().page
+    ));
+    let resized_font = Arc::clone(&fixture.app.composed_frame.as_ref().unwrap().page);
+    fixture.app.settings.reading_mode = reader_library::ReadingMode::Vertical;
+    fixture.render_reader(vec2(950., 700.));
+    assert!(!Arc::ptr_eq(
+        &resized_font,
+        &fixture.app.composed_frame.as_ref().unwrap().page
+    ));
+}
+
+#[test]
+#[ignore = "Manual native CPU frame timing; synthetic Japanese fixture, no model or book data"]
+fn warm_reader_frame_timing_probe() {
+    let mut fixture = TestApp::new();
+    let chapter = reader_core::parse_html(
+        &format!(
+            "<html><body>{}</body></html>",
+            "<p>文章の<ruby>漢字<rt>かんじ</rt></ruby>と<a href='#note'>参照</a>を表示します。</p>"
+                .repeat(1600)
+        ),
+        0,
+        "chapter.xhtml",
+        "",
+    )
+    .unwrap();
+    fixture.use_chapter(chapter);
+    fixture.app.settings.spread = reader_library::SpreadMode::Single;
+    let extent = vec2(1280., 760.);
+    fixture.render_reader(extent);
+    while fixture.app.pagination_pending {
+        let work = fixture.app.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        fixture.app.tx.send(work).unwrap();
+        fixture.app.handle_work();
+    }
+    fixture.render_reader(extent);
+    for rebuild in [true, false] {
+        let start = Instant::now();
+        for _ in 0..200 {
+            if rebuild {
+                fixture.app.composed_frame = None;
+            }
+            fixture.render_reader(extent);
+        }
+        eprintln!(
+            "native-warm-frame forced_recomposition={rebuild} frames=200 elapsed_us={}",
+            start.elapsed().as_micros()
+        );
+    }
+}
+
 /// All workers, state and book fixtures stay inside this directory. Startup
 /// scans complete before a test runs, so no worker outlives its temporary files.
 struct TestApp {
@@ -367,6 +458,8 @@ fn latest_book_open_wins_even_when_an_older_worker_finishes_last() {
 fn replacing_a_book_discards_old_geometry_selection_and_delayed_taps() {
     let mut fixture = TestApp::new();
     fixture.render_reader(vec2(400.0, 360.0));
+    let old_geometry = Arc::downgrade(&fixture.app.composed_frame.as_ref().unwrap().page);
+    let old_notes = Arc::downgrade(&fixture.app.annotations);
     let old_hit = fixture.app.layout.pages[0].hits[5].clone();
     fixture.app.selected = Some(old_hit.clone());
     fixture.app.selection_anchor = Some(old_hit.clone());
@@ -392,6 +485,14 @@ fn replacing_a_book_discards_old_geometry_selection_and_delayed_taps() {
         })
         .unwrap();
     fixture.app.handle_work();
+    assert!(
+        old_geometry.upgrade().is_none(),
+        "book replacement releases cached geometry"
+    );
+    assert!(
+        old_notes.upgrade().is_none(),
+        "book replacement releases cached annotations"
+    );
     assert!(fixture.app.layout.pages.is_empty());
     assert!(fixture.app.layout_key.is_empty());
     assert!(fixture.app.pictures.is_empty());

@@ -162,11 +162,14 @@ fn embolden_mask(image: &mut swash::scale::image::Image, strength: f32) {
     image.placement.height = expanded_height as u32;
 }
 
+type ShapedRuns = HashMap<(usize, bool), HashMap<String, Arc<[ShapedGlyph]>>>;
+
 pub struct FontSystem {
     faces: Vec<Face>,
     scale: ScaleContext,
     glyphs: HashMap<(usize, u16, u32, GlyphStyle), Option<CachedGlyph>>,
-    shapes: HashMap<(usize, String, bool), Vec<ShapedGlyph>>,
+    shapes: ShapedRuns,
+    shape_count: usize,
     outline_bounds: HashMap<(usize, u16), Option<Rect>>,
     atlases: Vec<Atlas>,
     pixels_per_point: f32,
@@ -177,6 +180,7 @@ pub struct FontSystem {
     coverage: HashMap<(usize, char), bool>,
     active_family: String,
     fallback_faces: HashMap<(usize, String), usize>,
+    draw_glyphs: Vec<(usize, CachedGlyph)>,
 }
 
 impl FontSystem {
@@ -202,6 +206,7 @@ impl FontSystem {
             scale: ScaleContext::new(),
             glyphs: HashMap::new(),
             shapes: HashMap::new(),
+            shape_count: 0,
             outline_bounds: HashMap::new(),
             atlases: Vec::new(),
             pixels_per_point: 1.0,
@@ -216,6 +221,7 @@ impl FontSystem {
             coverage: HashMap::new(),
             active_family: String::new(),
             fallback_faces: HashMap::new(),
+            draw_glyphs: Vec::new(),
         }
     }
 
@@ -248,6 +254,7 @@ impl FontSystem {
             self.fallback_faces.clear();
             self.glyphs.clear();
             self.shapes.clear();
+            self.shape_count = 0;
             self.outline_bounds.clear();
             self.atlases.clear();
         }
@@ -424,11 +431,12 @@ impl FontSystem {
         bounds
     }
 
-    /// Shaping results are in em units; layout remains independent of DPI.
-    pub fn shape(&mut self, face: usize, text: &str, vertical: bool) -> Vec<ShapedGlyph> {
-        let key = (face, text.to_owned(), vertical);
-        if let Some(glyphs) = self.shapes.get(&key) {
-            return glyphs.clone();
+    /// Shaping results are immutable and in em units. A warm lookup borrows the
+    /// text key and shares its run, without allocating or copying glyph arrays.
+    pub fn shape(&mut self, face: usize, text: &str, vertical: bool) -> Arc<[ShapedGlyph]> {
+        let key = (face, vertical);
+        if let Some(glyphs) = self.shapes.get(&key).and_then(|runs| runs.get(text)) {
+            return Arc::clone(glyphs);
         }
         let font = harfrust::ShaperFont::new(&self.faces[face].font);
         let mut buffer = harfrust::Buffer::new();
@@ -452,10 +460,16 @@ impl FontSystem {
                 });
             }
         }
-        if self.shapes.len() > 30_000 {
+        if self.shape_count > 30_000 {
             self.shapes.clear();
+            self.shape_count = 0;
         }
-        self.shapes.insert(key, output.clone());
+        let output: Arc<[ShapedGlyph]> = output.into();
+        self.shapes
+            .entry(key)
+            .or_default()
+            .insert(text.to_owned(), Arc::clone(&output));
+        self.shape_count += 1;
         output
     }
 
@@ -468,6 +482,18 @@ impl FontSystem {
         style: GlyphStyle,
     ) -> Option<CachedGlyph> {
         let dpi = ctx.pixels_per_point();
+        self.raster_at_scale(ctx, face, id, size, style, dpi)
+    }
+
+    fn raster_at_scale(
+        &mut self,
+        ctx: &egui::Context,
+        face: usize,
+        id: u16,
+        size: f32,
+        style: GlyphStyle,
+        dpi: f32,
+    ) -> Option<CachedGlyph> {
         // Cached dimensions/bearings are in points at this exact scale. Even a
         // small UI zoom must not reuse metrics converted at the previous DPI.
         if dpi.to_bits() != self.pixels_per_point.to_bits() {
@@ -589,6 +615,81 @@ impl FontSystem {
         Some(result)
     }
 
+    /// Keep source paint order while combining adjacent glyphs on the same
+    /// atlas. In particular, ruby, synthetic styles and rotated glyphs must not
+    /// be globally sorted by texture. The reusable scratch list also avoids
+    /// allocating per-glyph meshes on each idle/read-aloud repaint.
+    pub fn draw_batch(
+        &mut self,
+        painter: &egui::Painter,
+        glyphs: &[crate::layout::Glyph],
+        offset: Vec2,
+        color: Color32,
+    ) {
+        let dpi = painter.ctx().pixels_per_point();
+        let mut cached = std::mem::take(&mut self.draw_glyphs);
+        cached.clear();
+        for (index, glyph) in glyphs.iter().enumerate() {
+            if let Some(raster) = self.raster_at_scale(
+                painter.ctx(),
+                glyph.face,
+                glyph.id,
+                glyph.size,
+                glyph.style,
+                dpi,
+            ) {
+                cached.push((index, raster));
+            }
+        }
+        let mut start = 0;
+        while start < cached.len() {
+            let texture = cached[start].1.texture;
+            let mut end = start + 1;
+            // Fits 16-bit backends as well as egui's u32 indices. Limit each
+            // run before multiplying vertex/index counts or casting indices.
+            while end < cached.len() && end - start < 16_384 && cached[end].1.texture == texture {
+                end += 1;
+            }
+            let mut mesh = egui::Mesh::with_texture(texture);
+            mesh.vertices.reserve_exact((end - start) * 4);
+            mesh.indices.reserve_exact((end - start) * 6);
+            for &(index, raster) in &cached[start..end] {
+                let glyph = &glyphs[index];
+                let quad = raster.quad(glyph.origin + offset, dpi, glyph.rotated);
+                let tint = if raster.color { Color32::WHITE } else { color };
+                if !glyph.rotated {
+                    // Same vertex and triangle order as Painter::image.
+                    mesh.add_rect_with_uv(Rect::from_min_max(quad[0], quad[2]), raster.uv, tint);
+                } else {
+                    let base = mesh.vertices.len() as u32;
+                    for (pos, uv) in quad.into_iter().zip([
+                        raster.uv.left_top(),
+                        raster.uv.right_top(),
+                        raster.uv.right_bottom(),
+                        raster.uv.left_bottom(),
+                    ]) {
+                        mesh.vertices.push(egui::epaint::Vertex {
+                            pos,
+                            uv,
+                            color: tint,
+                        });
+                    }
+                    mesh.indices.extend_from_slice(&[
+                        base,
+                        base + 1,
+                        base + 2,
+                        base,
+                        base + 2,
+                        base + 3,
+                    ]);
+                }
+            }
+            painter.add(mesh);
+            start = end;
+        }
+        self.draw_glyphs = cached;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn draw_styled(
         &mut self,
@@ -632,6 +733,173 @@ impl FontSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    type PaintVertexSnapshot = (TextureId, [u32; 2], [u32; 2], [u8; 4]);
+
+    #[test]
+    fn shaped_runs_share_warm_results_and_remain_valid_across_font_changes() {
+        let mut fonts = FontSystem::new();
+        fonts.begin_layout("Noto Serif CJK JP");
+        let first = fonts.shape(SERIF_FACE, "本。", true);
+        let owned = String::from("本。");
+        let repeated = fonts.shape(SERIF_FACE, &owned, true);
+        assert!(Arc::ptr_eq(&first, &repeated));
+        let horizontal = fonts.shape(SERIF_FACE, &owned, false);
+        assert_ne!(first[1].id, horizontal[1].id);
+        fonts.begin_layout("Noto Serif CJK JP");
+        assert!(Arc::ptr_eq(&first, &fonts.shape(SERIF_FACE, &owned, true)));
+        fonts.begin_layout("Noto Sans CJK JP");
+        let refreshed = fonts.shape(SERIF_FACE, &owned, true);
+        assert!(!Arc::ptr_eq(&first, &refreshed));
+        for (old, new) in first.iter().zip(refreshed.iter()) {
+            assert_eq!(old.id, new.id);
+            assert_eq!(old.cluster, new.cluster);
+            assert_eq!(old.offset, new.offset);
+            assert_eq!(old.advance, new.advance);
+        }
+    }
+
+    #[test]
+    fn batched_glyph_triangles_match_individual_paints_across_atlases_and_dpi() {
+        fn input(dpi: f32) -> egui::RawInput {
+            let mut input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(800., 600.))),
+                ..Default::default()
+            };
+            input
+                .viewports
+                .get_mut(&egui::ViewportId::ROOT)
+                .unwrap()
+                .native_pixels_per_point = Some(dpi);
+            input
+        }
+        fn triangles(output: &egui::FullOutput) -> Vec<PaintVertexSnapshot> {
+            output
+                .shapes
+                .iter()
+                .flat_map(|shape| {
+                    let egui::Shape::Mesh(mesh) = &shape.shape else {
+                        return Vec::new();
+                    };
+                    mesh.indices
+                        .iter()
+                        .map(|index| {
+                            let vertex = mesh.vertices[*index as usize];
+                            (
+                                mesh.texture_id,
+                                [vertex.pos.x.to_bits(), vertex.pos.y.to_bits()],
+                                [vertex.uv.x.to_bits(), vertex.uv.y.to_bits()],
+                                vertex.color.to_array(),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        }
+        let tint = Color32::from_rgba_unmultiplied(91, 134, 213, 187);
+        let offset = Vec2::new(10.17, 18.29);
+        for dpi in [1.0, 1.25, 2.0] {
+            let ctx = egui::Context::default();
+            let mut fonts = FontSystem::new();
+            let first = fonts.shape(SERIF_FACE, "日", false)[0].id;
+            let second = fonts.shape(SERIF_FACE, "月", false)[0].id;
+            let space = fonts.shape(SERIF_FACE, " ", false)[0].id;
+            let glyphs: Vec<_> = [
+                first, first, second, second, first, second, space, second, second,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| crate::layout::Glyph {
+                face: SERIF_FACE,
+                id,
+                origin: Pos2::new(120.27 + index as f32 * 27.3, 90.43),
+                size: 28.,
+                rotated: index >= 7,
+                style: GlyphStyle {
+                    bold: index == 8,
+                    italic: index == 8,
+                },
+            })
+            .collect();
+            let individual = ctx.run_ui(input(dpi), |ui| {
+                let original = fonts
+                    .raster(&ctx, SERIF_FACE, first, 28., GlyphStyle::default())
+                    .unwrap();
+                // Fill the existing atlas's remaining space so the next real
+                // raster uses a different texture without allocating thousands
+                // of unrelated large glyph masks for this batching regression.
+                fonts.atlases.last_mut().unwrap().y = 2048;
+                let next = fonts
+                    .raster(&ctx, SERIF_FACE, second, 28., GlyphStyle::default())
+                    .unwrap();
+                assert_ne!(original.texture, next.texture);
+                for glyph in &glyphs {
+                    fonts.draw_styled(
+                        ui.painter(),
+                        glyph.face,
+                        glyph.id,
+                        glyph.origin + offset,
+                        glyph.size,
+                        tint,
+                        glyph.rotated,
+                        glyph.style,
+                    );
+                }
+            });
+            let batched = ctx.run_ui(input(dpi), |ui| {
+                fonts.draw_batch(ui.painter(), &glyphs, offset, tint);
+            });
+            assert_eq!(triangles(&individual), triangles(&batched));
+            let meshes = |output: &egui::FullOutput| {
+                output
+                    .shapes
+                    .iter()
+                    .filter(|shape| matches!(&shape.shape, egui::Shape::Mesh(_)))
+                    .count()
+            };
+            assert!(meshes(&batched) < meshes(&individual));
+        }
+    }
+
+    #[test]
+    fn batch_splits_before_exceeding_16_bit_indices() {
+        let ctx = egui::Context::default();
+        let mut fonts = FontSystem::new();
+        let id = fonts.shape(SERIF_FACE, "本", false)[0].id;
+        let glyph = crate::layout::Glyph {
+            face: SERIF_FACE,
+            id,
+            origin: Pos2::new(50., 60.),
+            size: 24.,
+            rotated: false,
+            style: GlyphStyle::default(),
+        };
+        let glyphs = vec![glyph; 16_385];
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            fonts.draw_batch(ui.painter(), &glyphs, Vec2::ZERO, Color32::WHITE);
+        });
+        let meshes: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Mesh(mesh) = &shape.shape {
+                    Some(mesh)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(meshes.len(), 2);
+        assert_eq!(
+            meshes.iter().map(|mesh| mesh.vertices.len()).sum::<usize>(),
+            16_385 * 4
+        );
+        assert!(
+            meshes
+                .iter()
+                .all(|mesh| mesh.indices.iter().all(|index| *index <= 65_535))
+        );
+    }
+
     #[test]
     fn installed_family_uses_its_real_bytes_and_falls_back_for_japanese() {
         let mut database = fontdb::Database::new();

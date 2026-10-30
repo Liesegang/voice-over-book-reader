@@ -114,7 +114,19 @@ impl LibraryStore {
             .optional()?;
         // Invalid stored settings are reported instead of silently overwriting the user's data.
         let mut settings = match settings_json {
-            Some(json) => serde_json::from_str(&json).context("Read saved application settings")?,
+            Some(json) => {
+                let mut value: serde_json::Value =
+                    serde_json::from_str(&json).context("Read saved application settings")?;
+                let cleaned = remove_obsolete_settings(&mut value)
+                    .then(|| serde_json::to_string(&value))
+                    .transpose()?;
+                let settings =
+                    serde_json::from_value(value).context("Read saved application settings")?;
+                if let Some(cleaned) = cleaned {
+                    connection.execute("UPDATE settings SET json=?1 WHERE key='app'", [cleaned])?;
+                }
+                settings
+            }
             None => Settings::default(),
         };
         if settings.calibre_path.is_none() {
@@ -286,5 +298,121 @@ impl LibraryStore {
             .query_map([book_id], |row| row.get::<_, String>(0))?
             .map(|row| Ok(serde_json::from_str(&row?)?))
             .collect()
+    }
+}
+
+/// Remove retired feature data without rewriting unrelated or newer settings.
+fn remove_obsolete_settings(value: &mut serde_json::Value) -> bool {
+    let Some(fields) = value.as_object_mut() else {
+        return false;
+    };
+    let mut changed = fields.remove("translation").is_some();
+    changed |= fields.remove("translation_target").is_some();
+    if let Some(bindings) = fields
+        .get_mut("key_bindings")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        changed |= bindings.remove("TranslateSelection").is_some();
+        changed |= bindings.remove("TranslateChapter").is_some();
+    }
+    changed
+}
+
+#[cfg(test)]
+mod settings_migration_tests {
+    use super::*;
+
+    #[test]
+    fn retired_service_data_is_purged_without_resetting_library_or_other_settings() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let exported = directory.path().join("translations");
+        fs::create_dir(&exported)?;
+        let text = exported.join("saved.txt");
+        fs::write(&text, "Previously saved text")?;
+        let connection = Connection::open(directory.path().join("reader.sqlite3"))?;
+        connection.execute_batch(
+            "CREATE TABLE settings (key TEXT PRIMARY KEY, json TEXT NOT NULL);
+             CREATE TABLE books (id TEXT PRIMARY KEY, json TEXT NOT NULL);",
+        )?;
+        let old = serde_json::json!({
+            "translation": {"provider":"DeepLFree","api_key":"fixture-retired-key"},
+            "translation_target":"JA",
+            "theme":"OneDark", "font_size":31.5, "calibre_path":"fixture-calibre",
+            "key_bindings": {"TranslateSelection":"Alt+T", "TranslateChapter":"Alt+K",
+                             "NextPage":"Alt+N", "PinDictionary":"Alt+D"},
+            "tts":{"provider_id":"windows_sapi","voice":"fixture-voice","speed":3.25},
+            "opds":{"url":"https://catalog.example.invalid/feed","password":"fixture-kept-password"},
+            "custom_shelves":{"kept shelf":["book-1"]},
+            "future_setting":{"preserved":true}
+        });
+        connection.execute("INSERT INTO settings VALUES('app',?1)", [old.to_string()])?;
+        let entry = BookEntry {
+            id: "book-1".into(),
+            uuid: None,
+            calibre_id: None,
+            title: "Kept book".into(),
+            authors: vec!["Fixture".into()],
+            tags: vec![],
+            epub_path: directory.path().join("source.epub"),
+            cover_path: None,
+            source: BookSource::Imported,
+            added_at: 7,
+        };
+        connection.execute(
+            "INSERT INTO books VALUES(?1,?2)",
+            params![entry.id, serde_json::to_string(&entry)?],
+        )?;
+        drop(connection);
+
+        let store = LibraryStore::open(directory.path())?;
+        assert_eq!(store.settings().font_size, 31.5);
+        assert_eq!(store.settings().theme, crate::Theme::OneDark);
+        assert_eq!(store.settings().tts.voice.as_deref(), Some("fixture-voice"));
+        assert_eq!(store.settings().tts.speed, 3.25);
+        assert_eq!(store.settings().key_bindings["NextPage"], "Alt+N");
+        assert_eq!(store.books()[0].id, entry.id);
+        assert_eq!(fs::read_to_string(text)?, "Previously saved text");
+        let raw: String =
+            store
+                .connection
+                .query_row("SELECT json FROM settings WHERE key='app'", [], |row| {
+                    row.get(0)
+                })?;
+        assert!(!raw.contains("fixture-retired-key"));
+        let cleaned: serde_json::Value = serde_json::from_str(&raw)?;
+        assert!(cleaned.get("translation").is_none());
+        assert!(cleaned.get("translation_target").is_none());
+        assert!(cleaned["key_bindings"].get("TranslateSelection").is_none());
+        assert!(cleaned["key_bindings"].get("TranslateChapter").is_none());
+        assert_eq!(cleaned["key_bindings"]["PinDictionary"], "Alt+D");
+        for field in ["opds", "tts", "custom_shelves", "future_setting"] {
+            assert_eq!(cleaned[field], old[field]);
+        }
+        drop(store);
+        let reopened = LibraryStore::open(directory.path())?;
+        let repeated: String = reopened.connection.query_row(
+            "SELECT json FROM settings WHERE key='app'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert_eq!(repeated, raw);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_saved_settings_are_not_overwritten_by_migration() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let connection = Connection::open(directory.path().join("reader.sqlite3"))?;
+        connection
+            .execute_batch("CREATE TABLE settings (key TEXT PRIMARY KEY, json TEXT NOT NULL);")?;
+        let invalid = r#"{"font_size":"invalid","translation":{"api_key":"fixture-retired-key"}}"#;
+        connection.execute("INSERT INTO settings VALUES('app',?1)", [invalid])?;
+        assert!(LibraryStore::open(directory.path()).is_err());
+        let preserved: String =
+            connection.query_row("SELECT json FROM settings WHERE key='app'", [], |row| {
+                row.get(0)
+            })?;
+        assert_eq!(preserved, invalid);
+        Ok(())
     }
 }

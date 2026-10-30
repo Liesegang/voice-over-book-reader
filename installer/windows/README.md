@@ -5,7 +5,7 @@
 With Python 3.12 or newer, run the wrapper from the repository root, for example:
 
 ```powershell
-python scripts/build-windows-installer.py --package target/packages/voice-over-book-reader-0.2.3-x86_64-pc-windows-msvc.zip --iscc 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' --output-dir target/installers
+python scripts/build-windows-installer.py --package target/packages/voice-over-book-reader-0.2.4-x86_64-pc-windows-msvc.zip --iscc 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' --output-dir target/installers
 python scripts/test-windows-installer.py
 ```
 

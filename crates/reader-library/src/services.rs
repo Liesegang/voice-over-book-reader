@@ -415,145 +415,6 @@ fn direct_epub(links: &[OpdsLink]) -> Option<String> {
         .map(|link| link.href.clone())
 }
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub enum TranslationProvider {
-    #[default]
-    DeepLFree,
-    DeepLPro,
-    Yandex,
-}
-
-#[derive(Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct TranslationConfig {
-    pub provider: TranslationProvider,
-    pub api_key: String,
-    pub folder_id: Option<String>,
-}
-impl fmt::Debug for TranslationConfig {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TranslationConfig")
-            .field("provider", &self.provider)
-            .field("api_key", &"[redacted]")
-            .field("folder_id", &self.folder_id)
-            .finish()
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct TranslationResult {
-    pub text: String,
-    pub detected_source: Option<String>,
-}
-
-#[derive(Clone)]
-pub struct TranslationClient {
-    client: Client,
-    config: TranslationConfig,
-    endpoint: Url,
-}
-impl TranslationClient {
-    pub fn new(config: TranslationConfig) -> Result<Self> {
-        anyhow::ensure!(
-            !config.api_key.trim().is_empty(),
-            "Enter a translation API key"
-        );
-        if config.provider == TranslationProvider::Yandex {
-            anyhow::ensure!(
-                config
-                    .folder_id
-                    .as_deref()
-                    .is_some_and(|id| !id.trim().is_empty()),
-                "Yandex Translate requires a folder ID"
-            );
-        }
-        let endpoint = Url::parse(match config.provider {
-            TranslationProvider::DeepLFree => "https://api-free.deepl.com/v2/translate",
-            TranslationProvider::DeepLPro => "https://api.deepl.com/v2/translate",
-            TranslationProvider::Yandex => {
-                "https://translate.api.cloud.yandex.net/translate/v2/translate"
-            }
-        })?;
-        Ok(Self {
-            client: http_client()?,
-            config,
-            endpoint,
-        })
-    }
-
-    /// Exactly one explicit request; no automatic retries of billable API calls.
-    pub fn translate(
-        &self,
-        text: &str,
-        target_lang: &str,
-        source_lang: Option<&str>,
-    ) -> Result<TranslationResult> {
-        anyhow::ensure!(!text.trim().is_empty(), "Select text to translate");
-        anyhow::ensure!(
-            text.chars().count() <= 10_000,
-            "Translate at most 10,000 characters at a time"
-        );
-        anyhow::ensure!(
-            !target_lang.is_empty()
-                && target_lang
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphabetic() || byte == b'-'),
-            "Use a target language code such as JA or EN"
-        );
-        let source =
-            source_lang.filter(|lang| !lang.is_empty() && !lang.eq_ignore_ascii_case("auto"));
-        let (body, authorization) = match self.config.provider {
-            TranslationProvider::DeepLFree | TranslationProvider::DeepLPro => {
-                let mut body = serde_json::json!({"text":[text],"target_lang":target_lang.to_ascii_uppercase()});
-                if let Some(source) = source {
-                    body["source_lang"] = source.to_ascii_uppercase().into();
-                }
-                (
-                    body,
-                    format!("DeepL-Auth-Key {}", self.config.api_key.trim()),
-                )
-            }
-            TranslationProvider::Yandex => {
-                let mut body = serde_json::json!({"texts":[text],"targetLanguageCode":target_lang.to_ascii_lowercase(),"folderId":self.config.folder_id,"format":"PLAIN_TEXT"});
-                if let Some(source) = source {
-                    body["sourceLanguageCode"] = source.to_ascii_lowercase().into();
-                }
-                (body, format!("Api-Key {}", self.config.api_key.trim()))
-            }
-        };
-        let mut header = reqwest::header::HeaderValue::from_str(&authorization)
-            .map_err(|_| anyhow::anyhow!("Invalid translation API key header"))?;
-        header.set_sensitive(true);
-        let response = self
-            .client
-            .post(self.endpoint.clone())
-            .header(reqwest::header::AUTHORIZATION, header)
-            .json(&body)
-            .send()
-            .map_err(network_error)?;
-        let bytes = response_bytes(response, 512 * 1024)?;
-        let value: serde_json::Value =
-            serde_json::from_slice(&bytes).context("Invalid translation response")?;
-        let item = value
-            .get("translations")
-            .and_then(|value| value.as_array())
-            .and_then(|items| items.first())
-            .context("Translation provider returned no translation")?;
-        let translated = item
-            .get("text")
-            .and_then(|value| value.as_str())
-            .context("Translation response has no text")?;
-        Ok(TranslationResult {
-            text: translated.into(),
-            detected_source: item
-                .get("detected_source_language")
-                .or_else(|| item.get("detectedLanguageCode"))
-                .and_then(|value| value.as_str())
-                .map(Into::into),
-        })
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct WebImportResult {
     pub path: PathBuf,
@@ -992,7 +853,6 @@ mod tests {
     struct Request {
         path: String,
         headers: HashMap<String, String>,
-        body: Vec<u8>,
     }
 
     fn server(
@@ -1026,6 +886,7 @@ mod tests {
                 let mut reader = BufReader::new(&mut stream);
                 let mut first = String::new();
                 reader.read_line(&mut first).unwrap();
+                assert_eq!(first.split_whitespace().next(), Some("GET"));
                 let path = first.split_whitespace().nth(1).unwrap().to_owned();
                 let mut headers = HashMap::<String, String>::new();
                 loop {
@@ -1038,18 +899,8 @@ mod tests {
                         headers.insert(name.to_ascii_lowercase(), value.trim().into());
                     }
                 }
-                let length = headers
-                    .get("content-length")
-                    .and_then(|value| value.parse().ok())
-                    .unwrap_or(0);
-                let mut body = vec![0; length];
-                reader.read_exact(&mut body).unwrap();
                 drop(reader);
-                let (status, mime, body) = handler(Request {
-                    path,
-                    headers,
-                    body,
-                });
+                let (status, mime, body) = handler(Request { path, headers });
                 write!(stream,"HTTP/1.1 {status} Response\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len()).unwrap();
                 stream.write_all(&body).unwrap();
             }
@@ -1213,59 +1064,7 @@ mod tests {
     }
 
     #[test]
-    fn translation_requests_match_official_wire_formats_without_real_api_calls() -> Result<()> {
-        let (address, handle) = server(2, |request| {
-            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
-            if request.path == "/deepl" {
-                assert_eq!(request.headers["authorization"], "DeepL-Auth-Key test-key");
-                assert_eq!(body["text"][0], "hello");
-                assert_eq!(body["target_lang"], "JA");
-                assert!(body.get("source_lang").is_none());
-                (200,"application/json","{\"translations\":[{\"text\":\"こんにちは\",\"detected_source_language\":\"EN\"}]}".as_bytes().to_vec())
-            } else {
-                assert_eq!(request.path, "/yandex");
-                assert_eq!(request.headers["authorization"], "Api-Key test-key");
-                assert_eq!(body["folderId"], "test-folder");
-                assert_eq!(body["targetLanguageCode"], "ja");
-                assert_eq!(body["sourceLanguageCode"], "en");
-                (200,"application/json","{\"translations\":[{\"text\":\"こんにちは\",\"detectedLanguageCode\":\"en\"}]}".as_bytes().to_vec())
-            }
-        });
-        let mut deepl = TranslationClient::new(TranslationConfig {
-            provider: TranslationProvider::DeepLFree,
-            api_key: "test-key".into(),
-            folder_id: None,
-        })?;
-        deepl.client = local_client();
-        deepl.endpoint = Url::parse(&format!("{address}/deepl"))?;
-        assert_eq!(deepl.translate("hello", "ja", None)?.text, "こんにちは");
-        let mut yandex = TranslationClient::new(TranslationConfig {
-            provider: TranslationProvider::Yandex,
-            api_key: "test-key".into(),
-            folder_id: Some("test-folder".into()),
-        })?;
-        yandex.client = local_client();
-        yandex.endpoint = Url::parse(&format!("{address}/yandex"))?;
-        assert_eq!(
-            yandex
-                .translate("hello", "JA", Some("EN"))?
-                .detected_source
-                .as_deref(),
-            Some("en")
-        );
-        handle.join().unwrap();
-        Ok(())
-    }
-
-    #[test]
-    fn credentials_are_redacted_and_missing_yandex_folder_is_rejected() {
-        let config = TranslationConfig {
-            provider: TranslationProvider::Yandex,
-            api_key: "a-real-secret-example".into(),
-            folder_id: None,
-        };
-        assert!(!format!("{config:?}").contains("a-real-secret-example"));
-        assert!(TranslationClient::new(config).is_err());
+    fn catalog_credentials_are_redacted_and_unsafe_urls_are_rejected() {
         let config = OpdsConfig {
             url: "https://example.test/feed?token=secret-query".into(),
             username: Some("secret-user".into()),

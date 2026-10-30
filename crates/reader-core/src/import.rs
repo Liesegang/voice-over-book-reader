@@ -2,10 +2,13 @@ use crate::*;
 use anyhow::{Context, Result, bail};
 use percent_encoding::percent_decode_str;
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap},
     fs,
+    hash::{Hash, Hasher},
     io::{Read, Seek},
     path::Path,
+    sync::Arc,
 };
 
 const MAX_RESOURCE: u64 = 64 * 1024 * 1024;
@@ -25,12 +28,27 @@ impl Node {
     fn attr(&self, name: &str) -> &str {
         self.attrs.get(name).map(String::as_str).unwrap_or("")
     }
-    fn descendants<'a>(&'a self, tag: &'a str) -> Box<dyn Iterator<Item = &'a Node> + 'a> {
-        Box::new(self.children.iter().flat_map(move |child| {
-            std::iter::once(child)
-                .filter(move |node| node.tag == tag)
-                .chain(child.descendants(tag))
-        }))
+    fn descendants<'a>(&'a self, tag: &'a str) -> impl Iterator<Item = &'a Node> + 'a {
+        // Walk lazily in document order with one depth stack, rather than
+        // allocating a boxed iterator for every visited element and text node.
+        let mut pending = vec![self.children.iter()];
+        std::iter::from_fn(move || {
+            loop {
+                let node = match pending.last_mut()?.next() {
+                    Some(node) => node,
+                    None => {
+                        pending.pop();
+                        continue;
+                    }
+                };
+                if !node.children.is_empty() {
+                    pending.push(node.children.iter());
+                }
+                if node.tag == tag {
+                    return Some(node);
+                }
+            }
+        })
     }
     fn text_content(&self) -> String {
         if let Some(text) = &self.text {
@@ -1003,11 +1021,35 @@ struct CssRule {
 type CascadeRank = (u8, u32, usize, usize);
 type CascadeDeclarations = HashMap<String, (String, CascadeRank)>;
 
+#[derive(Default)]
+struct CascadeCache {
+    entries: HashMap<u64, Vec<CachedCascade>>,
+    len: usize,
+    bytes: usize,
+}
+
+struct CachedCascade {
+    tag: String,
+    classes: String,
+    id: String,
+    inline: String,
+    cascade: Arc<NodeCascade>,
+}
+
+struct NodeCascade {
+    writing_mode: Option<bool>,
+    horizontal: Vec<(String, String)>,
+    vertical: Vec<(String, String)>,
+    image_align: Option<(ImageAlign, Option<CssLength>)>,
+}
+
 struct ChapterParser<'a> {
     chapter: u32,
     href: &'a str,
     block_id: u32,
     rules: Vec<CssRule>,
+    matches_ids: bool,
+    cascades: RefCell<CascadeCache>,
 }
 
 fn css_rules(css: &str) -> Vec<CssRule> {
@@ -1240,19 +1282,15 @@ fn expand_margin_declaration(name: String, raw: &str) -> Vec<(String, String)> {
 
 fn apply_declarations(
     context: &mut ContextStyle,
-    declarations: &str,
+    declarations: &[(String, String)],
     inherited: &ContextStyle,
 ) -> bool {
     let mut hidden = false;
-    for declaration in declarations.split(';') {
-        let Some((name, value)) = declaration.split_once(':') else {
-            continue;
-        };
-        let name = name.trim().to_ascii_lowercase();
-        let value = value.trim().to_ascii_lowercase();
-        let value = value.trim_end_matches("!important").trim().to_owned();
+    for (name, value) in declarations {
+        let name = name.as_str();
+        let value = value.as_str();
         if value == "inherit" {
-            match name.as_str() {
+            match name {
                 "margin-block-start" => context.margin_block_start = inherited.margin_block_start,
                 "margin-block-end" => context.margin_block_end = inherited.margin_block_end,
                 _ => (),
@@ -1262,7 +1300,7 @@ fn apply_declarations(
         if value == "unset" {
             continue;
         }
-        match name.as_str() {
+        match name {
             "writing-mode" | "-epub-writing-mode" | "-webkit-writing-mode" => {
                 if value == "vertical-rl" || value == "tb-rl" {
                     context.mode = WritingMode::VerticalRl;
@@ -1275,15 +1313,15 @@ fn apply_declarations(
                     value == "bold" || value.parse::<u32>().is_ok_and(|v| v >= 600)
             }
             "font-size" => {
-                if let Some(size) = computed_font_size(&value, inherited.inline.font_size) {
+                if let Some(size) = computed_font_size(value, inherited.inline.font_size) {
                     context.inline.font_size = Some(size);
                 }
             }
             "margin-block-start" | "margin-block-end" => {
-                let length = if matches!(value.as_str(), "initial" | "auto") {
+                let length = if matches!(value, "initial" | "auto") {
                     Some(CssLength::Px(0.))
                 } else {
-                    CssLength::parse(&value)
+                    CssLength::parse(value)
                 };
                 if name == "margin-block-start" {
                     context.margin_block_start = length;
@@ -1302,30 +1340,28 @@ fn apply_declarations(
             "text-combine-upright" | "-webkit-text-combine" | "-epub-text-combine" => {
                 context.inline.tate_chu_yoko = value != "none"
             }
-            "vertical-align" if matches!(value.as_str(), "super" | "sub" | "baseline") => {
+            "vertical-align" if matches!(value, "super" | "sub" | "baseline") => {
                 context.inline.superscript = value == "super";
                 context.inline.subscript = value == "sub";
             }
-            "white-space" => {
-                context.pre = matches!(value.as_str(), "pre" | "pre-wrap" | "break-spaces")
-            }
+            "white-space" => context.pre = matches!(value, "pre" | "pre-wrap" | "break-spaces"),
             "text-indent" => {
                 if value == "initial" {
                     context.text_indent = Some(CssLength::Px(0.0));
-                } else if let Some(indent) = CssLength::parse(&value) {
+                } else if let Some(indent) = CssLength::parse(value) {
                     context.text_indent = Some(indent);
                 }
             }
             "width" => {
                 context.image.width_set = true;
-                context.image.width = CssLength::parse(&value);
+                context.image.width = CssLength::parse(value);
             }
             "height" => {
                 context.image.height_set = true;
-                context.image.height = CssLength::parse(&value);
+                context.image.height = CssLength::parse(value);
             }
-            "max-width" => context.image.max_width = CssLength::parse(&value),
-            "max-height" => context.image.max_height = CssLength::parse(&value),
+            "max-width" => context.image.max_width = CssLength::parse(value),
+            "max-height" => context.image.max_height = CssLength::parse(value),
             "aspect-ratio" => {
                 let mut values = value
                     .split('/')
@@ -1337,7 +1373,7 @@ fn apply_declarations(
                     context.image.aspect_ratio = Some(numerator / denominator);
                 }
             }
-            "display" if matches!(value.as_str(), "inline" | "inline-block") => {
+            "display" if matches!(value, "inline" | "inline-block") => {
                 context.image.display = Some(ImageDisplay::Inline)
             }
             "display" if value == "block" => context.image.display = Some(ImageDisplay::Block),
@@ -1358,7 +1394,9 @@ fn parse_tree(tree: &Node, chapter: u32, href: &str, stylesheets: &str) -> Chapt
         chapter,
         href,
         block_id: 0,
+        matches_ids: rules.iter().any(|rule| rule.selector.contains('#')),
         rules,
+        cascades: RefCell::new(CascadeCache::default()),
     };
     let mut context = ContextStyle::default();
     parser.style(tree, &mut context);
@@ -1428,7 +1466,15 @@ fn parse_tree(tree: &Node, chapter: u32, href: &str, stylesheets: &str) -> Chapt
     }
     let mut nodes = Vec::new();
     flatten(tree, &mut nodes);
-    for (index, node) in nodes.iter().enumerate() {
+    let mut nearest = None;
+    for node in nodes.iter().rev() {
+        if let Some(&offset) = offsets.get(&node.id) {
+            nearest = Some(Locator {
+                chapter,
+                node: node.id,
+                offset,
+            });
+        }
         let anchor = if !node.attr("id").is_empty() {
             node.attr("id")
         } else if node.tag == "a" {
@@ -1437,18 +1483,10 @@ fn parse_tree(tree: &Node, chapter: u32, href: &str, stylesheets: &str) -> Chapt
             ""
         };
         if !anchor.is_empty()
-            && let Some(text) = nodes[index..]
-                .iter()
-                .find(|node| offsets.contains_key(&node.id))
+            && let Some(target) = nearest
         {
-            anchors.insert(
-                anchor.to_owned(),
-                Locator {
-                    chapter,
-                    node: text.id,
-                    offset: offsets[&text.id],
-                },
-            );
+            // Reverse traversal keeps the original last-authored duplicate ID.
+            anchors.entry(anchor.to_owned()).or_insert(target);
         }
     }
     if tree.tag == "svg" {
@@ -1568,42 +1606,77 @@ impl ChapterParser<'_> {
         }
     }
 
-    fn style(&self, node: &Node, context: &mut ContextStyle) -> bool {
-        let inherited = context.clone();
-        // Margins are not inherited; explicit `inherit` is handled separately.
-        context.margin_block_start = None;
-        context.margin_block_end = None;
-        // Image box properties are not inherited from a parent div/span.
-        context.image = ImageStyle::default();
-        match node.tag.as_str() {
-            "b" | "strong" => context.inline.bold = true,
-            "i" | "em" => context.inline.italic = true,
-            "code" | "kbd" | "samp" => context.inline.code = true,
-            "s" | "strike" | "del" => context.inline.strike = true,
-            "sup" => context.inline.superscript = true,
-            "sub" => context.inline.subscript = true,
-            "pre" => {
-                context.pre = true;
-                context.inline.code = true;
-            }
-            "blockquote" => context.quote = true,
-            "a" => {
-                context.link = Some(node.attr("href").to_owned());
-                context.link_is_note = node
-                    .attr("epub:type")
-                    .split_whitespace()
-                    .any(|value| value == "noteref")
-                    || node
-                        .attr("role")
-                        .split_whitespace()
-                        .any(|value| value == "doc-noteref")
-                    || node
-                        .attr("rel")
-                        .split_whitespace()
-                        .any(|value| value == "footnote");
-            }
-            _ => (),
+    fn cascade(&self, node: &Node) -> Arc<NodeCascade> {
+        // Only the supported simple selectors affect this cache identity.
+        // Inherited values are evaluated below for every element, not cached.
+        let classes = node.attr("class");
+        let id = if self.matches_ids {
+            node.attr("id")
+        } else {
+            ""
+        };
+        let inline = node.attr("style");
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (node.tag.as_str(), classes, id, inline).hash(&mut hash);
+        let hash = hash.finish();
+        let mut cache = self.cascades.borrow_mut();
+        if let Some(found) = cache.entries.get(&hash).and_then(|bucket| {
+            bucket.iter().find(|entry| {
+                entry.tag == node.tag
+                    && entry.classes == classes
+                    && entry.id == id
+                    && entry.inline == inline
+            })
+        }) {
+            return Arc::clone(&found.cascade);
         }
+        let cascade = Arc::new(self.resolve_cascade(node));
+        // Count owned strings and their containers on misses only. Publisher CSS
+        // can contain very large values even for properties we do not display.
+        // Limit bytes as well as identities so repeated IDs cannot retain those
+        // values thousands of times. Oversized entries still apply normally.
+        const MAX_CASCADE_BYTES: usize = 4 * 1024 * 1024;
+        let bytes = std::mem::size_of::<CachedCascade>()
+            + std::mem::size_of::<NodeCascade>()
+            + node.tag.len()
+            + classes.len()
+            + id.len()
+            + inline.len()
+            + [&cascade.horizontal, &cascade.vertical]
+                .into_iter()
+                .map(|declarations| {
+                    declarations.capacity() * std::mem::size_of::<(String, String)>()
+                        + declarations
+                            .iter()
+                            .map(|(name, value)| name.capacity() + value.capacity())
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        if bytes > MAX_CASCADE_BYTES {
+            return cascade;
+        }
+        if cache.len >= 2048 || cache.bytes + bytes > MAX_CASCADE_BYTES {
+            cache.entries.clear();
+            cache.len = 0;
+            cache.bytes = 0;
+        }
+        cache
+            .entries
+            .entry(hash)
+            .or_insert_with(|| Vec::with_capacity(1))
+            .push(CachedCascade {
+                tag: node.tag.clone(),
+                classes: classes.into(),
+                id: id.into(),
+                inline: inline.into(),
+                cascade: Arc::clone(&cascade),
+            });
+        cache.len += 1;
+        cache.bytes += bytes;
+        cascade
+    }
+
+    fn resolve_cascade(&self, node: &Node) -> NodeCascade {
         // Apply the cascade for supported properties. Author declarations beat
         // semantic defaults; !important, specificity, then source order decide.
         let mut winners = CascadeDeclarations::new();
@@ -1672,48 +1745,18 @@ impl ChapterParser<'_> {
             }
         }
         apply(node.attr("style"), 1_000_000, self.rules.len(), false);
-        let vertical = winners
-            .get("writing-mode")
-            .and_then(|(value, _)| {
-                let value = value.to_ascii_lowercase();
-                match value.trim_end_matches("!important").trim() {
-                    "vertical-rl" | "tb-rl" => Some(true),
-                    "horizontal-tb" | "lr-tb" => Some(false),
-                    _ => None,
-                }
-            })
-            .unwrap_or(context.mode.is_vertical());
-        for (physical, logical) in if vertical {
-            [
-                ("margin-right", "margin-block-start"),
-                ("margin-left", "margin-block-end"),
-            ]
-        } else {
-            [
-                ("margin-top", "margin-block-start"),
-                ("margin-bottom", "margin-block-end"),
-            ]
-        } {
-            if let Some((value, rank)) = winners.get(physical).cloned()
-                && winners
-                    .get(logical)
-                    .is_none_or(|(_, previous)| rank >= *previous)
-            {
-                winners.insert(logical.into(), (value, rank));
+        let writing_mode = winners.get("writing-mode").and_then(|(value, _)| {
+            let value = value.to_ascii_lowercase();
+            match value.trim_end_matches("!important").trim() {
+                "vertical-rl" | "tb-rl" => Some(true),
+                "horizontal-tb" | "lr-tb" => Some(false),
+                _ => None,
             }
-        }
-        let declarations = winners
-            .into_iter()
-            .map(|(name, (value, _))| format!("{name}:{value}"))
-            .collect::<Vec<_>>()
-            .join(";");
-        let hidden = apply_declarations(context, &declarations, &inherited);
-        if let Some((_, value)) = declarations
-            .split(';')
-            .filter_map(|value| value.split_once(':'))
-            .find(|(name, _)| *name == "vertical-align")
-        {
-            context.image.align = match value.trim().trim_end_matches("!important").trim() {
+        });
+        let image_align = winners.get("vertical-align").map(|(value, _)| {
+            let value = value.to_ascii_lowercase();
+            let value = value.trim_end_matches("!important").trim();
+            let alignment = match value {
                 "middle" => ImageAlign::Middle,
                 "top" | "text-top" => ImageAlign::Top,
                 "bottom" | "text-bottom" => ImageAlign::Bottom,
@@ -1721,8 +1764,94 @@ impl ChapterParser<'_> {
                 "super" => ImageAlign::Super,
                 _ => ImageAlign::Baseline,
             };
-            context.image.baseline_offset =
-                CssLength::parse(value.trim().trim_end_matches("!important").trim());
+            (alignment, CssLength::parse(value))
+        });
+        fn pairs(mut winners: CascadeDeclarations, vertical: bool) -> Vec<(String, String)> {
+            for (physical, logical) in if vertical {
+                [
+                    ("margin-right", "margin-block-start"),
+                    ("margin-left", "margin-block-end"),
+                ]
+            } else {
+                [
+                    ("margin-top", "margin-block-start"),
+                    ("margin-bottom", "margin-block-end"),
+                ]
+            } {
+                if let Some((value, rank)) = winners.get(physical).cloned()
+                    && winners
+                        .get(logical)
+                        .is_none_or(|(_, previous)| rank >= *previous)
+                {
+                    winners.insert(logical.into(), (value, rank));
+                }
+            }
+            winners
+                .into_iter()
+                .map(|(name, (value, _))| {
+                    let normalized = value.trim().to_ascii_lowercase();
+                    (
+                        name,
+                        normalized.trim_end_matches("!important").trim().to_owned(),
+                    )
+                })
+                .collect()
+        }
+        NodeCascade {
+            writing_mode,
+            horizontal: pairs(winners.clone(), false),
+            vertical: pairs(winners, true),
+            image_align,
+        }
+    }
+
+    fn style(&self, node: &Node, context: &mut ContextStyle) -> bool {
+        let inherited = context.clone();
+        // Margins are not inherited; explicit `inherit` is handled separately.
+        context.margin_block_start = None;
+        context.margin_block_end = None;
+        // Image box properties are not inherited from a parent div/span.
+        context.image = ImageStyle::default();
+        match node.tag.as_str() {
+            "b" | "strong" => context.inline.bold = true,
+            "i" | "em" => context.inline.italic = true,
+            "code" | "kbd" | "samp" => context.inline.code = true,
+            "s" | "strike" | "del" => context.inline.strike = true,
+            "sup" => context.inline.superscript = true,
+            "sub" => context.inline.subscript = true,
+            "pre" => {
+                context.pre = true;
+                context.inline.code = true;
+            }
+            "blockquote" => context.quote = true,
+            "a" => {
+                context.link = Some(node.attr("href").to_owned());
+                context.link_is_note = node
+                    .attr("epub:type")
+                    .split_whitespace()
+                    .any(|value| value == "noteref")
+                    || node
+                        .attr("role")
+                        .split_whitespace()
+                        .any(|value| value == "doc-noteref")
+                    || node
+                        .attr("rel")
+                        .split_whitespace()
+                        .any(|value| value == "footnote");
+            }
+            _ => (),
+        }
+        let cascade = self.cascade(node);
+        let vertical = cascade.writing_mode.unwrap_or(context.mode.is_vertical());
+        let declarations = if vertical {
+            &cascade.vertical
+        } else {
+            &cascade.horizontal
+        };
+        let hidden = apply_declarations(context, declarations, &inherited);
+        if let Some((align, offset)) = cascade.image_align {
+            context.image.align = align;
+            context.image.baseline_offset = offset;
         }
         hidden
             || node.attrs.contains_key("hidden")
@@ -2166,6 +2295,218 @@ pub(crate) fn demo_book() -> Book {
 
 #[cfg(test)]
 mod charset_regression {
+    #[test]
+    fn lazy_descendants_keep_document_order_for_titles_and_embedded_css() {
+        let chapter = super::parse_html(
+            "<html><head><title>先頭の題名</title><style>p {font-size:2em}</style></head><body><p>甲</p><section><style>p {font-size:3em}</style><p>乙</p></section><svg><title>図の題名</title></svg><p>丙</p></body></html>",
+            0,
+            "document-order.xhtml",
+            "",
+        ).unwrap();
+        assert_eq!(chapter.title, "先頭の題名");
+        for text in ["甲", "乙", "丙"] {
+            let atom = chapter
+                .atoms()
+                .into_iter()
+                .find(|atom| atom.text == text)
+                .unwrap();
+            assert_eq!(
+                atom.style.font_size,
+                Some(crate::CssLength::Em(3.)),
+                "the last authored stylesheet must win for {text}"
+            );
+        }
+
+        let target = |id| super::Node {
+            id,
+            tag: "target".into(),
+            ..Default::default()
+        };
+        let mut deep = target(3);
+        for _ in 0..512 {
+            deep = super::Node {
+                tag: "section".into(),
+                children: vec![deep],
+                ..Default::default()
+            };
+        }
+        let root = super::Node {
+            id: 0,
+            tag: "target".into(),
+            children: vec![target(1), deep, target(2)],
+            ..Default::default()
+        };
+        let mut nodes = root.descendants("target");
+        assert_eq!(
+            nodes.next().unwrap().id,
+            1,
+            "the first match must be yielded before a later deep branch"
+        );
+        assert_eq!(nodes.map(|node| node.id).collect::<Vec<_>>(), [3, 2]);
+    }
+
+    #[test]
+    fn cascade_cache_bounds_large_publisher_values_and_drops_evicted_entries() {
+        fn parser(opaque_bytes: usize) -> super::ChapterParser<'static> {
+            let rules = super::css_rules(&format!(
+                "* {{font-weight:bold;publisher-opaque:{}}} #other {{display:block}}",
+                "x".repeat(opaque_bytes),
+            ));
+            super::ChapterParser {
+                chapter: 0,
+                href: "bounded.xhtml",
+                block_id: 0,
+                matches_ids: true,
+                rules,
+                cascades: Default::default(),
+            }
+        }
+        let first = super::Node {
+            tag: "p".into(),
+            attrs: [("id".into(), "first".into())].into(),
+            ..Default::default()
+        };
+        let second = super::Node {
+            tag: "p".into(),
+            attrs: [("id".into(), "second".into())].into(),
+            ..Default::default()
+        };
+        let bounded = parser(1_100_000);
+        let weak = std::sync::Arc::downgrade(&bounded.cascade(&first));
+        assert!(weak.upgrade().is_some());
+        bounded.cascade(&second);
+        assert!(
+            weak.upgrade().is_none(),
+            "large values from the old identity must be freed"
+        );
+        assert_eq!(bounded.cascades.borrow().len, 1);
+        assert!(bounded.cascades.borrow().bytes <= 4 * 1024 * 1024);
+
+        let oversized = parser(2_200_000);
+        let mut context = super::ContextStyle::default();
+        oversized.style(&first, &mut context);
+        assert!(
+            context.inline.bold,
+            "an uncached oversized cascade must still apply"
+        );
+        assert_eq!(oversized.cascades.borrow().len, 0);
+    }
+
+    #[test]
+    fn cached_cascade_preserves_each_parent_font_mode_and_element_identity() {
+        let chapter = super::parse_html(
+            "<body><div style='font-size:2em'><h2 class='same' style='font-size:50%;margin-right:2em;margin-top:3em'>甲</h2></div><div style='font-size:3em;writing-mode:vertical-rl'><h2 class='same' style='font-size:50%;margin-right:2em;margin-top:3em'>乙</h2></div><p id='ordinary' class='identity'>丙</p><p id='special' class='identity'>丁</p><p class='visibility'>戊</p><p class='visibility' hidden>不可視</p><b><span class='inline'>己</span></b><span class='inline'>庚</span></body>",
+            3,
+            "contexts.xhtml",
+            "#special {font-weight:bold} .same {font-weight:normal}",
+        ).unwrap();
+        assert_eq!(chapter.blocks[0].font_size, Some(crate::CssLength::Em(1.)));
+        assert_eq!(chapter.blocks[1].font_size, Some(crate::CssLength::Em(1.5)));
+        assert_eq!(
+            chapter.blocks[0].margin_block_start,
+            Some(crate::CssLength::Em(3.))
+        );
+        assert_eq!(
+            chapter.blocks[1].margin_block_start,
+            Some(crate::CssLength::Em(2.))
+        );
+        let atoms = chapter.atoms();
+        for (text, bold) in [("丙", false), ("丁", true), ("己", true), ("庚", false)] {
+            assert_eq!(
+                atoms
+                    .iter()
+                    .find(|atom| atom.text == text)
+                    .unwrap()
+                    .style
+                    .bold,
+                bold,
+                "{text}"
+            );
+        }
+        assert!(!chapter.plain_text().contains("不可視"));
+        assert!(
+            atoms
+                .iter()
+                .flat_map(|atom| &atom.sources)
+                .all(|source| source.chapter == 3)
+        );
+    }
+
+    #[test]
+    fn reverse_anchor_scan_preserves_next_readable_target_and_last_duplicate_id() {
+        let chapter = super::parse_html(
+            "<body><a id='duplicate'></a><span id='empty'></span><p>最初</p><a id='duplicate'></a><a name='legacy'></a><p><ruby>漢字<rt>かんじ</rt></ruby></p><a id='trailing'></a></body>",
+            5,
+            "anchors.xhtml",
+            "",
+        ).unwrap();
+        let first = chapter.blocks[0].first_locator().unwrap();
+        let last = chapter.blocks[1].first_locator().unwrap();
+        assert_eq!(chapter.anchors["empty"], first);
+        assert_eq!(chapter.anchors["duplicate"], last);
+        assert_eq!(chapter.anchors["legacy"], last);
+        assert!(!chapter.anchors.contains_key("trailing"));
+    }
+
+    #[test]
+    #[ignore = "manual release-mode import timing; optional VOBR_BENCH_EPUB stays local"]
+    fn benchmark_import_hotpaths() {
+        use std::{hint::black_box, time::Instant};
+        let mut css = String::from(
+            "body { writing-mode:vertical-rl } .body { font-size:1em } .aside { font-size:0.85em } .strong { font-weight:bold }",
+        );
+        for index in 0..300 {
+            css.push_str(&format!(
+                ".publisher-{index} {{font-size:1.1em;margin:0.4em 0.2em}}"
+            ));
+        }
+        let mut html = String::from("<html><body>");
+        for index in 0..1200 {
+            html.push_str(&format!("<p class='body'><span class='strong'>読みやすい本文。</span><span class='aside'>繰り返す注記。</span><a id='anchor-{index}'></a></p>"));
+        }
+        html.push_str("</body></html>");
+        let mut samples = Vec::new();
+        let mut digest = String::new();
+        for _ in 0..7 {
+            let started = Instant::now();
+            let chapter =
+                super::parse_html(black_box(&html), 0, "chapter.xhtml", black_box(&css)).unwrap();
+            samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            digest = blake3::hash(&serde_json::to_vec(&chapter).unwrap())
+                .to_hex()
+                .to_string();
+            black_box(chapter);
+        }
+        samples.sort_by(f64::total_cmp);
+        eprintln!(
+            "synthetic_parse median_ms={:.3} min_ms={:.3} digest={digest}",
+            samples[3], samples[0]
+        );
+        if let Some(path) = std::env::var_os("VOBR_BENCH_EPUB") {
+            let mut samples = Vec::new();
+            let mut digest = String::new();
+            let mut chapter_count = 0;
+            for _ in 0..7 {
+                let started = Instant::now();
+                let book = crate::open(&path).unwrap();
+                let chapters = (0..book.chapters.len())
+                    .map(|index| book.load_chapter(index).unwrap())
+                    .collect::<Vec<_>>();
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                chapter_count = chapters.len();
+                digest = blake3::hash(&serde_json::to_vec(&chapters).unwrap())
+                    .to_hex()
+                    .to_string();
+                black_box(chapters);
+            }
+            samples.sort_by(f64::total_cmp);
+            eprintln!(
+                "local_epub_parse chapters={chapter_count} median_ms={:.3} min_ms={:.3} digest={digest}",
+                samples[3], samples[0]
+            );
+        }
+    }
+
     #[test]
     fn charset_before_the_first_rule_does_not_erase_vertical_writing_mode() {
         for prefix in [

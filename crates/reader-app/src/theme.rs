@@ -1,7 +1,7 @@
 use eframe::egui::{self, Color32};
 use reader_library::{Settings, Theme};
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
     pub paper: Color32,
     pub panel: Color32,

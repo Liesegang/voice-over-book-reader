@@ -24,7 +24,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::PathBuf,
     process::{Child, ChildStdin, Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender},
+    },
     time::{Duration, Instant},
 };
 
@@ -127,6 +130,26 @@ struct JumpMark {
     locator: Locator,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ComposedFrameKey {
+    revision: u64,
+    page: usize,
+    extent: [u32; 2],
+    columns: usize,
+    first_slot: usize,
+    gap: u32,
+    cross_chapter: bool,
+    sibling_ready: bool,
+    loaded_neighbors: u8,
+}
+
+struct ComposedFrame {
+    key: ComposedFrameKey,
+    page: Arc<layout::Page>,
+    links: Arc<std::collections::HashSet<u64>>,
+    prefetch: Arc<Vec<(usize, Vec<layout::Picture>)>>,
+}
+
 fn narration_texts<'a>(
     chapter: &'a reader_core::Chapter,
     rules: &std::collections::BTreeMap<String, String>,
@@ -219,6 +242,12 @@ pub struct ReaderApp {
     page: usize,
     layout: BookLayout,
     layout_key: String,
+    layout_revision: u64,
+    composed_frame: Option<ComposedFrame>,
+    applied_palette: Option<Palette>,
+    annotation_book: String,
+    annotations: Arc<Vec<reader_library::Annotation>>,
+    annotations_updated: Option<Instant>,
     pending_restore: Option<Locator>,
     resume_locator: Option<Locator>,
     open_generation: u64,
@@ -399,6 +428,12 @@ impl ReaderApp {
             page: 0,
             layout: BookLayout::default(),
             layout_key: String::new(),
+            layout_revision: 0,
+            composed_frame: None,
+            applied_palette: None,
+            annotation_book: String::new(),
+            annotations: Arc::new(Vec::new()),
+            annotations_updated: None,
             pending_restore: None,
             resume_locator: None,
             open_generation: 0,
@@ -606,6 +641,7 @@ impl ReaderApp {
         Ok(())
     }
     fn open_path(&mut self, path: PathBuf) {
+        self.clear_frame_caches();
         if path.extension().is_some_and(|extension| {
             ["mp3", "m4a", "m4b", "wav"]
                 .iter()
@@ -641,6 +677,7 @@ impl ReaderApp {
         self.screen = Screen::Reader;
         self.focus = true;
         self.layout = BookLayout::default();
+        self.composed_frame = None;
         self.layout_key.clear();
         let tx = self.tx.clone();
         let ctx = self.worker_context.clone();
@@ -651,6 +688,12 @@ impl ReaderApp {
             let _ = tx.send(Work::Opened { generation, result });
             ctx.request_repaint();
         });
+    }
+    fn clear_frame_caches(&mut self) {
+        self.composed_frame = None;
+        self.annotation_book.clear();
+        self.annotations = Arc::new(Vec::new());
+        self.annotations_updated = None;
     }
     pub(crate) fn refresh_shelf(&mut self) {
         if !self.reader_window
@@ -861,6 +904,7 @@ impl ReaderApp {
                     result: Ok((mut book, path)),
                 } => {
                     self.stop_speech();
+                    self.clear_frame_caches();
                     let linked = self
                         .shelf
                         .iter()
@@ -877,6 +921,7 @@ impl ReaderApp {
                     self.page = 0;
                     self.layout_key.clear();
                     self.layout = BookLayout::default();
+                    self.composed_frame = None;
                     self.pending_restore = None;
                     self.resume_locator = None;
                     self.pending_center_tap = None;
@@ -1073,6 +1118,7 @@ impl ReaderApp {
             self.chapter = target;
             self.page = 0;
             self.layout = BookLayout::default();
+            self.composed_frame = None;
             self.layout_key.clear();
             self.selected = None;
             self.pending_restore = None;
@@ -1111,6 +1157,7 @@ impl ReaderApp {
         self.selected = None;
         if old_chapter != self.chapter {
             self.layout = BookLayout::default();
+            self.composed_frame = None;
             self.pending_restore = None;
         }
         self.persist_position();
@@ -1961,7 +2008,8 @@ impl ReaderApp {
             let entries = self
                 .shelf
                 .iter()
-                .filter(|entry| {
+                .enumerate()
+                .filter(|(_, entry)| {
                     if membership.is_some_and(|ids| !ids.contains(&entry.id)) {
                         return false;
                     }
@@ -1997,7 +2045,7 @@ impl ReaderApp {
                                 _ => true,
                             })
                 })
-                .cloned()
+                .map(|(index, _)| index)
                 .collect::<Vec<_>>();
             ui.label(
                 RichText::new(format!("{}冊", entries.len()))
@@ -2029,7 +2077,7 @@ impl ReaderApp {
                 .show_rows(ui, row_height, rows, |ui, range| {
                     for index in range {
                         if list {
-                            let entry = &entries[index];
+                            let entry = self.shelf[entries[index]].clone();
                             let (rect, response) = ui.allocate_exact_size(
                                 vec2(ui.available_width() - 20., row_height),
                                 Sense::click(),
@@ -2039,7 +2087,7 @@ impl ReaderApp {
                             }
                             let cover =
                                 Rect::from_min_size(rect.min + vec2(4., 4.), vec2(38., 54.));
-                            self.paint_cover(ui, entry, cover, p);
+                            self.paint_cover(ui, &entry, cover, p);
                             let author_width = (rect.width() * 0.24).clamp(80., 240.);
                             let text = Rect::from_min_max(
                                 rect.min + vec2(58., 0.),
@@ -2065,13 +2113,14 @@ impl ReaderApp {
                             if response.clicked() {
                                 open = Some(entry.epub_path.clone());
                             }
-                            self.book_context_menu(response, entry);
+                            self.book_context_menu(response, &entry);
                         } else {
                             ui.horizontal_top(|ui| {
                                 ui.spacing_mut().item_spacing.x = 16.;
-                                for entry in &entries
+                                for &entry_index in &entries
                                     [index * columns..((index + 1) * columns).min(entries.len())]
                                 {
+                                    let entry = self.shelf[entry_index].clone();
                                     ui.vertical(|ui| {
                                         ui.spacing_mut().item_spacing.y = 4.;
                                         ui.set_width(width);
@@ -2079,11 +2128,11 @@ impl ReaderApp {
                                             vec2(width, width * 1.35),
                                             Sense::click(),
                                         );
-                                        self.paint_cover(ui, entry, rect, p);
+                                        self.paint_cover(ui, &entry, rect, p);
                                         if response.clicked() {
                                             open = Some(entry.epub_path.clone());
                                         }
-                                        self.book_context_menu(response, entry);
+                                        self.book_context_menu(response, &entry);
                                         ui.add_space(6.);
                                         let title = icons::label(
                                             ui,
@@ -2094,7 +2143,7 @@ impl ReaderApp {
                                         if title.clicked() {
                                             open = Some(entry.epub_path.clone());
                                         }
-                                        self.book_context_menu(title, entry);
+                                        self.book_context_menu(title, &entry);
                                         ui.add(
                                             egui::Label::new(
                                                 RichText::new(entry.authors.join("、"))
@@ -2349,6 +2398,8 @@ impl ReaderApp {
             reader_core::default_reader_css_revision()
         );
         if key != self.layout_key {
+            self.layout_revision = self.layout_revision.wrapping_add(1);
+            self.composed_frame = None;
             let anchor = self
                 .pending_restore
                 .take()
@@ -2415,6 +2466,8 @@ impl ReaderApp {
                     &crate::reading_surface::effective_layout_settings(&self.settings, next),
                 );
                 self.sibling_key = sibling_key.clone();
+                self.layout_revision = self.layout_revision.wrapping_add(1);
+                self.composed_frame = None;
             }
             if self.sibling_key == sibling_key && self.sibling_layout.pages.len() != 1 {
                 self.cross_chapter_spread = false;
@@ -2427,33 +2480,137 @@ impl ReaderApp {
             self.spread_pages,
             self.next_to_left(),
         );
-        let second = if self.cross_chapter_spread {
-            if self.sibling_key == sibling_key {
-                self.sibling_layout.pages.first().cloned()
+        let first_slot = if self.cross_chapter_spread {
+            plan.first_slot
+        } else {
+            window.first_slot
+        };
+        let loaded_neighbors = (self.chapter + 1
+            ..(self.chapter + 1 + self.spread_pages * 2).min(self.book.chapters.len()))
+            .enumerate()
+            .fold(0u8, |mask, (offset, index)| {
+                mask | (u8::from(self.book.chapters[index].loaded) << offset)
+            });
+        let frame_key = ComposedFrameKey {
+            revision: self.layout_revision,
+            page: self.page,
+            extent: [rect.width().to_bits(), rect.height().to_bits()],
+            columns: self.spread_pages,
+            first_slot,
+            gap: plan.gap.to_bits(),
+            cross_chapter: self.cross_chapter_spread,
+            sibling_ready: self.sibling_key == sibling_key,
+            loaded_neighbors,
+        };
+        if self
+            .composed_frame
+            .as_ref()
+            .is_none_or(|frame| frame.key != frame_key)
+        {
+            let second = if self.cross_chapter_spread {
+                if self.sibling_key == sibling_key {
+                    self.sibling_layout.pages.first().cloned()
+                } else {
+                    None
+                }
+            } else if window.end > self.page + 1 {
+                self.layout.pages.get(self.page + 1).cloned()
             } else {
                 None
+            };
+            let page = crate::reading_surface::compose(
+                self.layout
+                    .pages
+                    .get(self.page)
+                    .cloned()
+                    .unwrap_or_default(),
+                second,
+                rect.size(),
+                self.spread_pages,
+                first_slot,
+                plan.gap,
+            );
+            let links = std::iter::once(self.chapter)
+                .chain(if self.cross_chapter_spread {
+                    plan.second
+                } else {
+                    None
+                })
+                .filter_map(|i| self.book.chapters.get(i))
+                .flat_map(|chapter| {
+                    chapter
+                        .atoms()
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(_, atom)| atom.link.is_some())
+                        .map(|(index, _)| layout::unit_id(chapter.id, index))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            let mut prefetch = vec![(
+                self.chapter,
+                self.layout
+                    .pages
+                    .iter()
+                    .skip(self.page + self.spread_pages)
+                    .take(self.spread_pages * 2)
+                    .chain(
+                        self.layout
+                            .pages
+                            .iter()
+                            .skip(self.page.saturating_sub(self.spread_pages))
+                            .take(self.spread_pages),
+                    )
+                    .flat_map(|page| page.pictures.iter())
+                    .take(8)
+                    .cloned()
+                    .collect(),
+            )];
+            for index in self.chapter + 1
+                ..(self.chapter + 1 + self.spread_pages * 2).min(self.book.chapters.len())
+            {
+                let chapter = &self.book.chapters[index];
+                if chapter.loaded && crate::reading_surface::is_image_chapter(chapter) {
+                    let content = crate::reading_surface::content_rect(
+                        Rect::from_min_size(Pos2::ZERO, self.reading_extent),
+                        chapter,
+                        &self.settings,
+                    );
+                    let next_plan = crate::reading_surface::chapter_spread(
+                        &self.book,
+                        index,
+                        content.size(),
+                        &self.settings,
+                    );
+                    let next = layout::chapter_layout(
+                        &mut self.fonts,
+                        chapter,
+                        next_plan.extent(content.size()),
+                        &crate::reading_surface::effective_layout_settings(&self.settings, chapter),
+                    );
+                    prefetch.push((
+                        index,
+                        next.pages
+                            .iter()
+                            .take(self.spread_pages)
+                            .flat_map(|page| page.pictures.iter())
+                            .take(4)
+                            .cloned()
+                            .collect(),
+                    ));
+                }
             }
-        } else if window.end > self.page + 1 {
-            self.layout.pages.get(self.page + 1).cloned()
-        } else {
-            None
-        };
-        let page = crate::reading_surface::compose(
-            self.layout
-                .pages
-                .get(self.page)
-                .cloned()
-                .unwrap_or_default(),
-            second,
-            rect.size(),
-            self.spread_pages,
-            if self.cross_chapter_spread {
-                plan.first_slot
-            } else {
-                window.first_slot
-            },
-            plan.gap,
-        );
+            self.composed_frame = Some(ComposedFrame {
+                key: frame_key,
+                page: Arc::new(page),
+                links: Arc::new(links),
+                prefetch: Arc::new(prefetch),
+            });
+        }
+        let frame = self.composed_frame.as_ref().unwrap();
+        let page = Arc::clone(&frame.page);
+        let linked_units = Arc::clone(&frame.links);
+        let prefetch = Arc::clone(&frame.prefetch);
         let painter = ui.painter_at(rect);
         for fill in &page.header_fills {
             painter.rect_filled(fill.translate(rect.min.to_vec2()), 0., p.panel);
@@ -2486,7 +2643,16 @@ impl ReaderApp {
                 );
             }
         }
-        let annotations = self.store.annotations(&self.book.id).unwrap_or_default();
+        if self.annotation_book != self.book.id
+            || self
+                .annotations_updated
+                .is_none_or(|updated| updated.elapsed() >= Duration::from_secs(1))
+        {
+            self.annotations = Arc::new(self.store.annotations(&self.book.id).unwrap_or_default());
+            self.annotation_book.clone_from(&self.book.id);
+            self.annotations_updated = Some(Instant::now());
+        }
+        let annotations = Arc::clone(&self.annotations);
         for hit in &page.hits {
             let selected = self
                 .selected
@@ -2506,22 +2672,6 @@ impl ReaderApp {
                 );
             }
         }
-        let linked_units = std::iter::once(self.chapter)
-            .chain(if self.cross_chapter_spread {
-                plan.second
-            } else {
-                None
-            })
-            .filter_map(|i| self.book.chapters.get(i))
-            .flat_map(|c| {
-                c.atoms()
-                    .into_iter()
-                    .enumerate()
-                    .filter(|(_, a)| a.link.is_some())
-                    .map(|(i, _)| layout::unit_id(c.id, i))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<std::collections::HashSet<_>>();
         for hit in &page.hits {
             if linked_units.contains(&hit.unit_id) {
                 let target = hit.rect.translate(rect.min.to_vec2());
@@ -2533,18 +2683,8 @@ impl ReaderApp {
                 painter.line_segment(ends, egui::Stroke::new(1., p.accent));
             }
         }
-        for g in &page.glyphs {
-            self.fonts.draw_styled(
-                &painter,
-                g.face,
-                g.id,
-                rect.min + g.origin.to_vec2(),
-                g.size,
-                p.ink,
-                g.rotated,
-                g.style,
-            );
-        }
+        self.fonts
+            .draw_batch(&painter, &page.glyphs, rect.min.to_vec2(), p.ink);
         for rule in &page.rules {
             painter.rect_stroke(
                 rule.translate(rect.min.to_vec2()),
@@ -2556,70 +2696,15 @@ impl ReaderApp {
         self.ensure_pagination_index();
         self.prefetch_next_chapter();
         self.maybe_prefetch_audio(ui.ctx());
-        let nearby = self
-            .layout
-            .pages
-            .iter()
-            .skip(self.page + self.spread_pages)
-            .take(self.spread_pages * 2)
-            .chain(
-                self.layout
-                    .pages
-                    .iter()
-                    .skip(self.page.saturating_sub(self.spread_pages))
-                    .take(self.spread_pages),
-            )
-            .flat_map(|p| p.pictures.iter())
-            .take(8)
-            .cloned()
-            .collect::<Vec<_>>();
-        crate::book_images::prefetch(
-            ui.ctx(),
-            &self.book,
-            &self.book.chapters[self.chapter].href,
-            &nearby,
-            &mut self.pictures,
-            self.settings.adapt_monochrome_images.then_some(p.ink),
-        );
-        for index in self.chapter + 1
-            ..(self.chapter + 1 + self.spread_pages * 2).min(self.book.chapters.len())
-        {
-            let chapter = &self.book.chapters[index];
-            if chapter.loaded && crate::reading_surface::is_image_chapter(chapter) {
-                let content = crate::reading_surface::content_rect(
-                    Rect::from_min_size(Pos2::ZERO, self.reading_extent),
-                    chapter,
-                    &self.settings,
-                );
-                let plan = crate::reading_surface::chapter_spread(
-                    &self.book,
-                    index,
-                    content.size(),
-                    &self.settings,
-                );
-                let next = layout::chapter_layout(
-                    &mut self.fonts,
-                    chapter,
-                    plan.extent(content.size()),
-                    &crate::reading_surface::effective_layout_settings(&self.settings, chapter),
-                );
-                let pictures = next
-                    .pages
-                    .iter()
-                    .take(self.spread_pages)
-                    .flat_map(|p| p.pictures.iter())
-                    .take(4)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                crate::book_images::prefetch(
-                    ui.ctx(),
-                    &self.book,
-                    &chapter.href,
-                    &pictures,
-                    &mut self.pictures,
-                    self.settings.adapt_monochrome_images.then_some(p.ink),
-                );
-            }
+        for (chapter, pictures) in prefetch.iter() {
+            crate::book_images::prefetch(
+                ui.ctx(),
+                &self.book,
+                &self.book.chapters[*chapter].href,
+                pictures,
+                &mut self.pictures,
+                self.settings.adapt_monochrome_images.then_some(p.ink),
+            );
         }
 
         response.widget_info(|| {
@@ -2736,23 +2821,6 @@ impl ReaderApp {
         response.context_menu(|ui| {
             if ui.button("ここから読み始める").clicked() {
                 self.start_speech(self.selected.clone());
-                ui.close();
-            }
-            if ui.button("選択した部分を翻訳").clicked() {
-                if let Some(hit) = &self.selected {
-                    self.services
-                        .open_translation(hit.text.clone(), format!("{} · 翻訳", self.book.title));
-                }
-                ui.close();
-            }
-            if ui.button("この章を翻訳").clicked() {
-                self.services.open_translation(
-                    self.book.chapters[self.chapter].plain_text(),
-                    format!(
-                        "{} · {}",
-                        self.book.title, self.book.chapters[self.chapter].title
-                    ),
-                );
                 ui.close();
             }
             if ui.button("辞書を引く").clicked() {
@@ -3217,6 +3285,7 @@ impl ReaderApp {
                                 self.chapter = start.chapter as usize;
                                 self.page = 0;
                                 self.layout = BookLayout::default();
+                                self.composed_frame = None;
                                 self.layout_key.clear();
                                 self.pending_restore = Some(start);
                             }
@@ -3410,16 +3479,6 @@ impl ReaderApp {
                     );
                 }
             }
-            A::TranslateSelection => {
-                if let Some(hit) = &self.selected {
-                    self.services
-                        .open_translation(hit.text.clone(), "翻訳".into());
-                }
-            }
-            A::TranslateChapter => self.services.open_translation(
-                self.book.chapters[self.chapter].plain_text(),
-                "章の翻訳".into(),
-            ),
             A::PlayPause => self.toggle_speech(),
             A::Stop => self.stop_speech(),
             A::ReadSelection => self.start_speech(self.selected.clone()),
@@ -3581,7 +3640,10 @@ impl eframe::App for ReaderApp {
             ctx.input(|i| i.viewport().inner_rect.map(|r| r.min).unwrap_or(Pos2::ZERO));
         self.pixels_per_point = ctx.pixels_per_point();
         let p = Palette::for_settings(&self.settings);
-        p.apply(&ctx, p.is_dark());
+        if self.applied_palette != Some(p) {
+            p.apply(&ctx, p.is_dark());
+            self.applied_palette = Some(p);
+        }
         ctx.options_mut(|options| {
             options.input_options.line_scroll_speed = 40. * self.settings.scroll_speed
         });
@@ -3814,7 +3876,6 @@ impl ReaderApp {
         for action in self.services.show(ctx, &mut self.settings) {
             match action {
                 crate::services_ui::ServiceAction::OpenBook(path) => self.open_document(path),
-                crate::services_ui::ServiceAction::OpenParallel(path) => self.open_document(path),
                 crate::services_ui::ServiceAction::SettingsChanged => self.save_settings(),
                 crate::services_ui::ServiceAction::Notice(message) => self.notify(message),
             }
@@ -3822,10 +3883,6 @@ impl ReaderApp {
     }
     pub(crate) fn open_catalog_dialog(&mut self) {
         self.services.open_catalog();
-    }
-    pub(crate) fn open_translation_settings(&mut self) {
-        self.services
-            .open_translation(String::new(), "翻訳サービス".into());
     }
     fn note_popup(&mut self, ctx: &egui::Context) {
         if !self.note_open {
@@ -3870,6 +3927,7 @@ impl ReaderApp {
                 match self.store.save_annotation(&annotation) {
                     Ok(()) => {
                         self.note_open = false;
+                        self.annotations_updated = None;
                         self.notify("注釈を保存しました");
                     }
                     Err(e) => self.notify(e.to_string()),
@@ -4126,18 +4184,8 @@ impl ReaderApp {
                                 );
                             }
                         }
-                        for glyph in &page.glyphs {
-                            self.fonts.draw_styled(
-                                &painter,
-                                glyph.face,
-                                glyph.id,
-                                rect.min + glyph.origin.to_vec2(),
-                                glyph.size,
-                                p.ink,
-                                glyph.rotated,
-                                glyph.style,
-                            );
-                        }
+                        self.fonts
+                            .draw_batch(&painter, &page.glyphs, rect.min.to_vec2(), p.ink);
                         for rule in &page.rules {
                             painter.rect_stroke(
                                 rule.translate(rect.min.to_vec2()),
@@ -4570,6 +4618,7 @@ impl ReaderApp {
         self.chapter = index;
         self.page = 0;
         self.layout = BookLayout::default();
+        self.composed_frame = None;
         self.layout_key.clear();
         self.selected = None;
         self.selection_anchor = None;

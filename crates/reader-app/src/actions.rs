@@ -40,8 +40,6 @@ actions! {
     Copy, "選択文字をコピー", "選択", "Primary+C";
     Dictionary, "選択した語を辞書で引く", "選択", "D";
     PinDictionary, "辞書の固定を切り替える", "選択", "";
-    TranslateSelection, "選択文字を翻訳", "選択", "";
-    TranslateChapter, "この章を翻訳", "選択", "";
     PlayPause, "読み上げを再生・一時停止", "読み上げ", "Space";
     Stop, "読み上げを停止", "読み上げ", "";
     ReadSelection, "選択した位置から読み上げ", "読み上げ", "";

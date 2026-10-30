@@ -118,8 +118,6 @@ pub struct Settings {
     pub dictionary_paths: Vec<PathBuf>,
     pub last_book: Option<PathBuf>,
     pub opds: Option<crate::services::OpdsConfig>,
-    pub translation: Option<crate::services::TranslationConfig>,
-    pub translation_target: String,
 }
 
 impl Default for Settings {
@@ -152,8 +150,6 @@ impl Default for Settings {
             dictionary_paths: Vec::new(),
             last_book: None,
             opds: None,
-            translation: None,
-            translation_target: "JA".into(),
         }
     }
 }

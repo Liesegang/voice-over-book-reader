@@ -854,7 +854,7 @@ impl Flow<'_> {
             };
             let ruby_size = (base * self.settings.ruby_scale).min(extent / advance.max(0.01));
             let mut pen = Vec2::ZERO;
-            for glyph in glyphs {
+            for glyph in glyphs.iter() {
                 let origin = if self.vertical {
                     pos2(
                         rect.right() + ruby_size * 0.52,
@@ -1138,7 +1138,7 @@ impl Flow<'_> {
         } else {
             1.0
         };
-        for glyph in &glyphs {
+        for glyph in glyphs.iter() {
             let glyph_size = size * scale_tcy;
             let origin = if self.vertical && !rotate && !tcy {
                 pos2(self.x + size * 0.5, self.y) + pen + glyph.offset * size
@@ -1187,7 +1187,7 @@ impl Flow<'_> {
                 ruby_extent = advance;
             }
             let mut ruby_pen = Vec2::ZERO;
-            for glyph in ruby_glyphs {
+            for glyph in ruby_glyphs.iter() {
                 let origin = if self.vertical {
                     pos2(
                         self.x + size + ruby_size * 0.52,
@@ -1228,7 +1228,7 @@ impl Flow<'_> {
             }
         } else {
             let mut clusters: Vec<(usize, f32)> = Vec::new();
-            for glyph in &glyphs {
+            for glyph in glyphs.iter() {
                 let width = if self.vertical && !rotate {
                     glyph.advance.y
                 } else {
@@ -1299,7 +1299,7 @@ impl Flow<'_> {
                 } else {
                     0.0
                 };
-                for glyph in &mark {
+                for glyph in mark.iter() {
                     let origin = if self.vertical {
                         start
                             + script_shift
