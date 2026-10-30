@@ -1,0 +1,59 @@
+{
+  "native_backend": "Independent Rust inference and JPreprocess frontend; no Aivis Engine or Style-Bert-VITS2 Python implementation is bundled or linked.",
+  "jpreprocess": {
+    "version": "0.15.0",
+    "source": "https://github.com/jpreprocess/jpreprocess/tree/v0.15.0",
+    "license": "BSD-3-Clause"
+  },
+  "bert": {
+    "source": "https://huggingface.co/tsukumijima/deberta-v2-large-japanese-char-wwm-onnx",
+    "revision": "d701ec67708287b20d2063270f6b535e6eed09ab",
+    "license": "CC-BY-SA-4.0",
+    "model_sha256": "23f633ae7c5900ff82b35a428b67a54e7e7911d5d6a6dcfc77967be8f1c94dc6",
+    "tokenizer_sha256": "21a17e4d0032739e82dc60f155b4ae37e94519103e0d399657fdd249ec3e7905"
+  },
+  "voices": "AIVMX weights remain separate downloads or user files. Each embedded manifest license applies independently; imported models are not relicensed.",
+  "default_voice": {
+    "name": "まお",
+    "uuid": "a59cb814-0083-4369-8542-f51a29e72af7",
+    "version": "1.2.0",
+    "bytes": 258037076,
+    "sha256": "f87ccea2e8e2de0e0bfe52e803945af903b4086bf25621a015111628f00e4119",
+    "license": "ACML 1.0",
+    "source": "https://hub.aivis-project.com/aivm-models/a59cb814-0083-4369-8542-f51a29e72af7",
+    "download": "https://api.aivis-project.com/v1/aivm-models/a59cb814-0083-4369-8542-f51a29e72af7/download?model_type=AIVMX",
+    "license_retention": "The original AIVM manifest license is preserved at runtime, not inferred from software licenses."
+  },
+  "files": [
+    {
+      "file": "JPreprocess-LICENSE.txt",
+      "bytes": 1506,
+      "sha256": "f8767dd00ac8757073b3ebd9dc8bce90cad4b6a507b7ada33b7aa3448f1bf555",
+      "source": "https://raw.githubusercontent.com/jpreprocess/jpreprocess/v0.15.0/LICENSE"
+    },
+    {
+      "file": "OpenJTalk-NOTICE.txt",
+      "bytes": 3111,
+      "sha256": "7fc3a922a5be77fbefdb028329e172ceee4847bd7f1623b39e3a39445eed4bff",
+      "source": "https://raw.githubusercontent.com/jpreprocess/jpreprocess/v0.15.0/NOTICE"
+    },
+    {
+      "file": "NAIST-JDIC-NOTICE.txt",
+      "bytes": 7965,
+      "sha256": "f432d87128cdf954ebdb1419864af37436b0af6fe3d39d653c47f063a4f8fde1",
+      "source": "https://raw.githubusercontent.com/jpreprocess/jpreprocess/v0.15.0/crates/jpreprocess-naist-jdic/NOTICE.txt"
+    },
+    {
+      "file": "BERT-MODEL-CARD.md",
+      "bytes": 33,
+      "sha256": "f35ac7b30195da3b9b01d156fe7f0626e0ae4ac7f6d5757eb0b6ee3b8f31dcab",
+      "source": "https://huggingface.co/tsukumijima/deberta-v2-large-japanese-char-wwm-onnx/raw/d701ec67708287b20d2063270f6b535e6eed09ab/README.md"
+    },
+    {
+      "file": "CC-BY-SA-4.0.txt",
+      "bytes": 20138,
+      "sha256": "28a9529c7d0bb4dc51f4bf5c116a3d16ef247a052f7591466768ddf563fd1cf5",
+      "source": "https://creativecommons.org/licenses/by-sa/4.0/legalcode.txt"
+    }
+  ]
+}

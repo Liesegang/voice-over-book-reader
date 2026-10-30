@@ -1,0 +1,45 @@
+Kokoro and the native Japanese frontend
+======================================
+
+Kokoro 82M v1.0 model and ONNX conversion
+https://huggingface.co/hexgrad/Kokoro-82M
+https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX
+Apache License 2.0 (complete text in Misaki-LICENSE.txt).
+The unmodified model cards, including their training-data acknowledgements,
+and exact source revisions are retained in this directory and SOURCES.json.
+Locally generated *.duration-v1.onnx files modify the ONNX graph outputs to
+expose the existing duration prediction. They do not retrain the model.
+
+audio.cpp v0.9.3 native Japanese phoneme rules
+Copyright 2026 ShugoAI LLC
+https://github.com/0xShug0/audio.cpp/tree/v0.9.3
+Apache License 2.0; complete original notice in audio.cpp-LICENSE.txt.
+Voice Over Book Reader adapts these rules to Rust with source-range tracking,
+its own normalization, punctuation handling, and speech timing integration.
+
+Misaki 0.9.4 G2P rules and resources
+https://pypi.org/project/misaki/0.9.4/
+https://github.com/hexgrad/misaki
+Apache License 2.0; complete original text in Misaki-LICENSE.txt.
+Misaki's cutlet.py states that it was adapted from the MIT-licensed Cutlet:
+Copyright (c) 2020 Paul O'Leary McCann
+https://github.com/polm/cutlet
+The complete original MIT notice is retained in Cutlet-LICENSE.txt.
+No independent Python Cutlet or Misaki package is installed by the reader.
+
+Optional NVIDIA runtimes retain their own proprietary terms separately:
+NVIDIA-CUDA-cuBLAS-LICENSE.txt and NVIDIA-cuDNN-LICENSE.txt are unchanged
+copies from the exact pinned PyPI wheels. The latter contains an older SDK
+supplement; it is not replaced by a newer online agreement. The original
+cuDNN 9.8 acknowledgements page is retained as supplemental attribution in
+NVIDIA-cuDNN-ACKNOWLEDGEMENTS.html. These texts do not indicate that NVIDIA
+binaries are bundled with this reader, or that they are covered by MIT.
+
+UniDic and MeCab are separate from these licenses. The verified Kokoro GGUF
+retains the UniDic package's MIT notice and the dictionary's AUTHORS, COPYING,
+BSD, GPL and LGPL texts. The BSD option supplied by the UniDic Consortium is
+used for dictionary data. Pinned fugashi wheels supply native MeCab and retain
+LICENSE.mecab and LICENSE.fugashi. The reader does not load Python code.
+
+The reader's own MIT license does not relicense these components. Keep their
+original notices, model cards, and applicable terms with separate copies.

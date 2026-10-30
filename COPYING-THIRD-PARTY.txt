@@ -1,0 +1,152 @@
+Voice Over Book Reader third-party components
+==========================
+
+The independent Voice Over Book Reader Rust workspace code is available under MIT.
+Third-party code, font data, dictionary data, and separately acquired runtime
+or model assets retain their own licenses and notices. This file does not
+relicense them or replace their original notices.
+
+Build-specific Rust dependencies
+-------------------------------
+
+scripts/ci-package.py generates THIRD-PARTY-NOTICES.txt for each release ZIP
+from Cargo's resolved package metadata. It includes dependency versions,
+license expressions, source URLs, and available license/notice files from
+the published package contents. Keep this generated file with the binaries.
+
+Bundled fonts
+-------------
+
+Noto Sans, Noto Serif, JetBrains Mono, and STIX Two Math are bundled fonts.
+Their original copyright statements, any reserved font names, and complete
+SIL Open Font License 1.1 texts are retained in assets/fonts/LICENSE*.txt.
+The packaging script copies those files to licenses/fonts/ in each ZIP.
+
+Font projects:
+https://github.com/notofonts
+https://github.com/JetBrains/JetBrainsMono
+https://github.com/stipub/stixfonts
+
+Embedded Japanese dictionary data
+--------------------------------
+
+Lindera embeds mecab-ipadic-2.7.0-20070801 data for Japanese word lookup.
+The original NAIST and ICOT notices are retained in:
+  crates/reader-core/licenses/IPADIC-NOTICE.txt (source tree)
+  COPYING-IPADIC.txt (root copy included by the release packager)
+
+Keep the complete notice with binaries containing the embedded dictionary.
+User-selected MDX/MDD dictionaries are not supplied by Voice Over Book Reader.
+
+Sonic playback-speed library
+----------------------------
+
+Sonic library
+Copyright 2010 Bill Cox
+https://github.com/waywardgeek/sonic
+Apache License 2.0
+
+Voice Over Book Reader's vendored copy includes local extensions recording actual speed
+operations for the playback clock map. Original copyright headers and the
+complete license are retained under crates/reader-speech/vendor/sonic/.
+Release ZIPs include that license as licenses/Sonic-LICENSE.txt.
+
+Separately acquired speech assets
+---------------------------------
+
+The release ZIP does not contain audio.cpp or ONNX Runtime libraries,
+Irodori or Kokoro model weights, or Qwen3 ForcedAligner weights. The application acquires pinned
+assets in application data on first use. SPEECH.md in the ZIP (docs/speech.md
+in the source tree) records versions, sizes, checksums, and source links.
+
+audio.cpp v0.9.3
+Copyright 2026 ShugoAI LLC
+Apache License 2.0
+https://github.com/0xShug0/audio.cpp/tree/v0.9.3
+
+Irodori-TTS v4.1 Small MeanFlow
+MIT; the model card also states additional voice-use restrictions and
+disclaimers, including no nonconsensual voice impersonation and no deceptive
+synthetic speech. Refer to the original card and terms before using the model:
+https://huggingface.co/Aratako/Irodori-TTS-v4.1-Small-MF
+
+Qwen3 ForcedAligner 0.6B
+Apache License 2.0
+https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B
+
+Converted GGUF packages, including the Irodori tokenizer and DACVAE codec:
+https://huggingface.co/audio-cpp/audio.cpp-gguf/tree/462b4ce
+The converter does not replace the original model or component license terms.
+
+Kokoro 82M v1.0 ONNX
+Apache License 2.0
+https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX
+
+ONNX Runtime v1.22.0
+MIT; the installed runtime retains its LICENSE and ThirdPartyNotices.
+https://github.com/microsoft/onnxruntime/releases/tag/v1.22.0
+
+Misaki 0.9.4 Japanese pronunciation resources
+Apache License 2.0
+https://pypi.org/project/misaki/0.9.4/
+The Cutlet-derived rules retain Cutlet's original MIT notice:
+Copyright (c) 2020 Paul O'Leary McCann
+https://github.com/polm/cutlet
+Original notices, model cards, source revisions and local modification notes are
+retained in crates/reader-speech/licenses/kokoro/ and installed with managed
+assets under the runtime's licenses/kokoro/ directory. The Japanese GGUF keeps
+g2p/versions.json (Misaki 0.9.4; unidic Python package 1.1.0). The Python package
+version is distinct from the dictionary dataset version. The pinned GGUF hash
+identifies the actual dictionary bytes; no mutable latest dictionary is fetched.
+UniDic dictionary data retains its package MIT notice and the dictionary's
+AUTHORS, COPYING, BSD, GPL and LGPL texts; the included BSD option is used.
+Native MeCab and its notices are extracted from pinned fugashi 1.5.2 distributions;
+the application does not load the Python package. Original native-library and
+dictionary licenses remain in the installed resources' notices directories.
+
+Optional NVIDIA CUDA runtime, cuBLAS, and cuDNN
+These are separately licensed proprietary NVIDIA components, not part of the
+reader's MIT license. Their license notices are retained alongside the
+downloaded native DLLs. Package versions and source links are recorded in
+SPEECH.md. The release ZIP does not redistribute these GPU runtime assets.
+New NVIDIA runtime downloads require separate explicit permission after the
+CUDA and cuDNN license links in the Kokoro settings; legacy settings default to
+no permission. Without it, the reader uses CPU or compatible installed libraries.
+
+Kokoro's detailed pins and retention audit are in docs/license-audit-kokoro.md
+in the source tree (LICENSE-AUDIT-KOKORO.md in release packages).
+
+If these runtime libraries or model files are redistributed separately,
+retain their upstream copyright statements, licenses, component notices,
+and applicable model-card terms with those files.
+
+Separately acquired PDF engine
+-----------------------------
+
+PDFium binaries are obtained on the first PDF open, not bundled in the ZIP.
+The pinned package is chromium/8125 from:
+https://github.com/bblanchon/pdfium-binaries/releases/tag/chromium%2F8125
+The project hosts builds of PDFium:
+https://pdfium.googlesource.com/pdfium/
+
+PDFium and its bundled third-party components have their own licenses.
+The application retains license files from the downloaded package beneath
+the installed runtime's notices directory. Preserve those notices if the
+runtime is redistributed, including when supplying PDFIUM_LIBRARY_PATH.
+
+External applications and services
+----------------------------------
+
+The headless VOICEROID2 ABI bridge adapts the callback/ABI descriptions in
+Nkyoku/pyvcroid2, Copyright (c) 2021 Nkyoku, MIT:
+https://github.com/Nkyoku/pyvcroid2
+Its complete notice is retained at
+  crates/reader-voiceroid-bridge/licenses/pyvcroid2-LICENSE
+and included in ZIPs as licenses/pyvcroid2-LICENSE.txt.
+VOICEROID2's original engine, licenses, and voice data are not redistributed.
+The bridge uses the user's installed product through its normal native API;
+the product's own license and output-audio terms continue to apply.
+
+Calibre/ebook-convert, installed system voices, user-selected command TTS,
+VOICEVOX/OpenAI-compatible servers, DeepL, and Yandex are not bundled here.
+Their own software licenses, service terms, and any usage charges apply.

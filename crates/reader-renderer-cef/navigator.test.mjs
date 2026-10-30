@@ -1,0 +1,23 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+const context={TextEncoder,console,setTimeout,clearTimeout};
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(new URL('./src/navigator.js',import.meta.url),'utf8'),context);
+const {toUtf16,toUtf8}=context.__vobrBook.testing;
+const element=(name,...childNodes)=>({nodeType:1,localName:name,childNodes});
+const t=data=>({nodeType:3,data,childNodes:[]});
+const c=data=>({nodeType:4,data,childNodes:[]});
+const comment={nodeType:8,childNodes:[]};
+const tree=element('html',element('head',element('style',t('x{}'))),element('body',element('p',t('漢'),c('😀'),t('字'),comment,t('文')),element('ruby',t('頁'),element('rt',t('ページ')))));
+const nodes=context.__vobrBook.testing.snapshotSourceNodes(tree);
+assert.deepEqual(Array.from(nodes,n=>n.parts?n.text:n.dom.localName),['html','head','style','x{}','body','p','漢😀字','文','ruby','頁','rt','ページ']);
+assert.deepEqual(Array.from(nodes[6].parts,p=>p.prefix),[0,3,7]);
+const text='漢😀e\u0301𠮷文';
+const pairs=[[0,0],[3,1],[7,3],[8,4],[10,5],[14,7],[17,8]];
+for(const [bytes,units] of pairs){assert.equal(toUtf16(text,bytes),units);assert.equal(toUtf8(text,units),bytes);}
+for(const offset of [1,2,4,5,6,9,11,12,13,15,16,18])assert.throws(()=>toUtf16(text,offset));
+assert.throws(()=>toUtf8(text,2));assert.throws(()=>toUtf8(text,6));
+await context.__vobrBook.dispatch({type:'page',revision:987,index:1});
+assert.equal(context.__vobrBook.drain().length,0,'old revisions must not move pages');
+console.log('navigator protocol: UTF-8/UTF-16, astral/combining characters, boundaries and revision checks passed');

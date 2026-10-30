@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A native Rust desktop EPUB reader with vertical Japanese text, ruby, text-to-speech, Calibre, and MDX/MDD dictionaries.">
+  <meta name="theme-color" content="#f8fafc">
+  <meta property="og:title" content="Voice Over Book Reader">
+  <meta property="og:description" content="A native Rust desktop EPUB reader with vertical Japanese text, ruby, text-to-speech, Calibre, and MDX/MDD dictionaries.">
+  <meta property="og:type" content="website">
+  <title>Voice Over Book Reader | Japanese books, read and spoken.</title>
+  <link rel="icon" href="../assets/app-icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="../styles.css">
+  <link rel="alternate" hreflang="ja" href="../index.html">
+  <link rel="alternate" hreflang="en" href="../en/index.html">
+  <script src="../preview.js" defer></script>
+</head>
+<body>
+  <a class="skip" href="#main">Skip to content</a>
+  <header class="header wrap">
+    <a class="brand" href="index.html"><img src="../assets/app-icon.svg" width="40" height="40" alt=""><span>Voice Over<br>Book Reader</span></a>
+    <nav class="nav" aria-label="Main navigation">
+      <a class="feature-link" href="#features">Features</a>
+      <a href="#download">Download</a>
+      <a class="language" href="../" lang="ja" hreflang="ja">日本語</a>
+    </nav>
+  </header>
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="title">
+      <div class="hero-copy">
+        <p class="product-type">A native Rust desktop EPUB reader</p>
+        <h1 id="title">Japanese books,<br>read and spoken.</h1>
+        <p>Read vertical text and ruby, or listen from the line you choose. Connect your Calibre library and use the MDX/MDD dictionaries you already own.</p>
+        <div class="actions"><a class="button" href="#download"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m-5-5 5 5 5-5M4 16v5h16v-5"/></svg>Choose a download</a><a class="source-link" href="https://github.com/Liesegang/voice-over-book-reader">Source code</a></div>
+        <p class="availability">Windows / macOS / Linux</p>
+      </div>
+      <figure class="reader-demo" data-reader-theme="light">
+        <div class="reader-window" aria-hidden="true">
+          <div class="reader-caption"><span>青い栞</span><span class="window-dots"><i></i><i></i><i></i></span></div>
+          <div class="book-page"><div class="vertical-page" lang="ja">
+            <p class="book-heading">青い<ruby>栞<rt>しおり</rt></ruby></p>
+            <p>朝の光が、窓辺の本を照らす。</p>
+            <p>昨日の続きへ、<ruby>頁<rt>ページ</rt></ruby>を開く。</p>
+            <p>一行ずつ、<mark>言葉に耳を澄ます。</mark></p>
+            <p>青い栞を挟み、また先へ進む。</p>
+          </div></div>
+          <div class="reader-footer"><span>青い栞</span><span>Kokoro · 1.75×</span><span>38 / 100</span></div>
+          <div class="reader-progress"></div>
+        </div>
+        <figcaption class="preview-meta"><span class="preview-label">Illustrative reading view with original sample text.</span><div class="themes" role="group" aria-label="Illustration theme" hidden><button type="button" data-theme="light" aria-pressed="true">Light</button><button type="button" data-theme="sepia" aria-pressed="false">Sepia</button><button type="button" data-theme="dark" aria-pressed="false">Dark</button></div></figcaption>
+      </figure>
+    </section>
+    <div class="wrap">
+      <section class="intro" id="features" aria-labelledby="features-title"><h2 id="features-title">Keep your place.<br>Read your way.</h2><p>Choose a passage, select a voice, and look up a word. Menus sit over the page, while the library lives in a separate window.</p></section>
+      <div class="features"><article class="feature"><div class="feature-title"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 5h6l2 2 2-2h6v15h-6l-2 1-2-1H4zM12 7v14"/></svg><h3>Read Japanese typography</h3></div><div><p>Vertical and horizontal text, ruby, and inline images. Image spreads follow page metadata and aspect ratios; the gap between text pages is a separate option.</p><p class="note">Choose light, dark, sepia, and other palettes. Use installed fonts and adjust each page margin.</p></div></article><article class="feature"><div class="feature-title"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 9h4l5-4v14l-5-4H4zM17 8a6 6 0 0 1 0 8M20 5a10 10 0 0 1 0 14"/></svg><h3>Listen from a chosen line</h3></div><div><p>Select a position in the text to start reading. Highlights use actual speech timing, while prefetch and caching prepare the next passage.</p><p class="note">Use Irodori, Kokoro, native Aivis model inference, Windows voices, or external TTS. Register pronunciations and play prepared audio at 0.5 to 10× speed.</p></div></article><article class="feature"><div class="feature-title"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M3 20h18M4 5h4v12H4zM10 3h4v14h-4zM16 6l4-1 2 11-4 1z"/></svg><h3>Bring your library and dictionaries</h3></div><div><p>Browse a Calibre library and open several books in separate windows. Switch between covers and rows, or create your own shelves.</p><p class="note">MDX/MDD results appear as continuous definitions. Move, resize, or pin the dictionary popup.</p></div></article></div>
+    </div>
+    <section class="download-band" id="download" aria-labelledby="download-title"><div class="download-layout wrap">
+      <div><h2 id="download-title">Start reading<br>on your desktop.</h2><p>Choose the files for your operating system on GitHub Releases.</p></div>
+      <div>
+        <article class="platform"><h3>Windows</h3><p>x64 installer / ZIP<br>Per-user installation, no admin rights</p><a href="https://github.com/Liesegang/voice-over-book-reader/releases/latest" aria-label="Windows: View releases">View releases</a></article>
+        <article class="platform"><h3>macOS</h3><p>Apple Silicon / Intel<br>Separate ZIPs for both architectures</p><a href="https://github.com/Liesegang/voice-over-book-reader/releases/latest" aria-label="macOS: View releases">View releases</a></article>
+        <article class="platform"><h3>Linux</h3><p>x64 ZIP<br>Requires GTK, WebKitGTK, and ALSA</p><a href="https://github.com/Liesegang/voice-over-book-reader/releases/latest" aria-label="Linux: View releases">View releases</a></article>
+        <p class="download-note">Native testing has focused on Windows. macOS/Linux still need further testing on each platform.</p>
+      </div>
+    </div></section>
+    <section class="questions wrap" aria-labelledby="questions-title"><h2 id="questions-title">Before you start.</h2><div><details><summary>Can synthesis always keep up at 10×?</summary><p>The 0.5 to 10× range controls playback of prepared audio. Uncached synthesis throughput depends on the model and hardware. Initial downloads and model loading also take time.</p></details><details><summary>Can this be the default EPUB app?</summary><p>The Windows installer can register the reader in Open with and Default apps. Choose the default in Windows Settings; the installer does not replace UserChoice.</p></details><details><summary>Does it render every EPUB exactly?</summary><p>The current native renderer supports a subset of EPUB HTML/CSS. Complex layouts and scripts have limitations. The project does not claim full EPUB conformance.</p></details><details><summary>Are the voices and models also MIT?</summary><p>MIT applies to original project code. External models, voices, dictionary data, and runtimes have their own terms. Neural model weights are not included in the app downloads.</p></details><p><a href="https://github.com/Liesegang/voice-over-book-reader/blob/main/docs/epub-support.md">Formats and current limits</a></p></div></section>
+  </main>
+  <footer class="footer wrap"><p>A native Rust reading app.<br>Source books, Calibre files, and user dictionaries stay read-only.</p><div class="footer-links"><a href="https://github.com/Liesegang/voice-over-book-reader/blob/main/README.md">English README</a><a href="https://github.com/Liesegang/voice-over-book-reader/blob/main/LICENSE-MIT">MIT</a><a href="https://github.com/Liesegang/voice-over-book-reader/blob/main/docs/license-audit.md">Speech license review</a></div></footer>
+</body>
+</html>

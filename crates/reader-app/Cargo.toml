@@ -1,0 +1,35 @@
+[package]
+name = "voice-over-book-reader"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+eframe = { version = "0.37", default-features = false, features = ["accesskit", "clipboard", "default_fonts", "links", "system_fonts", "wayland", "wgpu", "x11"] }
+egui_extras = { version = "0.37", features = ["image", "svg"] }
+rfd = "0.17"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
+fontdb = "0.23"
+harfrust = "0.15"
+swash = "0.2"
+formulary = "0.3"
+resvg = "0.45"
+unicode-segmentation = "1"
+unicode-vo = "0.1"
+raw-window-handle = "0.6"
+reader-core = { path = "../reader-core" }
+reader-library = { path = "../reader-library" }
+reader-speech = { path = "../reader-speech" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version="0.61", features=["Win32_Foundation","Win32_Graphics_Dwm"] }
+
+[dev-dependencies]
+tempfile = "3"
+zip = { version = "4", default-features = false, features = ["deflate"] }

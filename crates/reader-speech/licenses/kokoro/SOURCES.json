@@ -1,0 +1,55 @@
+[
+  {
+    "file": "Kokoro-ONNX-MODEL-CARD.md",
+    "source": "https://huggingface.co/onnx-community/Kokoro-82M-v1.0-ONNX/raw/468588286ebb2dd77c25b9771e5d165896538cce/README.md",
+    "sha256": "f8a44cced54ac933828f5367d4875422d1f48716bfdc01fd3ddee749b0be5c77",
+    "bytes": 7540
+  },
+  {
+    "file": "Kokoro-BASE-MODEL-CARD.md",
+    "source": "https://huggingface.co/hexgrad/Kokoro-82M/raw/f3ff3571791e39611d31c381e3a41a3af07b4987/README.md",
+    "sha256": "91dcabced89db6f109b8786642f50402d3ee87450e8189589b6f85520e7f4d78",
+    "bytes": 6348
+  },
+  {
+    "file": "audio.cpp-LICENSE.txt",
+    "source": "https://raw.githubusercontent.com/0xShug0/audio.cpp/v0.9.3/LICENSE",
+    "sha256": "8f0b762d062e1ec79a3e73189b29474051c0e957973f43146aefeb03f2e11581",
+    "bytes": 10276
+  },
+  {
+    "file": "Cutlet-LICENSE.txt",
+    "source": "https://raw.githubusercontent.com/polm/cutlet/master/LICENSE",
+    "sha256": "8736ad0d4636cb6dabae3e97e99c08f5c0c08b8c451f1d489b29a0d63bebf074",
+    "bytes": 1076
+  },
+  {
+    "file": "Misaki-LICENSE.txt",
+    "source": "https://pypi.org/project/misaki/0.9.4/",
+    "wheel_sha256": "90e2eeb169786c014c429e5058d2ea6bcd02d651f2a24450ba6c9ffc0f8da15a",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "bytes": 11357
+  },
+  {
+    "file": "NVIDIA-CUDA-cuBLAS-LICENSE.txt",
+    "source": "https://pypi.org/project/nvidia-cuda-runtime-cu12/12.8.90/#files",
+    "wheel": "nvidia_cuda_runtime_cu12-12.8.90-py3-none-win_amd64.whl",
+    "wheel_sha256": "c0c6027f01505bfed6c3b21ec546f69c687689aad5f1a377554bc6ca4aa993a8",
+    "sha256": "ad6f5853fba0ca0d159d0f58d49ae49830c2f8c93f7a92648b9ce90adb4c6ccd",
+    "bytes": 59262
+  },
+  {
+    "file": "NVIDIA-cuDNN-LICENSE.txt",
+    "source": "https://pypi.org/project/nvidia-cudnn-cu12/9.8.0.87/#files",
+    "wheel": "nvidia_cudnn_cu12-9.8.0.87-py3-none-win_amd64.whl",
+    "wheel_sha256": "b4b5cfddc32aa4180f9d390ee99e9a9f55a89e7087329b41aba4319327e22466",
+    "sha256": "49cf79bdb35734b52fe6203013b3bd759f81e998cd32aa2c65c51db9a88c61d2",
+    "bytes": 18174
+  },
+  {
+    "file": "NVIDIA-cuDNN-ACKNOWLEDGEMENTS.html",
+    "source": "https://docs.nvidia.com/deeplearning/cudnn/backend/v9.8.0/reference/acknowledgements.html",
+    "sha256": "c07c1e35aaf6a92a8a6f88204aee1d09281d952f831121d574097c4ef9d2df82",
+    "bytes": 29227
+  }
+]

@@ -1,0 +1,169 @@
+name: Native desktop CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: native-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  native:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      # Standard hosted labels checked against GitHub's runner reference:
+      # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runner: windows-2025
+            target: x86_64-pc-windows-msvc
+          - platform: macos-aarch64
+            runner: macos-15
+            target: aarch64-apple-darwin
+          - platform: macos-x86_64
+            runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Linux native libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev \
+            libx11-dev libxi-dev libxcursor-dev libxrandr-dev libvulkan1 \
+            fonts-noto-cjk
+
+      - name: Pin the macOS deployment target
+        if: runner.os == 'macOS'
+        run: echo "MACOSX_DEPLOYMENT_TARGET=15.0" >> "$GITHUB_ENV"
+
+      - name: Rust 1.97.0
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
+          rustup target add --toolchain 1.97.0 "${{ matrix.target }}"
+          rustc +1.97.0 --version
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ matrix.target }}-1.97-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ matrix.target }}-1.97-
+
+      - name: Formatting
+        run: cargo +1.97.0 fmt --all --check
+
+      - name: Workspace build
+        run: cargo +1.97.0 build --workspace --all-targets --locked --target "${{ matrix.target }}"
+
+      - name: Offline-capable unit and fixture tests
+        # The default tests never synthesize speech, download neural models,
+        # open a GUI, or require an audio device. Native PDF/TTS smokes are ignored.
+        run: cargo +1.97.0 test --workspace --all-targets --locked --target "${{ matrix.target }}"
+
+      - name: Release binaries
+        run: cargo +1.97.0 build --workspace --release --bins --locked --target "${{ matrix.target }}"
+
+      - name: Windows 32-bit native VOICEROID2 DLL host
+        if: runner.os == 'Windows'
+        run: |
+          rustup target add --toolchain 1.97.0 i686-pc-windows-msvc
+          cargo +1.97.0 test -p reader-voiceroid-bridge --locked --target i686-pc-windows-msvc
+          cargo +1.97.0 build -p reader-voiceroid-bridge --release --locked --target i686-pc-windows-msvc
+
+      - name: Packaging fixture tests
+        run: python scripts/ci-test-package.py
+
+      - name: Windows installer boundary tests
+        if: runner.os == 'Windows'
+        run: python scripts/test-windows-installer.py
+
+      - name: Package native processes and license notices
+        run: python scripts/ci-package.py --target "${{ matrix.target }}" --output-dir target/packages
+
+      - name: Verified Inno Setup 6.7.4 compiler
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $toolRoot = Join-Path $env:RUNNER_TEMP 'vobr-inno-6.7.4'
+          New-Item -ItemType Directory -Path $toolRoot -Force | Out-Null
+          $download = Join-Path $toolRoot 'innosetup-6.7.4.exe'
+          Invoke-WebRequest -Uri 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe' -OutFile $download
+          $expected = 'a549929319f9120716677c685535ca4671e4b937b5fdc87e2585f32d8eb30e8c'
+          if ((Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash -ne $expected) {
+            throw 'Inno Setup download SHA-256 mismatch'
+          }
+          $signature = Get-AuthenticodeSignature -LiteralPath $download
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)CN=Pyrsys B\.V\.(,|$)') {
+            throw 'Inno Setup download has an invalid or unexpected Authenticode signer'
+          }
+          $compilerDir = Join-Path $toolRoot 'compiler'
+          $arguments = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER', '/TASKS=', ('/DIR="' + $compilerDir + '"'))
+          $install = Start-Process -FilePath $download -ArgumentList $arguments -WindowStyle Hidden -PassThru -Wait
+          if ($install.ExitCode -ne 0) { throw "Inno compiler setup failed: $($install.ExitCode)" }
+          $compiler = Join-Path $compilerDir 'ISCC.exe'
+          $signature = Get-AuthenticodeSignature -LiteralPath $compiler
+          if ($signature.Status -ne 'Valid' -or $signature.SignerCertificate.Subject -notmatch '(^|,\s*)CN=Pyrsys B\.V\.(,|$)') {
+            throw 'Installed Inno compiler has an invalid or unexpected Authenticode signer'
+          }
+          "ISCC=$compiler" >> $env:GITHUB_ENV
+
+      - name: Compile per-user Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $packages = @(Get-ChildItem -LiteralPath target/packages -Filter '*-x86_64-pc-windows-msvc.zip' -File)
+          if ($packages.Count -ne 1) { throw 'Expected exactly one native Windows release ZIP' }
+          python scripts/build-windows-installer.py --package $packages[0].FullName --iscc $env:ISCC --output-dir target/installers
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload release ZIP
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: voice-over-book-reader-${{ matrix.platform }}
+          path: |
+            target/packages/*.zip
+            target/packages/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+      - name: Upload Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: voice-over-book-reader-windows-x64-installer
+          path: |
+            target/installers/*.exe
+            target/installers/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

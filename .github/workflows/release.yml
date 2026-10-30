@@ -1,0 +1,183 @@
+name: Release native desktop packages
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-tag:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Match the tag, workspace, and locked application version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, pathlib, re, tomllib
+          tag = os.environ['RELEASE_TAG']
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version']
+          assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag), 'Use a stable vMAJOR.MINOR.PATCH tag'
+          assert tag == f'v{version}', 'Tag and workspace version differ'
+          locked = tomllib.loads(pathlib.Path('Cargo.lock').read_text())['package']
+          assert next(p['version'] for p in locked if p['name'] == 'voice-over-book-reader') == version
+          print(f'Validated release tag {tag}')
+          PY
+
+  # Reuse exactly the normal four-target tests, release builds, ZIP licensing,
+  # x86 VOICEROID2 helper build, and verified Windows Inno compiler/installer.
+  # No models, installed proprietary voices, or engine DLLs are distributed.
+  native-packages:
+    needs: validate-tag
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  publish:
+    needs: [validate-tag, native-packages]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: voice-over-book-reader-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify all ten assets before creating a release
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, pathlib, struct, zipfile
+          version = os.environ['RELEASE_TAG'].removeprefix('v')
+          root = pathlib.Path('release-assets')
+          targets = ('x86_64-pc-windows-msvc', 'aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-gnu')
+          archives = [f'voice-over-book-reader-{version}-{target}.zip' for target in targets]
+          setup = f'voice-over-book-reader-{version}-windows-x64-setup.exe'
+          payloads = archives + [setup]
+          expected = set(payloads + [name + '.sha256' for name in payloads])
+          assert {path.name for path in root.iterdir()} == expected, 'Missing or unexpected release assets'
+          for name in payloads:
+              path = root / name
+              with path.open('rb') as stream:
+                  digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+              assert (root / (name + '.sha256')).read_text().strip() == f'{digest}  {name}', f'Invalid SHA-256: {name}'
+          for target, name in zip(targets, archives):
+              with zipfile.ZipFile(root / name) as archive:
+                  assert archive.testzip() is None, f'Bad ZIP CRC: {name}'
+                  prefix = f'voice-over-book-reader-{version}-{target}/'
+                  names = archive.namelist()
+                  assert len(names) == len(set(names)), 'Duplicate ZIP entries'
+                  assert all(n.startswith(prefix) and '..' not in pathlib.PurePosixPath(n).parts for n in names)
+                  assert not any(n.lower().endswith(('.gguf', '.onnx', '.safetensors', '.dll', '.wav')) for n in names), 'Unexpected model or runtime asset'
+                  metadata = json.loads(archive.read(prefix + 'BUILD.json'))
+                  assert (metadata['application'], metadata['version'], metadata['target']) == ('voice-over-book-reader', version, target)
+                  for required in ('README.md', 'README.ja.md', 'SPEECH.md', 'EPUB-SUPPORT.md', 'THIRD-PARTY-NOTICES.txt',
+                                   'LICENSE-AUDIT.md', 'LICENSE-AUDIT-AIVIS-VOICEVOX.md', 'LICENSE-AUDIT-KOKORO.md',
+                                   'licenses/LICENSE-MIT', 'licenses/Apache-2.0.txt', 'licenses/Sonic-LICENSE.txt',
+                                   'licenses/pyvcroid2-LICENSE.txt', 'licenses/COPYING-THIRD-PARTY.txt'):
+                      assert archive.getinfo(prefix + required).file_size > 0, f'Missing notice: {required}'
+                  kokoro = prefix + 'licenses/kokoro/'
+                  for notice in ('NOTICE.txt', 'SOURCES.json', 'audio.cpp-LICENSE.txt', 'Misaki-LICENSE.txt',
+                                 'Cutlet-LICENSE.txt', 'Kokoro-ONNX-MODEL-CARD.md', 'Kokoro-BASE-MODEL-CARD.md',
+                                 'NVIDIA-CUDA-cuBLAS-LICENSE.txt', 'NVIDIA-cuDNN-LICENSE.txt',
+                                 'NVIDIA-cuDNN-ACKNOWLEDGEMENTS.html'):
+                      assert archive.getinfo(kokoro + notice).file_size > 0, f'Missing Kokoro notice: {notice}'
+                  for record in json.loads(archive.read(kokoro + 'SOURCES.json')):
+                      original = archive.read(kokoro + record['file'])
+                      assert len(original) == record['bytes']
+                      assert hashlib.sha256(original).hexdigest() == record['sha256'], 'Changed original notice'
+                  for provider in ('kokoro', 'aivis-native'):
+                      original_dir = pathlib.Path('crates/reader-speech/licenses') / provider
+                      originals = {path.relative_to(original_dir).as_posix(): path.read_bytes()
+                                   for path in original_dir.rglob('*') if path.is_file()}
+                      notice_prefix = prefix + 'licenses/' + provider + '/'
+                      assert {n.removeprefix(notice_prefix) for n in names if n.startswith(notice_prefix)} == set(originals)
+                      for relative, original in originals.items():
+                          assert archive.read(notice_prefix + relative) == original, f'Changed source notice: {provider}/{relative}'
+                  native = prefix + 'licenses/aivis-native/'
+                  for record in json.loads(archive.read(native + 'SOURCES.json'))['files']:
+                      original = archive.read(native + record['file'])
+                      assert len(original) == record['bytes']
+                      assert hashlib.sha256(original).hexdigest() == record['sha256'], 'Changed native Aivis notice'
+                  windows = 'windows' in target
+                  binary_dir = prefix + ('Voice Over Book Reader.app/Contents/MacOS/' if 'apple' in target else '')
+                  processes = ['voice-over-book-reader', 'reader-dictionary-popup']
+                  if windows:
+                      processes = [p + '.exe' for p in processes] + ['reader-voiceroid-bridge.exe']
+                  assert metadata['native_processes'] == processes
+                  for process in processes:
+                      with archive.open(binary_dir + process) as stream:
+                          header = stream.read(4096)
+                      if windows:
+                          offset = struct.unpack_from('<I', header, 60)[0]
+                          assert header[:2] == b'MZ' and header[offset:offset+4] == b'PE\0\0'
+                          machine = struct.unpack_from('<H', header, offset+4)[0]
+                          assert machine == (0x14c if process == 'reader-voiceroid-bridge.exe' else 0x8664)
+                      elif 'apple' in target:
+                          assert header[:4] == b'\xcf\xfa\xed\xfe', 'Expected a 64-bit Mach-O'
+                          assert struct.unpack_from('<I', header, 4)[0] == (0x100000c if target.startswith('aarch64') else 0x1000007)
+                      else:
+                          assert header[:6] == b'\x7fELF\x02\x01' and struct.unpack_from('<H', header, 18)[0] == 62
+          assert (root / setup).read_bytes()[:2] == b'MZ'
+          pathlib.Path('release-assets.txt').write_text(''.join(str(root / name) + '\n' for name in sorted(expected)))
+          print('Verified four portable ZIPs, Windows installer, and five matching SHA-256 files')
+          PY
+
+      - name: Prepare bilingual release notes
+        run: |
+          python - <<'PY'
+          import os, pathlib
+          base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/blob/{os.environ['RELEASE_TAG']}"
+          pathlib.Path('release-notes.md').write_text(
+              f"Native desktop EPUB reader with text-to-speech. [English guide]({base}/README.md) · [日本語ガイド]({base}/README.ja.md)\n\n"
+              "Portable ZIPs: Windows x64, macOS Apple Silicon / Intel, Linux x64. Windows also has a per-user setup EXE. Each download has a SHA-256 file.\n\n"
+              "Windows にはユーザー単位のインストーラーもあります。EPUB の既定アプリは Windows の設定で選べます。\n\n"
+              "Speech models, external inference runtimes, and proprietary voice assets are acquired separately and retain their own terms. See the guides and bundled notices.\n\n"
+              "macOS binaries are ad-hoc signed, not notarized. CI builds and fixture tests do not certify GUI, audio hardware, or every TTS backend on untested platforms.\n",
+              encoding='utf-8')
+          PY
+
+      - name: Create a draft with every verified asset
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo 'This tag already has a release; refusing to replace it.' >&2
+            exit 1
+          fi
+          mapfile -t assets < release-assets.txt
+          gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --verify-tag --draft --title "Voice Over Book Reader $RELEASE_TAG" --notes-file release-notes.md
+
+      - name: Verify uploaded draft assets and publish
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release-draft.json
+          python - <<'PY'
+          import hashlib, json, pathlib
+          remote = json.loads(pathlib.Path('release-draft.json').read_text())
+          assert remote['draft'] is True, 'Expected our unpublished draft'
+          local = {pathlib.Path(name).name: pathlib.Path(name) for name in pathlib.Path('release-assets.txt').read_text().splitlines()}
+          assets = {asset['name']: asset for asset in remote['assets']}
+          assert len(remote['assets']) == len(local) and set(assets) == set(local), 'Incomplete draft assets'
+          for name, path in local.items():
+              assert assets[name]['size'] == path.stat().st_size, f'Wrong uploaded size: {name}'
+              if assets[name].get('digest'):
+                  with path.open('rb') as stream:
+                      assert assets[name]['digest'] == 'sha256:' + hashlib.file_digest(stream, 'sha256').hexdigest(), f'Wrong uploaded digest: {name}'
+          PY
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
