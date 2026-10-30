@@ -1834,6 +1834,7 @@ fn link_hit(chapter: &reader_core::Chapter, label: &str) -> Hit {
 }
 
 fn finish_link_worker(fixture: &mut TestApp) {
+    let mut replies = Vec::new();
     loop {
         let work = fixture
             .app
@@ -1841,12 +1842,57 @@ fn finish_link_worker(fixture: &mut TestApp) {
             .recv_timeout(Duration::from_secs(5))
             .expect("local link resolver must finish");
         let linked = matches!(work, Work::Link { .. });
-        fixture.app.tx.send(work).unwrap();
-        fixture.app.handle_work();
+        // Do not let handle_work consume a Link which this helper has not yet
+        // observed: it drains the whole channel, including concurrent arrivals.
+        replies.push(work);
         if linked {
             break;
         }
     }
+    // Replay the observed prefix before any newer arrivals. Requeueing it onto
+    // the live channel's tail could let a later reply run before this Link.
+    let (replay_tx, replay_rx) = std::sync::mpsc::channel();
+    for work in replies {
+        replay_tx.send(work).unwrap();
+    }
+    let incoming = std::mem::replace(&mut fixture.app.rx, replay_rx);
+    fixture.app.handle_work();
+    fixture.app.rx = incoming;
+}
+
+#[test]
+fn link_worker_wait_preserves_a_link_queued_behind_unrelated_work() {
+    let mut fixture = TestApp::new();
+    fixture.app.book = reader_core::open(linked_epub_fixture(fixture.directory.path())).unwrap();
+    let target = fixture.app.book.load_link_target(0, "#note").unwrap();
+    assert!(target.is_some());
+    let anchor = pos2(80., 120.);
+    // Make the losing interleaving deterministic: handle_work would drain both
+    // replies if the helper requeued the first reply before observing the Link.
+    fixture
+        .app
+        .tx
+        .send(Work::Opened {
+            generation: fixture.app.open_generation.wrapping_add(1),
+            result: Err("ignored stale fixture reply".into()),
+        })
+        .unwrap();
+    fixture
+        .app
+        .tx
+        .send(Work::Link {
+            book_generation: fixture.app.open_generation,
+            request: fixture.app.link_request,
+            result: Ok(target),
+            note: true,
+            anchor,
+        })
+        .unwrap();
+    finish_link_worker(&mut fixture);
+    let (text, locator, actual_anchor) = fixture.app.footnote.as_ref().unwrap();
+    assert!(text.contains("本文中の注釈です"));
+    assert_eq!(locator.chapter, 0);
+    assert_eq!(*actual_anchor, anchor);
 }
 
 #[test]

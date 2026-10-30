@@ -70,13 +70,12 @@ jobs:
           rustup target add --toolchain 1.97.0 "${{ matrix.target }}"
           rustc +1.97.0 --version
 
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: cargo-${{ matrix.target }}-1.97-${{ hashFiles('Cargo.lock') }}
-          restore-keys: cargo-${{ matrix.target }}-1.97-
+          shared-key: ${{ matrix.target }}-release-1.97
+          cache-bin: "false"
+          cache-on-failure: "true"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Formatting
         run: cargo +1.97.0 fmt --all --check

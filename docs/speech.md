@@ -100,13 +100,21 @@ Independent Japanese G2P/accent processing may differ from AivisSpeech Engine.
 Pronunciation parity is not claimed.
 
 The native provider generated 2.775 seconds of audio in local tests.
-CPU synthesis took 9.47 seconds cold and 1.54 seconds warm.
+CPU synthesis took 9.47 seconds cold and 1.54 seconds for repeated text.
 
-CUDA synthesis took 10.52 seconds cold and 114 ms warm.
+CUDA synthesis took 10.52 seconds cold and 114 ms for repeated text.
 A 100-character passage yielded 18.506 seconds of audio and 60 actual aligned groups.
-Warm CUDA synthesis took 227 ms for that passage.
+CUDA synthesis took 227 ms when repeating that passage.
 
-Another CPU probe ran alongside these tests, so these figures are local observations.
+The repeated-input figures do not represent synthesis of a changing book passage.
+A later test kept one native provider with forced CUDA and did not play the audio.
+Inputs varied across 15, 35, 70, and 100 characters.
+After the first call, changing text took about 0.5 to 0.9 seconds per request.
+A consecutive repeat of the same 100-character input took 237 ms in the control run.
+These call times include observed cuDNN retry overhead and exclude asset downloads.
+
+Another CPU probe ran alongside the earlier repeated-input tests.
+These figures are local observations.
 They do not establish performance on other devices or sustained playback throughput.
 Five representative sentences matched the Engine's 256-phoneme sequence.
 Two sentences with numbers/quotes differed in six binary tone values.
