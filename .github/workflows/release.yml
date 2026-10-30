@@ -166,7 +166,8 @@ jobs:
 
       - name: Verify uploaded draft assets and publish
         run: |
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > release-draft.json
+          release_id=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json databaseId --jq '.databaseId')
+          gh api "repos/$GITHUB_REPOSITORY/releases/$release_id" > release-draft.json
           python - <<'PY'
           import hashlib, json, pathlib
           remote = json.loads(pathlib.Path('release-draft.json').read_text())
@@ -180,4 +181,4 @@ jobs:
                   with path.open('rb') as stream:
                       assert assets[name]['digest'] == 'sha256:' + hashlib.file_digest(stream, 'sha256').hexdigest(), f'Wrong uploaded digest: {name}'
           PY
-          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release_id" -F draft=false -f make_latest=true --silent
