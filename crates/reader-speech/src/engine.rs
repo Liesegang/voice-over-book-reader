@@ -14,7 +14,7 @@ use std::{
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 enum Command {
@@ -24,7 +24,12 @@ enum Command {
         start: usize,
         byte_offset: usize,
     },
-    Prefetch(u64, Vec<SpeechUnit>),
+    Prefetch {
+        generation: u64,
+        ticket: u64,
+        units: Vec<SpeechUnit>,
+        target: (u64, usize),
+    },
     Append(u64, Vec<SpeechUnit>),
     Stop(u64),
     Pause,
@@ -34,10 +39,12 @@ enum Command {
     Shutdown,
 }
 struct Job {
+    queued_at: Instant,
     generation: u64,
     units: Vec<SpeechUnit>,
     target: Option<(u64, usize)>,
     playback: bool,
+    prefetch_ticket: Option<u64>,
     config: SpeechConfig,
 }
 enum Produced {
@@ -51,6 +58,7 @@ pub struct SpeechController {
     commands: Sender<Command>,
     events: Receiver<SpeechEvent>,
     epoch: Arc<AtomicU64>,
+    prefetch_epoch: Arc<AtomicU64>,
 }
 /// A chapter loader can feed speech without relying on GUI repaint callbacks.
 /// Capturing the epoch makes an old loader harmless after stop or point-seek.
@@ -87,13 +95,16 @@ impl SpeechController {
         let (tx, events) = mpsc::channel();
         let epoch = Arc::new(AtomicU64::new(0));
         let worker_epoch = epoch.clone();
+        let prefetch_epoch = Arc::new(AtomicU64::new(0));
+        let worker_prefetch_epoch = prefetch_epoch.clone();
         thread::Builder::new()
             .name("reader-speech-playback".into())
-            .spawn(move || run(rx, tx, worker_epoch, config))?;
+            .spawn(move || run(rx, tx, worker_epoch, worker_prefetch_epoch, config))?;
         Ok(Self {
             commands,
             events,
             epoch,
+            prefetch_epoch,
         })
     }
     /// All later requests revoke this generation. start_index is a source unit,
@@ -167,12 +178,46 @@ impl SpeechController {
     pub fn generation(&self) -> u64 {
         self.epoch.load(Ordering::Acquire)
     }
-    /// Warm visible text without playing it. Invoke after an explicit speech-tool
+    /// Warm the first three chunks without playing them. Invoke after an explicit speech-tool
     /// action; a missing built-in model may be downloaded. A later speak/stop
     /// revokes outstanding prefetch work, while completed cache entries survive.
     pub fn prefetch(&self, units: Vec<SpeechUnit>) -> Result<()> {
-        self.commands
-            .send(Command::Prefetch(self.epoch.load(Ordering::Acquire), units))?;
+        let Some(start) = units.iter().position(|unit| !unit.text.trim().is_empty()) else {
+            return Ok(());
+        };
+        self.prefetch_at(units, start, 0)
+    }
+    /// Prepare at most three canonical chunks around a source position. Supply
+    /// the same complete chapter units as `speak_at`, so page boundaries never
+    /// change chunk text, pronunciation mapping, or the generated-audio key.
+    /// A newer prefetch supersedes old pages without stopping active playback.
+    pub fn prefetch_at(
+        &self,
+        units: Vec<SpeechUnit>,
+        start_index: usize,
+        byte_offset: usize,
+    ) -> Result<()> {
+        ensure!(
+            start_index < units.len(),
+            "読み上げ開始位置が本文の範囲外です"
+        );
+        ensure!(
+            byte_offset < units[start_index].text.len()
+                && units[start_index].text.is_char_boundary(byte_offset),
+            "読み上げ開始文字が不正です"
+        );
+        ensure!(
+            units.iter().any(|unit| !unit.text.trim().is_empty()),
+            "読み上げる本文がありません"
+        );
+        let target = (units[start_index].id, byte_offset);
+        let ticket = self.prefetch_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.commands.send(Command::Prefetch {
+            generation: self.epoch.load(Ordering::Acquire),
+            ticket,
+            units,
+            target,
+        })?;
         Ok(())
     }
     /// Supply an already loaded following chapter without replacing the active
@@ -230,6 +275,7 @@ impl Playing {
         )?;
         let device_len = device_audio.len() as u64;
         player.play(device_audio, generation);
+        tracing::info!(target: "vobr_perf", phase = "speech_audio_submitted", generation, samples = device_len, device_rate = player.sample_rate, speed);
         Ok(Self {
             generation,
             original,
@@ -352,6 +398,7 @@ fn run(
     commands: Receiver<Command>,
     events: Sender<SpeechEvent>,
     epoch: Arc<AtomicU64>,
+    prefetch_epoch: Arc<AtomicU64>,
     mut config: SpeechConfig,
 ) {
     let (jobs, job_rx) = mpsc::channel();
@@ -361,7 +408,7 @@ fn run(
     let synth_epoch = epoch.clone();
     let _ = thread::Builder::new()
         .name("reader-speech-synthesis".into())
-        .spawn(move || synthesize_jobs(job_rx, produced_tx, synth_epoch));
+        .spawn(move || synthesize_jobs(job_rx, produced_tx, synth_epoch, prefetch_epoch));
     let mut generation = 0;
     let mut queue = VecDeque::new();
     let mut active: Option<Playing> = None;
@@ -391,10 +438,12 @@ fn run(
                 let target = Some((units[start].id, byte_offset));
                 if jobs
                     .send(Job {
+                        queued_at: Instant::now(),
                         generation,
                         units,
                         target,
                         playback: true,
+                        prefetch_ticket: None,
                         config: config.clone(),
                     })
                     .is_err()
@@ -408,12 +457,19 @@ fn run(
                     pending_jobs = 0;
                 }
             }
-            Ok(Command::Prefetch(id, units)) => {
+            Ok(Command::Prefetch {
+                generation: id,
+                ticket,
+                units,
+                target,
+            }) => {
                 let _ = jobs.send(Job {
+                    queued_at: Instant::now(),
                     generation: id,
                     units,
-                    target: None,
+                    target: Some(target),
                     playback: false,
+                    prefetch_ticket: Some(ticket),
                     config: config.clone(),
                 });
             }
@@ -425,10 +481,12 @@ fn run(
                 pending_jobs += 1;
                 if jobs
                     .send(Job {
+                        queued_at: Instant::now(),
                         generation: id,
                         units,
                         target: None,
                         playback: true,
+                        prefetch_ticket: None,
                         config: config.clone(),
                     })
                     .is_err()
@@ -718,22 +776,48 @@ fn chunks(units: Vec<SpeechUnit>) -> Vec<Chunk> {
     chunks
 }
 
-fn synthesize_jobs(jobs: Receiver<Job>, output: Sender<Produced>, epoch: Arc<AtomicU64>) {
+fn synthesize_jobs(
+    jobs: Receiver<Job>,
+    output: Sender<Produced>,
+    epoch: Arc<AtomicU64>,
+    prefetch_epoch: Arc<AtomicU64>,
+) {
+    synthesize_jobs_with_factory(jobs, output, epoch, prefetch_epoch, create_provider);
+}
+
+fn synthesize_jobs_with_factory(
+    jobs: Receiver<Job>,
+    output: Sender<Produced>,
+    epoch: Arc<AtomicU64>,
+    prefetch_epoch: Arc<AtomicU64>,
+    mut factory: impl FnMut(&ProviderConfig) -> Result<Box<dyn crate::TtsProvider>>,
+) {
     let mut provider: Option<Box<dyn crate::TtsProvider>> = None;
     let mut provider_key = String::new();
     for job in jobs {
-        let cancel = Cancellation::new(epoch.clone(), job.generation);
+        let mut cancel = Cancellation::new(epoch.clone(), job.generation);
+        if let Some(ticket) = job.prefetch_ticket {
+            cancel = cancel.with_supersession(prefetch_epoch.clone(), ticket);
+        }
         if cancel.is_cancelled() {
             continue;
         }
+        let job_started = Instant::now();
+        tracing::info!(target: "vobr_perf", phase = "speech_worker_begin", generation = job.generation, playback = job.playback, units = job.units.len(), queued_ms = job.queued_at.elapsed().as_secs_f64() * 1000.0);
         let key = serde_json::to_string(&job.config.provider).unwrap_or_default();
         if provider.is_none() || key != provider_key {
-            match create_provider(&job.config.provider) {
+            let initialization_started = Instant::now();
+            let initialized = factory(&job.config.provider);
+            tracing::info!(target: "vobr_perf", phase = "speech_provider_init", elapsed_ms = initialization_started.elapsed().as_secs_f64() * 1000.0, success = initialized.is_ok());
+            match initialized {
                 Ok(value) => {
                     provider = Some(value);
                     provider_key = key;
                 }
                 Err(error) => {
+                    if cancel.is_cancelled() {
+                        continue;
+                    }
                     let _ = output.send(Produced::Error(job.generation, error.to_string()));
                     if job.playback {
                         let _ = output.send(Produced::Done(job.generation));
@@ -742,7 +826,9 @@ fn synthesize_jobs(jobs: Receiver<Job>, output: Sender<Produced>, epoch: Arc<Ato
                 }
             }
         }
+        let mut first_ready = true;
         let mut reached_target = job.target.is_none();
+        let mut prefetched = 0;
         for mut chunk in chunks(job.units) {
             let target = if !reached_target {
                 let (id, byte) = job.target.unwrap();
@@ -767,6 +853,12 @@ fn synthesize_jobs(jobs: Receiver<Job>, output: Sender<Produced>, epoch: Arc<Ato
             };
             if cancel.is_cancelled() {
                 break;
+            }
+            if job.prefetch_ticket.is_some() {
+                if prefetched == 3 {
+                    break;
+                }
+                prefetched += 1;
             }
             let result = (|| -> Result<SynthesizedAudio> {
                 let progress = |text| {
@@ -842,6 +934,10 @@ fn synthesize_jobs(jobs: Receiver<Job>, output: Sender<Produced>, epoch: Arc<Ato
                     if job.playback {
                         match PreparedAudio::new(&job.config.cache_dir, &audio) {
                             Ok(prepared) => {
+                                if first_ready {
+                                    tracing::info!(target: "vobr_perf", phase = "speech_first_pcm_ready", generation = job.generation, request_ms = job.queued_at.elapsed().as_secs_f64() * 1000.0, worker_ms = job_started.elapsed().as_secs_f64() * 1000.0, samples = audio.samples.len(), sample_rate = audio.sample_rate, marks = audio.boundaries.len());
+                                    first_ready = false;
+                                }
                                 if output
                                     .send(Produced::Ready(job.generation, prepared))
                                     .is_err()
@@ -891,10 +987,15 @@ fn cached_audio(
     hasher.update(key.as_bytes());
     hasher.update(serde_json::to_vec(units)?);
     let path = cache.join(format!("{:x}.pcm", hasher.finalize()));
+    let lookup_started = Instant::now();
     if let Ok(audio) = crate::cache::read(&path) {
+        tracing::info!(target: "vobr_perf", phase = "speech_pcm_cache", hit = true, elapsed_ms = lookup_started.elapsed().as_secs_f64() * 1000.0);
         return Ok(audio);
     }
+    tracing::info!(target: "vobr_perf", phase = "speech_pcm_cache", hit = false, elapsed_ms = lookup_started.elapsed().as_secs_f64() * 1000.0);
+    let generation_started = Instant::now();
     let audio = provider.synthesize(units, cancel, progress)?;
+    tracing::info!(target: "vobr_perf", phase = "speech_provider_generation", elapsed_ms = generation_started.elapsed().as_secs_f64() * 1000.0, units = units.len(), samples = audio.samples.len(), marks = audio.boundaries.len());
     audio.validate()?;
     std::fs::create_dir_all(cache)?;
     // A native inference can finish after cancellation. Keep its completed,
@@ -1218,10 +1319,11 @@ mod tests {
         let (finished, finish) = mpsc::channel();
         let worker_epoch = epoch.clone();
         let worker = thread::spawn(move || {
-            synthesize_jobs(rx, output, worker_epoch);
+            synthesize_jobs(rx, output, worker_epoch, Arc::new(AtomicU64::new(0)));
             let _ = finished.send(());
         });
         jobs.send(Job {
+            queued_at: Instant::now(),
             generation: 1,
             units: (0..12)
                 .map(|index| SpeechUnit {
@@ -1231,6 +1333,7 @@ mod tests {
                 .collect(),
             target: None,
             playback: true,
+            prefetch_ticket: None,
             config,
         })
         .unwrap();
@@ -1283,6 +1386,7 @@ mod tests {
             commands: command,
             events: rx,
             epoch,
+            prefetch_epoch: Arc::new(AtomicU64::new(0)),
         };
         assert!(matches!(
             controller.try_recv().unwrap().kind,
@@ -1399,5 +1503,342 @@ mod tests {
         assert_eq!(audio.boundaries.len(), 1);
         assert_eq!(audio.boundaries[0].start_sample, 0);
         assert_eq!(audio.boundaries[0].ranges[0].start, 3);
+    }
+}
+
+#[cfg(test)]
+mod prefetch_tests {
+    use super::*;
+
+    struct CountingProvider {
+        calls: Arc<AtomicU64>,
+    }
+    impl crate::TtsProvider for CountingProvider {
+        fn name(&self) -> &str {
+            "counting fixture"
+        }
+        fn synthesize(
+            &mut self,
+            units: &[SpeechUnit],
+            _: &Cancellation,
+            _: &dyn Fn(String),
+        ) -> Result<SynthesizedAudio> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            let mut boundaries = vec![];
+            let mut samples = vec![];
+            for unit in units {
+                for (start, character) in unit.text.char_indices() {
+                    let from = samples.len() as u64;
+                    samples.extend([0.1; 24]);
+                    boundaries.push(TimedBoundary {
+                        start_sample: from,
+                        end_sample: samples.len() as u64,
+                        ranges: vec![UnitRange {
+                            id: unit.id,
+                            start,
+                            end: start + character.len_utf8(),
+                        }],
+                        precision: BoundaryPrecision::Word,
+                    });
+                }
+            }
+            Ok(SynthesizedAudio {
+                samples,
+                sample_rate: 24_000,
+                boundaries,
+            })
+        }
+    }
+    fn fixture(count: usize) -> Vec<SpeechUnit> {
+        (0..count)
+            .map(|index| SpeechUnit {
+                id: index as u64 + 100,
+                text: format!("{index:02}{}。", "あ".repeat(27)),
+            })
+            .collect()
+    }
+    fn config(directory: &std::path::Path) -> SpeechConfig {
+        SpeechConfig {
+            cache_dir: directory.into(),
+            ..SpeechConfig::default()
+        }
+    }
+    fn mid_page_roundtrip(canonical: bool) -> (u64, u64, Vec<SynthesizedAudio>) {
+        let directory = tempfile::tempdir().unwrap();
+        let all = fixture(6);
+        let target = (all[1].id, 2 + 5 * 3);
+        let warm_units = if canonical {
+            all.clone()
+        } else {
+            all[1..4].to_vec()
+        };
+        let epoch = Arc::new(AtomicU64::new(0));
+        let prefetch_epoch = Arc::new(AtomicU64::new(1));
+        let calls = Arc::new(AtomicU64::new(0));
+        let worker_calls = calls.clone();
+        let (jobs, input) = mpsc::channel();
+        let (output, results) = mpsc::channel();
+        let worker_epoch = epoch.clone();
+        let worker = thread::spawn(move || {
+            synthesize_jobs_with_factory(input, output, worker_epoch, prefetch_epoch, move |_| {
+                Ok(Box::new(CountingProvider {
+                    calls: worker_calls.clone(),
+                }))
+            })
+        });
+        jobs.send(Job {
+            queued_at: Instant::now(),
+            generation: 0,
+            units: warm_units,
+            target: Some(target),
+            playback: false,
+            prefetch_ticket: Some(1),
+            config: config(directory.path()),
+        })
+        .unwrap();
+        loop {
+            match results.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Produced::Progress(0, message) if message == "音声の先読みが完了しました" =>
+                {
+                    break;
+                }
+                Produced::Error(_, message) => panic!("{message}"),
+                _ => {}
+            }
+        }
+        let warm_calls = calls.load(Ordering::Acquire);
+        epoch.store(1, Ordering::Release);
+        jobs.send(Job {
+            queued_at: Instant::now(),
+            generation: 1,
+            units: all,
+            target: Some(target),
+            playback: true,
+            prefetch_ticket: None,
+            config: config(directory.path()),
+        })
+        .unwrap();
+        drop(jobs);
+        worker.join().unwrap();
+        let calls_after_play = calls.load(Ordering::Acquire);
+        let results = results
+            .into_iter()
+            .filter_map(|value| match value {
+                Produced::Ready(1, audio) => Some(audio.load().unwrap()),
+                Produced::Error(_, message) => panic!("{message}"),
+                _ => None,
+            })
+            .collect();
+        (warm_calls, calls_after_play - warm_calls, results)
+    }
+    #[test]
+    fn canonical_mid_page_prefetch_removes_real_worker_cache_misses() {
+        // This reduced visible-unit sequence reproduces the former app request:
+        // its 90-character chunk starts one atom after the canonical chapter chunk.
+        let (old_warm, old_playback, _) = mid_page_roundtrip(false);
+        assert_eq!((old_warm, old_playback), (1, 2));
+        let (new_warm, new_playback, ready) = mid_page_roundtrip(true);
+        assert_eq!((new_warm, new_playback), (2, 0));
+        assert_eq!(ready.len(), 2);
+        let first = &ready[0].boundaries[0];
+        assert_eq!(first.start_sample, 0);
+        assert_eq!(
+            first.ranges[0],
+            UnitRange {
+                id: 101,
+                start: 17,
+                end: 20
+            }
+        );
+    }
+    #[test]
+    fn superseded_inflight_prefetch_keeps_completed_pcm_and_reuses_the_voice() {
+        struct GatedProvider {
+            inner: CountingProvider,
+            started: Option<Sender<()>>,
+            release: Receiver<()>,
+        }
+        impl crate::TtsProvider for GatedProvider {
+            fn name(&self) -> &str {
+                "gated fixture"
+            }
+            fn synthesize(
+                &mut self,
+                units: &[SpeechUnit],
+                cancel: &Cancellation,
+                progress: &dyn Fn(String),
+            ) -> Result<SynthesizedAudio> {
+                if let Some(started) = self.started.take() {
+                    started.send(()).unwrap();
+                    self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                self.inner.synthesize(units, cancel, progress)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let creations = Arc::new(AtomicU64::new(0));
+        let epoch = Arc::new(AtomicU64::new(0));
+        let prefetch_epoch = Arc::new(AtomicU64::new(1));
+        let worker_prefetch = prefetch_epoch.clone();
+        let counted = calls.clone();
+        let created = creations.clone();
+        let (jobs, input) = mpsc::channel();
+        let (output, results) = mpsc::channel();
+        let (started, signal) = mpsc::channel();
+        let (release, wait) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let mut wait = Some(wait);
+            synthesize_jobs_with_factory(input, output, epoch, worker_prefetch, move |_| {
+                created.fetch_add(1, Ordering::AcqRel);
+                Ok(Box::new(GatedProvider {
+                    inner: CountingProvider {
+                        calls: counted.clone(),
+                    },
+                    started: Some(started.clone()),
+                    release: wait.take().expect("voice must stay loaded"),
+                }))
+            });
+        });
+        let all = fixture(30);
+        jobs.send(Job {
+            queued_at: Instant::now(),
+            generation: 0,
+            units: all.clone(),
+            target: Some((all[0].id, 0)),
+            playback: false,
+            prefetch_ticket: Some(1),
+            config: config(directory.path()),
+        })
+        .unwrap();
+        signal.recv_timeout(Duration::from_secs(5)).unwrap();
+        prefetch_epoch.store(2, Ordering::Release);
+        jobs.send(Job {
+            queued_at: Instant::now(),
+            generation: 0,
+            units: all.clone(),
+            target: Some((all[9].id, 0)),
+            playback: false,
+            prefetch_ticket: Some(2),
+            config: config(directory.path()),
+        })
+        .unwrap();
+        release.send(()).unwrap();
+        drop(jobs);
+        worker.join().unwrap();
+        assert_eq!(
+            calls.load(Ordering::Acquire),
+            4,
+            "one completed old chunk, then three current chunks"
+        );
+        assert_eq!(creations.load(Ordering::Acquire), 1);
+        assert_eq!(
+            std::fs::read_dir(directory.path()).unwrap().count(),
+            4,
+            "completed cancelled PCM remains reusable"
+        );
+        let events: Vec<_> = results.into_iter().collect();
+        assert_eq!(
+            events.len(),
+            1,
+            "superseded prefetch must not emit stale completion or errors"
+        );
+        assert!(
+            matches!(&events[0], Produced::Progress(0, message) if message == "音声の先読みが完了しました")
+        );
+    }
+    #[test]
+    fn superseded_provider_initialization_error_cannot_reach_current_prefetch() {
+        let directory = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let ticket = Arc::new(AtomicU64::new(1));
+        let changed = ticket.clone();
+        let counted = calls.clone();
+        let (jobs, input) = mpsc::channel();
+        let (output, results) = mpsc::channel();
+        for number in 1..=2 {
+            let units = fixture(30);
+            let target = (units[0].id, 0);
+            jobs.send(Job {
+                queued_at: Instant::now(),
+                generation: 0,
+                units,
+                target: Some(target),
+                playback: false,
+                prefetch_ticket: Some(number),
+                config: config(directory.path()),
+            })
+            .unwrap();
+        }
+        drop(jobs);
+        let mut first = true;
+        synthesize_jobs_with_factory(
+            input,
+            output,
+            Arc::new(AtomicU64::new(0)),
+            ticket,
+            move |_| {
+                if first {
+                    first = false;
+                    changed.store(2, Ordering::Release);
+                    anyhow::bail!("obsolete initialization failure");
+                }
+                Ok(Box::new(CountingProvider {
+                    calls: counted.clone(),
+                }))
+            },
+        );
+        let events: Vec<_> = results.into_iter().collect();
+        assert_eq!(calls.load(Ordering::Acquire), 3);
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], Produced::Progress(0, message) if message == "音声の先読みが完了しました")
+        );
+    }
+    #[test]
+    fn newer_pages_skip_queued_prefetch_and_only_generate_three_chunks() {
+        let directory = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let creations = Arc::new(AtomicU64::new(0));
+        let (jobs, input) = mpsc::channel();
+        let (output, results) = mpsc::channel();
+        for ticket in 1..=5 {
+            let units = fixture(30);
+            let target = (units[0].id, 0);
+            jobs.send(Job {
+                queued_at: Instant::now(),
+                generation: 0,
+                units,
+                target: Some(target),
+                playback: false,
+                prefetch_ticket: Some(ticket),
+                config: config(directory.path()),
+            })
+            .unwrap();
+        }
+        drop(jobs);
+        let counted = calls.clone();
+        let created = creations.clone();
+        synthesize_jobs_with_factory(
+            input,
+            output,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(5)),
+            move |_| {
+                created.fetch_add(1, Ordering::AcqRel);
+                Ok(Box::new(CountingProvider {
+                    calls: counted.clone(),
+                }))
+            },
+        );
+        assert_eq!(calls.load(Ordering::Acquire), 3);
+        assert_eq!(creations.load(Ordering::Acquire), 1);
+        assert_eq!(
+            results
+                .into_iter()
+                .filter(|value| matches!(value, Produced::Progress(_, _)))
+                .count(),
+            1
+        );
     }
 }

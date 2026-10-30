@@ -3075,6 +3075,109 @@ fn custom_pronunciations_keep_cross_atom_spelling_but_preserve_unregistered_ruby
 }
 
 #[test]
+fn narration_plan_keeps_canonical_chapter_units_when_starting_inside_a_page() {
+    let mut fixture = TestApp::new();
+    let chapter = reader_core::parse_html(
+        &format!(
+            "<body><p>{}</p><p><ruby>東京<rt>とうきょう</rt></ruby>大学へ。</p></body>",
+            "長い段落の途中から読み始めます。".repeat(60)
+        ),
+        0,
+        "speech-plan.xhtml",
+        "",
+    )
+    .unwrap();
+    fixture.use_chapter(chapter);
+    fixture.render_reader(vec2(320., 240.));
+    fixture.app.turn_page(true);
+    fixture.render_reader(vec2(320., 240.));
+    let hit = fixture.app.speech_start_hit().unwrap();
+    assert!(
+        hit.offset > 0,
+        "the page begins inside the original paragraph"
+    );
+    let chapter = &fixture.app.book.chapters[0];
+    let rules = [("東京大学".into(), "とうだい".into())]
+        .into_iter()
+        .collect();
+    let complete = chapter_narration(chapter, &rules, None);
+    let selected = chapter_narration(chapter, &rules, Some(&hit));
+    assert_eq!(
+        complete.units, selected.units,
+        "prefetch and playback must share full chapter chunk boundaries"
+    );
+    assert_eq!(selected.units[selected.start_index].id, hit.unit_id);
+    assert_eq!(selected.byte_offset, hit.offset);
+    assert!(selected.units.iter().any(|unit| unit.text == "東京"));
+    assert!(!selected.units.iter().any(|unit| unit.text == "とうきょう"));
+    assert!(
+        fixture.app.speech.is_none(),
+        "planning never starts a provider or playback"
+    );
+}
+
+#[test]
+#[ignore = "Manual operation latency probe; native egui CPU frames, no hardware presentation or TTS"]
+fn operation_latency_probe() {
+    let initialize = Instant::now();
+    let mut fixture = TestApp::new();
+    eprintln!("operation,initialize,{}", initialize.elapsed().as_micros());
+    let size = fixture.wheel_fixture();
+    for _ in 0..3 {
+        fixture.frame(size, vec![]);
+    }
+    for turn in 0..24 {
+        let start = Instant::now();
+        fixture.app.turn_page(true);
+        let dispatch = start.elapsed().as_micros();
+        fixture.frame(size, vec![]);
+        eprintln!(
+            "operation,page_turn,{turn},{dispatch},{}",
+            start.elapsed().as_micros()
+        );
+    }
+}
+
+#[test]
+fn page_turn_persists_the_new_page_and_keeps_a_real_origin_while_loading_next_chapter() {
+    let mut fixture = TestApp::new();
+    fixture.wheel_fixture();
+    fixture.app.turn_page(true);
+    let next = fixture.app.layout.pages[fixture.app.page]
+        .first_locator()
+        .unwrap();
+    let saved = fixture
+        .app
+        .store
+        .position(&fixture.app.book.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.locator, next);
+    fixture.app.page = fixture.app.layout.pages.len() - 1;
+    let origin = fixture.app.layout.pages[fixture.app.page]
+        .first_locator()
+        .unwrap();
+    let mut following = fixture.app.book.chapters[0].clone();
+    following.id = 1;
+    following.loaded = false;
+    following.blocks.clear();
+    fixture.app.book.chapters.push(following);
+    fixture.app.turn_page(true);
+    assert_eq!(fixture.app.chapter, 1);
+    assert!(fixture.app.layout.pages.is_empty());
+    let saved = fixture
+        .app
+        .store
+        .position(&fixture.app.book.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        saved.locator, origin,
+        "unlaid chapters never save a fabricated source position"
+    );
+}
+
+#[test]
 fn nvidia_permission_is_explicit_persistent_revocable_and_does_not_start_audio() {
     let mut fixture = TestApp::new();
     fixture.app.speech_provider = "kokoro".into();

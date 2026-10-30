@@ -6,6 +6,7 @@ mod book_images;
 mod covers;
 mod fonts;
 mod icons;
+mod latency;
 mod layout;
 mod library_ipc;
 mod pagination;
@@ -19,9 +20,13 @@ mod speech_settings;
 mod theme;
 
 fn main() -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     tracing_subscriber::fmt()
+        .with_ansi(false)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+    latency::initialize(started);
+    latency::event("process_started", 0);
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.iter().any(|a| {
         a == "--reader"

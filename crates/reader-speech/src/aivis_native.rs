@@ -15,7 +15,7 @@ use ort::{
     },
     value::Tensor,
 };
-use std::{ops::Range, path::PathBuf};
+use std::{ops::Range, path::PathBuf, time::Instant};
 use tokenizers::Tokenizer;
 
 #[derive(Clone, Debug)]
@@ -52,9 +52,13 @@ impl NativeAivis {
     pub fn load_with_cuda(paths: &AivisNativePaths, use_cuda: bool) -> Result<Self> {
         let data = aivis_model::model_data(&paths.model)?;
         aivis_model::initialize_runtime(&paths.runtime_library)?;
+        let started = Instant::now();
         let model = session(&paths.model, use_cuda)?;
+        tracing::info!(target: "vobr_perf", phase = "aivis_session_load", graph = "voice", cuda = use_cuda, elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
         aivis_model::validate_session(&model)?;
+        let started = Instant::now();
         let bert = session(&paths.bert_model, use_cuda)?;
+        tracing::info!(target: "vobr_perf", phase = "aivis_session_load", graph = "bert", cuda = use_cuda, elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
         ensure!(
             bert.inputs.len() == 2
                 && bert.inputs.iter().any(|v| v.name == "input_ids")
@@ -115,7 +119,9 @@ impl NativeAivis {
             .get(style_id as usize)
             .context("Style vector is missing")?
             .clone();
+        let started = Instant::now();
         let prepared = self.frontend.prepare(text)?;
+        tracing::info!(target: "vobr_perf", phase = "aivis_japanese_frontend", phones = prepared.phones.len(), elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
         cancel.check()?;
         let mut token_ids = vec![
             self.tokenizer
@@ -143,10 +149,12 @@ impl NativeAivis {
             "Aivis chunk exceeds the model context; split this text before synthesis"
         );
         let n = token_ids.len();
+        let started = Instant::now();
         let features = self.bert.run(ort::inputs![
          "input_ids"=>Tensor::from_array(([1usize,n],token_ids))?,
          "attention_mask"=>Tensor::from_array(([1usize,n],vec![1i64;n]))?,
         ])?;
+        tracing::info!(target: "vobr_perf", phase = "aivis_bert_run", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
         let (shape, features) = features[0].try_extract_tensor::<f32>()?;
         ensure!(
             (shape.as_ref() == [n as i64, 1024] || shape.as_ref() == [1, n as i64, 1024])
@@ -198,6 +206,7 @@ impl NativeAivis {
             selector = selector.with(duration);
         }
         let options = RunOptions::new()?.with_outputs(selector);
+        let started = Instant::now();
         let output = self.model.run_with_options(
             ort::inputs![
              "x_tst"=>Tensor::from_array(([1usize,length],ids))?,
@@ -212,6 +221,7 @@ impl NativeAivis {
             ],
             &options,
         )?;
+        tracing::info!(target: "vobr_perf", phase = "aivis_audio_graph_run", elapsed_ms = started.elapsed().as_secs_f64() * 1000.0);
         let (_, samples) = output["output"].try_extract_tensor::<f32>()?;
         ensure!(
             !samples.is_empty()

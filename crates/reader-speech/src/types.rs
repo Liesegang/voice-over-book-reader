@@ -374,6 +374,7 @@ pub enum SpeechEventKind {
 pub struct Cancellation {
     epoch: Arc<AtomicU64>,
     generation: u64,
+    supersession: Option<(Arc<AtomicU64>, u64)>,
 }
 impl Cancellation {
     /// For direct provider calls that are not owned by a controller generation.
@@ -381,10 +382,22 @@ impl Cancellation {
         Self::new(Arc::new(AtomicU64::new(0)), 0)
     }
     pub(crate) fn new(epoch: Arc<AtomicU64>, generation: u64) -> Self {
-        Self { epoch, generation }
+        Self {
+            epoch,
+            generation,
+            supersession: None,
+        }
+    }
+    pub(crate) fn with_supersession(mut self, epoch: Arc<AtomicU64>, generation: u64) -> Self {
+        self.supersession = Some((epoch, generation));
+        self
     }
     pub fn is_cancelled(&self) -> bool {
         self.epoch.load(Ordering::Acquire) != self.generation
+            || self
+                .supersession
+                .as_ref()
+                .is_some_and(|(epoch, generation)| epoch.load(Ordering::Acquire) != *generation)
     }
     pub fn check(&self) -> Result<()> {
         ensure!(!self.is_cancelled(), "Speech request cancelled");
@@ -431,6 +444,21 @@ fn unit_gain() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn prefetch_supersession_does_not_cancel_playback() {
+        let playback_epoch = Arc::new(AtomicU64::new(1));
+        let prefetch_epoch = Arc::new(AtomicU64::new(7));
+        let playback = Cancellation::new(playback_epoch.clone(), 1);
+        let prefetch = playback
+            .clone()
+            .with_supersession(prefetch_epoch.clone(), 7);
+        assert!(!prefetch.is_cancelled());
+        prefetch_epoch.store(8, Ordering::Release);
+        assert!(prefetch.is_cancelled());
+        assert!(!playback.is_cancelled());
+        playback_epoch.store(2, Ordering::Release);
+        assert!(playback.is_cancelled());
+    }
     #[test]
     fn ruby_spoken_once() {
         let units = normalize_runs(&[SpeechRun {

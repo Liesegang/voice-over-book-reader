@@ -172,7 +172,49 @@ fn narration_texts<'a>(
         .collect()
 }
 
+struct ChapterNarration {
+    units: Vec<SpeechUnit>,
+    start_index: usize,
+    byte_offset: usize,
+}
+
+fn chapter_narration(
+    chapter: &reader_core::Chapter,
+    rules: &std::collections::BTreeMap<String, String>,
+    hit: Option<&Hit>,
+) -> ChapterNarration {
+    let mut plan = ChapterNarration {
+        units: Vec::new(),
+        start_index: 0,
+        byte_offset: 0,
+    };
+    for (index, (atom, text)) in chapter
+        .atoms()
+        .into_iter()
+        .zip(narration_texts(chapter, rules))
+        .enumerate()
+    {
+        if atom.locator_at(0).is_none() || text.trim().is_empty() {
+            continue;
+        }
+        let id = layout::unit_id(chapter.id, index);
+        if let Some(hit) = hit.filter(|hit| hit.unit_id == id) {
+            plan.start_index = plan.units.len();
+            if atom.ruby.is_none() && text.is_char_boundary(hit.offset) {
+                plan.byte_offset = hit.offset;
+            }
+        }
+        plan.units.push(SpeechUnit {
+            id,
+            text: text.to_owned(),
+        });
+    }
+    plan
+}
+
 pub struct ReaderApp {
+    first_book_frame: Option<crate::latency::Pending>,
+    page_count_ready: Option<crate::latency::Pending>,
     pagination_index: Option<crate::pagination::PageIndex>,
     pagination_key: String,
     pagination_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -336,8 +378,13 @@ impl ReaderApp {
         .cloned()
     }
     pub fn new(cc: &eframe::CreationContext<'_>, args: &[String]) -> anyhow::Result<Self> {
-        fonts::install_ui(&cc.egui_ctx);
+        let _init = crate::latency::span("app_initialize", 0);
+        {
+            let _fonts = crate::latency::span("ui_fonts_install", 0);
+            fonts::install_ui(&cc.egui_ctx);
+        }
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        let store_timer = crate::latency::span("library_store_open", 0);
         let store = if let Some(i) = args.iter().position(|a| a == "--data-dir") {
             LibraryStore::open(
                 args.get(i + 1)
@@ -346,6 +393,7 @@ impl ReaderApp {
         } else {
             LibraryStore::open_default()?
         };
+        drop(store_timer);
         let settings = store.settings().clone();
         let speech_profiles = crate::speech_profiles::SpeechProfiles::load(&settings);
         let services =
@@ -353,6 +401,8 @@ impl ReaderApp {
         let (tx, rx) = mpsc::channel();
         let covers = crate::covers::CoverCache::new(store.data_dir());
         let mut app = Self {
+            first_book_frame: None,
+            page_count_ready: None,
             worker_context: cc.egui_ctx.clone(),
             pagination_index: None,
             pagination_key: String::new(),
@@ -671,6 +721,11 @@ impl ReaderApp {
         self.wheel_accumulator = 0.;
         self.open_generation = self.open_generation.wrapping_add(1);
         let generation = self.open_generation;
+        self.first_book_frame = Some(crate::latency::pending(
+            "open_to_first_frame_cpu_ready",
+            generation,
+        ));
+        crate::latency::event("book_open_requested", generation);
         self.busy = true;
         self.opening = true;
         self.open_error = None;
@@ -682,6 +737,7 @@ impl ReaderApp {
         let tx = self.tx.clone();
         let ctx = self.worker_context.clone();
         std::thread::spawn(move || {
+            let _open = crate::latency::span("book_open_worker", generation);
             let result = reader_core::open(&path)
                 .map(|book| (book, path))
                 .map_err(|e| format!("{e:#}"));
@@ -767,14 +823,21 @@ impl ReaderApp {
                         continue;
                     }
                     self.pagination_pending = false;
+                    crate::latency::event("page_count_received", generation);
                     match result {
                         Ok(index) => {
+                            if let Some(timer) = self.page_count_ready.take() {
+                                timer.finish();
+                            }
                             self.pagination_index = Some(index);
                             if let Some(fraction) = self.pending_book_seek.take() {
                                 self.seek_book(fraction);
                             }
                         }
-                        Err(error) => self.pagination_error = Some(error),
+                        Err(error) => {
+                            self.page_count_ready = None;
+                            self.pagination_error = Some(error);
+                        }
                     }
                 }
                 Work::Link {
@@ -903,6 +966,8 @@ impl ReaderApp {
                     generation: _,
                     result: Ok((mut book, path)),
                 } => {
+                    let _apply = crate::latency::span("book_open_apply", self.open_generation);
+                    crate::latency::event("book_open_received", self.open_generation);
                     self.stop_speech();
                     self.clear_frame_caches();
                     let linked = self
@@ -1059,6 +1124,7 @@ impl ReaderApp {
         self.restore_locator(locator);
     }
     fn persist_position(&mut self) {
+        let _persist = crate::latency::span("reading_position_persist", self.open_generation);
         if let Some(locator) = self
             .layout
             .pages
@@ -1084,11 +1150,11 @@ impl ReaderApp {
         }
     }
     fn turn_page(&mut self, forward: bool) {
+        let _turn = crate::latency::span("page_turn_dispatch", self.open_generation);
         if self.opening || self.chapter_loading.is_some() {
             return;
         }
         self.selection_anchor = None;
-        self.persist_position();
         let old_chapter = self.chapter;
         self.pending_center_tap = None;
         self.pending_page_turn = None;
@@ -1115,6 +1181,7 @@ impl ReaderApp {
             if target >= self.book.chapters.len() || target == self.chapter {
                 return;
             }
+            self.persist_position();
             self.chapter = target;
             self.page = 0;
             self.layout = BookLayout::default();
@@ -1136,6 +1203,7 @@ impl ReaderApp {
             if window.end < self.layout.pages.len() {
                 self.page = window.end;
             } else if self.chapter + 1 < self.book.chapters.len() {
+                self.persist_position();
                 self.chapter += 1;
                 self.page = 0;
                 self.layout_key.clear();
@@ -1150,6 +1218,7 @@ impl ReaderApp {
             )
             .start;
         } else if self.chapter > 0 {
+            self.persist_position();
             self.chapter -= 1;
             self.page = usize::MAX;
             self.layout_key.clear();
@@ -2398,6 +2467,7 @@ impl ReaderApp {
             reader_core::default_reader_css_revision()
         );
         if key != self.layout_key {
+            let _layout = crate::latency::span("visible_chapter_layout", self.open_generation);
             self.layout_revision = self.layout_revision.wrapping_add(1);
             self.composed_frame = None;
             let anchor = self
@@ -3141,6 +3211,7 @@ impl ReaderApp {
         }
     }
     fn start_speech(&mut self, hit: Option<Hit>) {
+        let _request = crate::latency::span("speech_request_prepare", self.open_generation);
         self.voice_preview = false;
         self.speech_error = None;
         self.audiobook.stop();
@@ -3160,35 +3231,17 @@ impl ReaderApp {
             let _ = speech.set_speed(self.settings.tts.speed);
         }
         self.speech_sources.clear();
-        let mut units = Vec::new();
-        let mut start_index = 0;
-        let mut byte_offset = 0;
         let hit = hit.or_else(|| self.speech_start_hit());
-        for chapter in self.book.chapters.iter().skip(self.chapter).take(1) {
-            for (index, (atom, text)) in chapter
-                .atoms()
-                .into_iter()
-                .zip(narration_texts(chapter, &self.settings.tts.pronunciations))
-                .enumerate()
-            {
-                let id = layout::unit_id(chapter.id, index);
-                if atom.locator_at(0).is_none() {
-                    continue;
-                }
-                let text = text.to_owned();
-                if let Some(hit) = &hit
-                    && hit.unit_id == id
-                {
-                    start_index = units.len();
-                    if atom.ruby.is_none() && atom.text.is_char_boundary(hit.offset) {
-                        byte_offset = hit.offset;
-                    }
-                }
-                if !text.trim().is_empty() {
-                    self.speech_sources.insert(id, atom.clone());
-                    units.push(SpeechUnit { id, text });
-                }
-            }
+        let chapter = &self.book.chapters[self.chapter];
+        let ChapterNarration {
+            units,
+            start_index,
+            byte_offset,
+        } = chapter_narration(chapter, &self.settings.tts.pronunciations, hit.as_ref());
+        let atoms = chapter.atoms();
+        for unit in &units {
+            let index = (unit.id & 0xFFFF_FFFF) as usize;
+            self.speech_sources.insert(unit.id, atoms[index].clone());
         }
         if units.is_empty() {
             self.notify("読み上げる本文がありません");
@@ -3797,6 +3850,16 @@ impl eframe::App for ReaderApp {
         for file in ctx.input(|i| i.raw.dropped_files.clone()) {
             self.open_document(file.path().to_path_buf());
         }
+        if self.screen == Screen::Reader
+            && !self.opening
+            && !self.layout.pages.is_empty()
+            && let Some(timer) = self.first_book_frame.take()
+        {
+            timer.finish();
+        }
+        if self.frame_count == 1 {
+            crate::latency::event("first_native_frame_cpu_ready", 0);
+        }
         if self.frame_count >= 8
             && !self.busy
             && let Some(path) = self.screenshot.take()
@@ -3941,28 +4004,20 @@ impl ReaderApp {
         if !self.ensure_speech() {
             return;
         }
-        let ids: std::collections::HashSet<u64> = self
-            .layout
-            .pages
-            .iter()
-            .skip(self.page)
-            .take(self.spread_pages + 1)
-            .flat_map(|p| p.hits.iter().map(|h| h.unit_id))
-            .collect();
-        let chapter = &self.book.chapters[self.chapter];
-        let units = narration_texts(chapter, &self.settings.tts.pronunciations)
-            .into_iter()
-            .enumerate()
-            .filter_map(|(index, text)| {
-                let id = layout::unit_id(chapter.id, index);
-                (ids.contains(&id) && !text.trim().is_empty()).then(|| SpeechUnit {
-                    id,
-                    text: text.to_owned(),
-                })
-            })
-            .collect();
+        let Some(chapter) = self.book.chapters.get(self.chapter).filter(|c| c.loaded) else {
+            return;
+        };
+        let hit = self.speech_start_hit();
+        let ChapterNarration {
+            units,
+            start_index,
+            byte_offset,
+        } = chapter_narration(chapter, &self.settings.tts.pronunciations, hit.as_ref());
+        if units.is_empty() {
+            return;
+        }
         if let Some(speech) = &self.speech {
-            if let Err(error) = speech.prefetch(units) {
+            if let Err(error) = speech.prefetch_at(units, start_index, byte_offset) {
                 self.speech_error = Some(error.to_string());
             } else {
                 self.speech_progress = "音声を先読みしています".into();
@@ -4530,6 +4585,12 @@ impl ReaderApp {
             .pagination_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
+        let debounce = !self.pagination_key.is_empty();
+        self.page_count_ready = Some(crate::latency::pending(
+            "page_count_request_to_ready",
+            generation,
+        ));
+        crate::latency::event("page_count_requested", generation);
         self.pagination_key = key.clone();
         self.pagination_index = None;
         self.pagination_error = None;
@@ -4560,11 +4621,13 @@ impl ReaderApp {
         let ctx = self.worker_context.clone();
         let directory = self.store.data_dir().join("pagination-v022");
         std::thread::spawn(move || {
+            let _worker = crate::latency::span("page_count_worker", generation);
             use std::hash::{Hash, Hasher};
             let mut hash = std::collections::hash_map::DefaultHasher::new();
             key.hash(&mut hash);
             let path = directory.join(format!("{:016x}.json", hash.finish()));
             let result = (|| -> anyhow::Result<crate::pagination::PageIndex> {
+                let cache_timer = crate::latency::span("page_count_cache_read", generation);
                 if let Ok(bytes) = std::fs::read(&path)
                     && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
                     && value.get("key").and_then(|v| v.as_str()) == Some(key.as_str())
@@ -4573,20 +4636,29 @@ impl ReaderApp {
                     )
                     && index.counts.len() == book.chapters.len()
                 {
+                    crate::latency::event("page_count_cache_hit", generation);
                     return Ok(index);
                 }
+                drop(cache_timer);
                 // A resize emits many intermediate geometries. Wait briefly off
                 // the UI thread and discard superseded work before loading fonts
                 // or parsing chapters for a size the user has already left.
-                std::thread::sleep(Duration::from_millis(120));
+                // The first layout has no resize burst to debounce.
+                if debounce {
+                    let _wait = crate::latency::span("page_count_resize_debounce", generation);
+                    std::thread::sleep(Duration::from_millis(120));
+                }
                 if epoch.load(std::sync::atomic::Ordering::Relaxed) != generation {
                     anyhow::bail!("Pagination superseded");
                 }
+                let compute_timer = crate::latency::span("page_count_compute", generation);
                 let index = crate::pagination::compute(&book, e, &settings, &epoch, generation)?;
+                drop(compute_timer);
                 if epoch.load(std::sync::atomic::Ordering::Relaxed) != generation {
                     anyhow::bail!("Pagination superseded");
                 }
                 if std::fs::create_dir_all(&directory).is_ok() {
+                    let _write = crate::latency::span("page_count_cache_write", generation);
                     let temp = path.with_extension(format!("{}.tmp", std::process::id()));
                     if let Ok(bytes) =
                         serde_json::to_vec(&serde_json::json!({"key":key,"index":index}))

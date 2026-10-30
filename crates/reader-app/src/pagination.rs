@@ -183,6 +183,17 @@ fn compute_with_workers(
     generation: u64,
     workers: usize,
 ) -> Result<PageIndex> {
+    compute_output::<false>(book, extent, settings, epoch, generation, workers)
+}
+
+fn compute_output<const EMIT: bool>(
+    book: &Book,
+    extent: Vec2,
+    settings: &Settings,
+    epoch: &AtomicU64,
+    generation: u64,
+    workers: usize,
+) -> Result<PageIndex> {
     let check = || -> Result<()> {
         ensure!(
             epoch.load(Ordering::Acquire) == generation,
@@ -215,9 +226,23 @@ fn compute_with_workers(
     }
     let next = AtomicUsize::new(0);
     let worker = || -> Result<Vec<(usize, Vec<Option<Locator>>)>> {
+        #[cfg(test)]
+        let mut phases = [std::time::Duration::ZERO; 4];
+        #[cfg(test)]
+        let started = std::time::Instant::now();
         let mut working = book.clone();
         working.unload_chapters_except(&[]);
+        #[cfg(test)]
+        {
+            phases[0] += started.elapsed();
+        }
+        #[cfg(test)]
+        let started = std::time::Instant::now();
         let mut fonts = FontSystem::new();
+        #[cfg(test)]
+        {
+            phases[1] += started.elapsed();
+        }
         let mut results = Vec::new();
         loop {
             check()?;
@@ -231,7 +256,15 @@ fn compute_with_workers(
                 results.push((index, vec![metadata.start_locator()]));
                 continue;
             }
+            #[cfg(test)]
+            let started = std::time::Instant::now();
             working.ensure_chapter_loaded(index)?;
+            #[cfg(test)]
+            {
+                phases[2] += started.elapsed();
+            }
+            #[cfg(test)]
+            let started = std::time::Instant::now();
             let content = reading_surface::content_rect(
                 eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, extent),
                 &working.chapters[index],
@@ -240,20 +273,44 @@ fn compute_with_workers(
             let effective =
                 reading_surface::effective_layout_settings(settings, &working.chapters[index]);
             let plan = reading_surface::chapter_spread(&working, index, content.size(), settings);
-            let page = layout::chapter_layout(
-                &mut fonts,
-                &working.chapters[index],
-                plan.extent(content.size()),
-                &effective,
-            );
-            check()?;
-            let starts = if page.pages.is_empty() {
-                vec![None]
+            let starts = if EMIT {
+                let page = layout::chapter_layout(
+                    &mut fonts,
+                    &working.chapters[index],
+                    plan.extent(content.size()),
+                    &effective,
+                );
+                if page.pages.is_empty() {
+                    vec![None]
+                } else {
+                    page.pages.iter().map(|page| page.first_locator()).collect()
+                }
             } else {
-                page.pages.iter().map(|page| page.first_locator()).collect()
+                layout::chapter_page_starts(
+                    &mut fonts,
+                    &working.chapters[index],
+                    plan.extent(content.size()),
+                    &effective,
+                )
             };
+            #[cfg(test)]
+            {
+                phases[3] += started.elapsed();
+            }
+            check()?;
             results.push((index, starts));
             working.unload_chapters_except(&[]);
+        }
+        #[cfg(test)]
+        if std::env::var_os("VOBR_PAGINATION_PHASES").is_some() {
+            eprintln!(
+                "pagination_worker: emit={EMIT} chapters={} clone_us={} fonts_us={} load_us={} layout_us={}",
+                results.len(),
+                phases[0].as_micros(),
+                phases[1].as_micros(),
+                phases[2].as_micros(),
+                phases[3].as_micros()
+            );
         }
         Ok(results)
     };
@@ -298,7 +355,31 @@ mod tests {
         let opened = started.elapsed();
         let settings = Settings::default();
         let before = std::time::Instant::now();
-        let result = compute(&book, vec2(1280., 760.), &settings, &AtomicU64::new(0), 0).unwrap();
+        let emit = std::env::var("VOBR_PAGINATION_OUTPUT").is_ok_and(|mode| mode == "full");
+        let workers = std::env::var("VOBR_PAGINATION_WORKERS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(3);
+        let result = if emit {
+            compute_output::<true>(
+                &book,
+                vec2(1280., 760.),
+                &settings,
+                &AtomicU64::new(0),
+                0,
+                workers,
+            )
+        } else {
+            compute_output::<false>(
+                &book,
+                vec2(1280., 760.),
+                &settings,
+                &AtomicU64::new(0),
+                0,
+                workers,
+            )
+        }
+        .unwrap();
         eprintln!(
             "pagination: open_ms={} layout_ms={} chapters={} pages={}",
             opened.as_millis(),
@@ -307,6 +388,9 @@ mod tests {
             result.total
         );
         assert!(result.total >= book.chapters.len());
+        if let Some(path) = std::env::var_os("VOBR_PAGINATION_INDEX_OUTPUT") {
+            std::fs::write(path, serde_json::to_vec(&result).unwrap()).unwrap();
+        }
     }
 
     #[test]
@@ -339,6 +423,9 @@ mod tests {
             let parallel =
                 compute_with_workers(&book, vec2(590., 650.), &settings, &epoch, 1, 3).unwrap();
             assert_eq!(serial, parallel);
+            let rendered =
+                compute_output::<true>(&book, vec2(590., 650.), &settings, &epoch, 1, 1).unwrap();
+            assert_eq!(serial, rendered);
             assert!(
                 compute_with_workers(&book, vec2(590., 650.), &settings, &epoch, 0, 3).is_err()
             );

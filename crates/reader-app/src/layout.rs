@@ -407,7 +407,7 @@ pub fn expand_word(chapter: &Chapter, hit: &Hit) -> Hit {
     }
 }
 
-struct Flow<'a> {
+struct Flow<'a, const EMIT: bool> {
     fonts: &'a mut FontSystem,
     settings: &'a Settings,
     extent: Vec2,
@@ -419,6 +419,9 @@ struct Flow<'a> {
     y: f32,
     page: Page,
     pages: Vec<Page>,
+    starts: Vec<Option<Locator>>,
+    counted: [usize; 4],
+    first_hit: Option<Locator>,
     atom_index: usize,
     chapter: u32,
     in_cell: bool,
@@ -441,50 +444,43 @@ struct AtomToken<'a> {
     tcy: bool,
 }
 
-fn atom_tokens(atom: &Atom, show_ruby: bool) -> Vec<AtomToken<'_>> {
+fn atom_tokens(atom: &Atom, show_ruby: bool) -> impl Iterator<Item = AtomToken<'_>> {
     let ruby = show_ruby.then_some(atom.ruby.as_deref()).flatten();
-    if ruby.is_some() || atom.style.tate_chu_yoko {
-        return vec![AtomToken {
-            text: &atom.text,
-            offset: 0,
-            ruby,
-            tcy: atom.style.tate_chu_yoko,
-        }];
-    }
-    let mut tokens = Vec::new();
-    let mut ascii_start = None;
-    for (offset, grapheme) in atom.text.grapheme_indices(true) {
-        if grapheme
+    let grouped = ruby.is_some() || atom.style.tate_chu_yoko;
+    let mut whole = grouped.then_some(AtomToken {
+        text: &atom.text,
+        offset: 0,
+        ruby,
+        tcy: atom.style.tate_chu_yoko,
+    });
+    let mut graphemes = atom.text.grapheme_indices(true).peekable();
+    let ascii_word = |grapheme: &str| {
+        grapheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "-_@./".contains(c))
-        {
-            ascii_start.get_or_insert(offset);
-            continue;
+    };
+    std::iter::from_fn(move || {
+        if grouped {
+            return whole.take();
         }
-        if let Some(start) = ascii_start.take() {
-            tokens.push(AtomToken {
-                text: &atom.text[start..offset],
-                offset: start,
-                ruby: None,
-                tcy: false,
-            });
+        let (offset, grapheme) = graphemes.next()?;
+        let mut end = offset + grapheme.len();
+        if ascii_word(grapheme) {
+            while let Some(&(next, grapheme)) = graphemes.peek() {
+                if !ascii_word(grapheme) {
+                    break;
+                }
+                end = next + grapheme.len();
+                graphemes.next();
+            }
         }
-        tokens.push(AtomToken {
-            text: grapheme,
+        Some(AtomToken {
+            text: &atom.text[offset..end],
             offset,
             ruby: None,
             tcy: false,
-        });
-    }
-    if let Some(start) = ascii_start {
-        tokens.push(AtomToken {
-            text: &atom.text[start..],
-            offset: start,
-            ruby: None,
-            tcy: false,
-        });
-    }
-    tokens
+        })
+    })
 }
 
 fn cannot_start_line(character: char) -> bool {
@@ -562,104 +558,16 @@ fn prepare_break_hints(
         vertical: bool,
         tcy: bool,
     }
-    fn atom_count(blocks: &[Block]) -> usize {
-        blocks
-            .iter()
-            .map(|block| {
-                block.atoms.len()
-                    + block
-                        .table
-                        .as_ref()
-                        .map(|table| {
-                            table
-                                .rows
-                                .iter()
-                                .flat_map(|row| &row.cells)
-                                .map(|cell| atom_count(&cell.blocks))
-                                .sum::<usize>()
-                        })
-                        .unwrap_or(0)
-            })
-            .sum()
-    }
-    let mut tokens = Vec::new();
-    let mut atom_index = start_atom;
-    for block in blocks {
-        if !closing_only_block(block) {
-            tokens.push(None);
-        }
-        if block.image.is_some()
-            || block.table.is_some()
-            || block.mathml.is_some()
-            || matches!(block.kind, BlockKind::Rule)
-        {
-            atom_index += atom_count(std::slice::from_ref(block));
-            tokens.push(None);
-            continue;
-        }
-        let vertical = vertical && !matches!(block.kind, BlockKind::Code);
-        let base = block_size(block, settings.font_size);
-        for atom in &block.atoms {
-            let id = unit_id(chapter, atom_index);
-            atom_index += 1;
-            if atom.image.is_some() {
-                tokens.push(None);
-                continue;
-            }
-            let preferred = if atom.style.code || matches!(block.kind, BlockKind::Code) {
-                fonts::CODE_FACE
-            } else {
-                fonts.body_face(&settings.font_family)
-            };
-            let size = atom_size(atom, base, settings.font_size)
-                * if atom.style.superscript || atom.style.subscript {
-                    0.68
-                } else {
-                    1.
-                };
-            for token in atom_tokens(atom, settings.show_ruby) {
-                if token.text.is_empty() {
-                    continue;
-                }
-                if token.text.contains(['\n', '\t']) {
-                    tokens.push(None);
-                    continue;
-                }
-                let first = token.text.chars().next().unwrap();
-                let last = token.text.chars().last().unwrap();
-                tokens.push(Some(Token {
-                    id,
-                    offset: token.offset,
-                    first,
-                    last,
-                    text: token.text,
-                    preferred,
-                    size,
-                    vertical,
-                    tcy: token.tcy,
-                }));
-            }
-        }
-    }
-    let mut hints = HashMap::new();
-    for run in tokens.split(|token| token.is_none()) {
-        let mut start = 0;
-        for end in 1..=run.len() {
-            if end < run.len()
-                && (cannot_end_line(run[end - 1].as_ref().unwrap().last)
-                    || cannot_start_line(run[end].as_ref().unwrap().first))
-            {
-                continue;
-            }
-            // Ordinary breakable characters need no extra shaping or map
-            // entries. Only measure multi-token kinsoku groups in advance.
-            if end == start + 1 {
-                start = end;
-                continue;
-            }
+    fn flush_group(
+        fonts: &mut FontSystem,
+        settings: &Settings,
+        group: &mut Vec<Token<'_>>,
+        hints: &mut HashMap<(u64, usize), BreakHint>,
+    ) {
+        if group.len() > 1 {
             let mut remaining = 0.;
-            for index in (start..end).rev() {
-                let token = run[index].as_ref().unwrap();
+            for index in (0..group.len()).rev() {
+                let token = &group[index];
                 let face = fonts.face_for_text(token.preferred, token.text);
                 let rotate = token.vertical
                     && !token.tcy
@@ -688,18 +596,205 @@ fn prepare_break_hints(
                     (token.id, token.offset),
                     BreakHint {
                         remaining,
-                        before: index == start,
+                        before: index == 0,
                     },
                 );
             }
-            start = end;
+        }
+        group.clear();
+    }
+    fn push_token<'a>(
+        fonts: &mut FontSystem,
+        settings: &Settings,
+        group: &mut Vec<Token<'a>>,
+        token: Token<'a>,
+        hints: &mut HashMap<(u64, usize), BreakHint>,
+    ) {
+        if let Some(previous) = group.last()
+            && !cannot_end_line(previous.last)
+            && !cannot_start_line(token.first)
+        {
+            flush_group(fonts, settings, group, hints);
+        }
+        group.push(token);
+    }
+    fn atom_count(blocks: &[Block]) -> usize {
+        blocks
+            .iter()
+            .map(|block| {
+                block.atoms.len()
+                    + block
+                        .table
+                        .as_ref()
+                        .map(|table| {
+                            table
+                                .rows
+                                .iter()
+                                .flat_map(|row| &row.cells)
+                                .map(|cell| atom_count(&cell.blocks))
+                                .sum::<usize>()
+                        })
+                        .unwrap_or(0)
+            })
+            .sum()
+    }
+    // Only a pending unbreakable group needs storage. Ordinary characters are
+    // discarded as soon as the next permitted break is known.
+    let mut group = Vec::new();
+    let mut hints = HashMap::new();
+    let mut atom_index = start_atom;
+    for block in blocks {
+        if !closing_only_block(block) {
+            flush_group(fonts, settings, &mut group, &mut hints);
+        }
+        if block.image.is_some()
+            || block.table.is_some()
+            || block.mathml.is_some()
+            || matches!(block.kind, BlockKind::Rule)
+        {
+            atom_index += atom_count(std::slice::from_ref(block));
+            flush_group(fonts, settings, &mut group, &mut hints);
+            continue;
+        }
+        let vertical = vertical && !matches!(block.kind, BlockKind::Code);
+        let base = block_size(block, settings.font_size);
+        for atom in &block.atoms {
+            let id = unit_id(chapter, atom_index);
+            atom_index += 1;
+            if atom.image.is_some() {
+                flush_group(fonts, settings, &mut group, &mut hints);
+                continue;
+            }
+            let preferred = if atom.style.code || matches!(block.kind, BlockKind::Code) {
+                fonts::CODE_FACE
+            } else {
+                fonts.body_face(&settings.font_family)
+            };
+            let size = atom_size(atom, base, settings.font_size)
+                * if atom.style.superscript || atom.style.subscript {
+                    0.68
+                } else {
+                    1.
+                };
+            for token in atom_tokens(atom, settings.show_ruby) {
+                if token.text.is_empty() {
+                    continue;
+                }
+                if token.text.contains(['\n', '\t']) {
+                    flush_group(fonts, settings, &mut group, &mut hints);
+                    continue;
+                }
+                let first = token.text.chars().next().unwrap();
+                let last = token.text.chars().last().unwrap();
+                push_token(
+                    fonts,
+                    settings,
+                    &mut group,
+                    Token {
+                        id,
+                        offset: token.offset,
+                        first,
+                        last,
+                        text: token.text,
+                        preferred,
+                        size,
+                        vertical,
+                        tcy: token.tcy,
+                    },
+                    &mut hints,
+                );
+            }
         }
     }
+    flush_group(fonts, settings, &mut group, &mut hints);
     hints
 }
 
-impl Flow<'_> {
+impl<const EMIT: bool> Flow<'_, EMIT> {
+    // Page output is optional, while every line-break and block-placement
+    // decision runs through the same flow. Counting keeps only occupancy and
+    // the first real source hit; it never constructs paint or selection data.
+    fn output_sizes(&self) -> [usize; 4] {
+        if EMIT {
+            [
+                self.page.glyphs.len(),
+                self.page.hits.len(),
+                self.page.pictures.len(),
+                self.page.rules.len(),
+            ]
+        } else {
+            self.counted
+        }
+    }
+
+    fn page_count(&self) -> usize {
+        if EMIT {
+            self.pages.len()
+        } else {
+            self.starts.len()
+        }
+    }
+
+    fn count_hit(&mut self, locator: Locator) {
+        self.counted[1] += 1;
+        self.first_hit.get_or_insert(locator);
+    }
+
+    fn hit(&mut self, locator: Locator, make: impl FnOnce() -> Hit) {
+        if EMIT {
+            self.page.hits.push(make());
+        } else {
+            self.count_hit(locator);
+        }
+    }
+
+    fn token_source(
+        &mut self,
+        atom: &Atom,
+        text: &str,
+        offset: usize,
+        whole: bool,
+        glyphs: &[fonts::ShapedGlyph],
+    ) {
+        if whole {
+            if let (Some(locator), Some(_)) = (
+                atom.locator_at(offset),
+                atom.locator_at(offset + text.len()),
+            ) {
+                self.count_hit(locator);
+            }
+            return;
+        }
+        let mut index = 0;
+        while index < glyphs.len() {
+            let cluster = glyphs[index].cluster;
+            index += 1;
+            while index < glyphs.len() && glyphs[index].cluster == cluster {
+                index += 1;
+            }
+            let end = glyphs
+                .get(index)
+                .map(|glyph| glyph.cluster)
+                .unwrap_or(text.len());
+            if text.get(cluster..end).is_some()
+                && let (Some(locator), Some(_)) = (
+                    atom.locator_at(offset + cluster),
+                    atom.locator_at(offset + end),
+                )
+            {
+                // Subsequent hits cannot change this page's first source, and
+                // occupancy only distinguishes an empty line from a nonempty one.
+                self.count_hit(locator);
+                break;
+            }
+        }
+    }
+
     fn picture(&mut self, image: &ImageRef, rect: Rect) {
+        if !EMIT {
+            self.counted[2] += 1;
+            return;
+        }
         self.page.pictures.push(Picture {
             rect,
             resource: image.resource.clone(),
@@ -730,8 +825,8 @@ impl Flow<'_> {
             return;
         }
         if (!self.vertical && self.x > self.margin)
-            || !self.page.glyphs.is_empty()
-            || !self.page.pictures.is_empty()
+            || self.output_sizes()[0] != 0
+            || self.output_sizes()[2] != 0
         {
             self.newline(base);
         }
@@ -752,7 +847,7 @@ impl Flow<'_> {
                 size,
             )
         };
-        if self.page.hits.is_empty() && self.page.anchor.is_none() {
+        if self.output_sizes()[1] == 0 && self.page.anchor.is_none() {
             self.page.anchor = image.source.map(|source| source.start_locator());
         }
         self.picture(image, rect);
@@ -824,7 +919,7 @@ impl Flow<'_> {
         };
         self.picture(image, rect);
         if let (Some(locator), Some(end)) = (atom.locator_at(0), atom.locator_at(atom.text.len())) {
-            self.page.hits.push(Hit {
+            self.hit(locator, || Hit {
                 rect,
                 locator,
                 end,
@@ -833,7 +928,8 @@ impl Flow<'_> {
                 text: atom.text.clone(),
             });
         }
-        if self.settings.show_ruby
+        if EMIT
+            && self.settings.show_ruby
             && let Some(ruby) = atom.ruby.as_ref().filter(|ruby| !ruby.is_empty())
         {
             let glyphs = self.fonts.shape(face, ruby, self.vertical);
@@ -888,13 +984,17 @@ impl Flow<'_> {
         self.line_ascent = 0.0;
         self.line_cross = 0.0;
         self.line_start = [
-            self.page.glyphs.len(),
-            self.page.hits.len(),
-            self.page.pictures.len(),
+            self.output_sizes()[0],
+            self.output_sizes()[1],
+            self.output_sizes()[2],
         ];
     }
     fn raise_baseline(&mut self, ascent: f32) {
         if self.vertical || ascent <= self.line_ascent {
+            return;
+        }
+        if !EMIT {
+            self.line_ascent = ascent;
             return;
         }
         let shift = vec2(0.0, ascent - self.line_ascent);
@@ -916,11 +1016,9 @@ impl Flow<'_> {
         self.extent.x - self.margin
     }
     fn fresh_page(&mut self) {
-        if !self.page.glyphs.is_empty()
-            || !self.page.pictures.is_empty()
-            || !self.page.rules.is_empty()
+        if self.output_sizes()[0] != 0 || self.output_sizes()[2] != 0 || self.output_sizes()[3] != 0
         {
-            if !self.in_cell {
+            if EMIT && !self.in_cell {
                 self.page.balance_grid(
                     self.fonts,
                     self.extent,
@@ -929,7 +1027,14 @@ impl Flow<'_> {
                     self.vertical,
                 );
             }
-            self.pages.push(std::mem::take(&mut self.page));
+            if EMIT {
+                self.pages.push(std::mem::take(&mut self.page));
+            } else {
+                self.starts.push(self.page.anchor.or(self.first_hit));
+                self.page.anchor = None;
+                self.first_hit = None;
+                self.counted = [0; 4];
+            }
         }
         self.x = if self.vertical {
             self.right() - self.settings.font_size
@@ -1023,7 +1128,7 @@ impl Flow<'_> {
             if let (Some(locator), Some(end)) =
                 (atom.locator_at(offset), atom.locator_at(offset + 1))
             {
-                self.page.hits.push(Hit {
+                self.hit(locator, || Hit {
                     rect,
                     locator,
                     end,
@@ -1083,9 +1188,9 @@ impl Flow<'_> {
         let hint = self.break_hints.get(&(id, offset));
         let need = hint.map_or(advance, |hint| hint.remaining);
         let can_break = hint.is_none_or(|hint| hint.before);
-        let line_has_content = self.page.glyphs.len() > self.line_start[0]
-            || self.page.hits.len() > self.line_start[1]
-            || self.page.pictures.len() > self.line_start[2];
+        let line_has_content = self.output_sizes()[0] > self.line_start[0]
+            || self.output_sizes()[1] > self.line_start[1]
+            || self.output_sizes()[2] > self.line_start[2];
         if need > available + 0.01 && can_break && line_has_content {
             self.newline(base_size);
         }
@@ -1103,6 +1208,32 @@ impl Flow<'_> {
         }
         if !self.vertical {
             self.raise_baseline(base_size * 0.88);
+        }
+        if !EMIT {
+            let mut has_glyph = !glyphs.is_empty();
+            // Ruby and emphasis never alter the flow advance. Only their
+            // presence can make an otherwise empty output page nonempty.
+            if !has_glyph && let Some(ruby) = ruby.filter(|text| !text.is_empty()) {
+                has_glyph = !self.fonts.shape(face, ruby, self.vertical).is_empty();
+            }
+            if !has_glyph && atom.style.emphasis && text.chars().any(char::is_alphanumeric) {
+                has_glyph = !self.fonts.shape(face, "・", self.vertical).is_empty();
+            }
+            self.counted[0] += usize::from(has_glyph);
+            self.token_source(
+                atom,
+                text,
+                offset,
+                ruby.is_some() || tcy || glyphs.is_empty(),
+                &glyphs,
+            );
+            self.counted[3] += usize::from(atom.style.strike);
+            if self.vertical {
+                self.y += advance;
+            } else {
+                self.x += advance;
+            }
+            return;
         }
         let start = pos2(self.x, self.y);
         let script_shift = if atom.style.superscript {
@@ -1368,26 +1499,30 @@ impl Flow<'_> {
             ),
             vec2(width, height) * scale,
         );
-        let palette = crate::theme::Palette::for_settings(self.settings);
-        let color = format!(
-            "fill=\"#{:02x}{:02x}{:02x}\"",
-            palette.ink.r(),
-            palette.ink.g(),
-            palette.ink.b()
-        );
-        let svg = formulary::svg::to_svg(&formula, &font).replacen("fill=\"black\"", &color, 1);
-        self.page.pictures.push(Picture {
-            rect,
-            resource: format!(
-                "math:{}:{}:{:.2}:{:?}",
-                self.chapter, block.id, self.settings.font_size, self.settings.theme
-            ),
-            alt: block.plain_text(),
-            inline_svg: Some(svg),
-            pdf_page: None,
-            fixed_canvas: None,
-            text_image: false,
-        });
+        if EMIT {
+            let palette = crate::theme::Palette::for_settings(self.settings);
+            let color = format!(
+                "fill=\"#{:02x}{:02x}{:02x}\"",
+                palette.ink.r(),
+                palette.ink.g(),
+                palette.ink.b()
+            );
+            let svg = formulary::svg::to_svg(&formula, &font).replacen("fill=\"black\"", &color, 1);
+            self.page.pictures.push(Picture {
+                rect,
+                resource: format!(
+                    "math:{}:{}:{:.2}:{:?}",
+                    self.chapter, block.id, self.settings.font_size, self.settings.theme
+                ),
+                alt: block.plain_text(),
+                inline_svg: Some(svg),
+                pdf_page: None,
+                fixed_canvas: None,
+                text_image: false,
+            });
+        } else {
+            self.counted[2] += 1;
+        }
         if let (Some(start), Some(end)) = (
             block.atoms.iter().find_map(|atom| atom.locator_at(0)),
             block
@@ -1396,11 +1531,12 @@ impl Flow<'_> {
                 .rev()
                 .find_map(|atom| atom.locator_at(atom.text.len())),
         ) {
-            self.page.hits.push(Hit {
+            let id = unit_id(self.chapter, self.atom_index);
+            self.hit(start, || Hit {
                 rect,
                 locator: start,
                 end,
-                unit_id: unit_id(self.chapter, self.atom_index),
+                unit_id: id,
                 offset: 0,
                 text: block.plain_text(),
             });
@@ -1426,7 +1562,7 @@ impl Flow<'_> {
             self.fresh_page();
             self.vertical = false;
             self.x = self.margin;
-        } else if self.x > self.margin || !self.page.glyphs.is_empty() {
+        } else if self.x > self.margin || self.output_sizes()[0] != 0 {
             self.newline(base);
         }
         struct Cell {
@@ -1497,7 +1633,7 @@ impl Flow<'_> {
                 self.atom_index,
                 false,
             );
-            let mut sub = Flow {
+            let mut sub = Flow::<true> {
                 fonts: self.fonts,
                 settings: &settings,
                 extent: vec2(column_width * colspan as f32 - padding * 2.0, 1_000_000.0),
@@ -1509,6 +1645,9 @@ impl Flow<'_> {
                 y: 0.0,
                 page: Page::default(),
                 pages: Vec::new(),
+                starts: Vec::new(),
+                counted: [0; 4],
+                first_hit: None,
                 atom_index: self.atom_index,
                 chapter: self.chapter,
                 in_cell: true,
@@ -1555,7 +1694,7 @@ impl Flow<'_> {
                 .iter()
                 .any(|cell| cell.row < header_rows && cell.row + cell.rowspan > header_rows);
         let margin = self.margin;
-        let draw_group = |page: &mut Page, start: usize, end: usize, y: f32, scale: f32| {
+        let draw_group = |flow: &mut Self, start: usize, end: usize, y: f32, scale: f32| {
             for cell in cells
                 .iter()
                 .filter(|cell| cell.row >= start && cell.row < end)
@@ -1570,11 +1709,20 @@ impl Flow<'_> {
                         row_offsets[cell.row + cell.rowspan] - row_offsets[cell.row],
                     ) * scale,
                 );
-                if cell.header {
-                    page.header_fills.push(rect);
+                if !EMIT {
+                    flow.counted[0] += cell.page.glyphs.len();
+                    flow.counted[2] += cell.page.pictures.len();
+                    flow.counted[3] += 1 + cell.page.rules.len();
+                    if let Some(hit) = cell.page.hits.first() {
+                        flow.count_hit(hit.locator);
+                    }
+                    continue;
                 }
-                page.rules.push(rect);
-                page.append_at(
+                if cell.header {
+                    flow.page.header_fills.push(rect);
+                }
+                flow.page.rules.push(rect);
+                flow.page.append_at(
                     cell.page.clone(),
                     rect.min.to_vec2() + vec2(padding, padding) * scale,
                     scale,
@@ -1622,11 +1770,12 @@ impl Flow<'_> {
             } else {
                 0.0
             };
-            draw_group(&mut self.page, row, end, self.y + header_height, effective);
+            let y = self.y;
+            draw_group(self, row, end, y + header_height, effective);
             // Put repeated-header hits after body hits so page bookmarks resume
             // at the new row rather than repeatedly targeting the first header.
             if repeat {
-                draw_group(&mut self.page, 0, header_rows, self.y, effective);
+                draw_group(self, 0, header_rows, y, effective);
             }
             self.y += (natural_height * effective) + header_height;
             self.x = self.margin;
@@ -1667,7 +1816,7 @@ impl Flow<'_> {
             self.fonts.body_face(&self.settings.font_family)
         };
         let continue_closing = closing_only_block(block);
-        if self.vertical && self.page.glyphs.is_empty() && self.page.pictures.is_empty() {
+        if self.vertical && self.output_sizes()[0] == 0 && self.output_sizes()[2] == 0 {
             // A large authored/default heading starts inside the page's right
             // edge; its CSS size must not extend beyond a body-sized first cell.
             self.x = self.right() - size;
@@ -1681,11 +1830,11 @@ impl Flow<'_> {
             .margin_block_start
             .map(|length| length.resolve(size, base, reference))
             .unwrap_or(0.);
-        if (!self.page.glyphs.is_empty() || !self.page.pictures.is_empty()) && !continue_closing {
+        if (self.output_sizes()[0] != 0 || self.output_sizes()[2] != 0) && !continue_closing {
             let heading_gap = collapsed_margin(std::mem::take(&mut self.heading_gap), start_margin);
-            let old_page = self.pages.len();
+            let old_page = self.page_count();
             self.newline(size);
-            if old_page == self.pages.len() && heading_gap != 0. {
+            if old_page == self.page_count() && heading_gap != 0. {
                 if self.vertical {
                     self.x -= heading_gap;
                     if self.x < self.margin {
@@ -1764,6 +1913,32 @@ pub fn chapter_layout(
     extent: Vec2,
     settings: &Settings,
 ) -> BookLayout {
+    chapter_output::<true>(fonts, chapter, extent, settings).0
+}
+
+/// Exact page starts using the rendering flow, without producing paint or hit
+/// arrays. No character ratio or separate approximate paginator is involved.
+pub fn chapter_page_starts(
+    fonts: &mut FontSystem,
+    chapter: &Chapter,
+    extent: Vec2,
+    settings: &Settings,
+) -> Vec<Option<Locator>> {
+    chapter_output::<false>(fonts, chapter, extent, settings).1
+}
+
+fn chapter_output<const EMIT: bool>(
+    fonts: &mut FontSystem,
+    chapter: &Chapter,
+    extent: Vec2,
+    settings: &Settings,
+) -> (BookLayout, Vec<Option<Locator>>) {
+    if !EMIT
+        && (chapter.fixed_page.is_some()
+            || chapter.presentation.layout == Some(reader_core::RenditionLayout::PrePaginated))
+    {
+        return (BookLayout::default(), vec![chapter.start_locator()]);
+    }
     fonts.begin_layout(&settings.font_family);
     let vertical = match settings.reading_mode {
         ReadingMode::Vertical => true,
@@ -1814,14 +1989,14 @@ pub fn chapter_layout(
                 text: character.text.clone(),
             });
         }
-        return BookLayout { pages: vec![page] };
+        return (BookLayout { pages: vec![page] }, Vec::new());
     }
     if chapter.presentation.layout == Some(reader_core::RenditionLayout::PrePaginated) {
-        return epub_fixed_layout(chapter, extent);
+        return (epub_fixed_layout(chapter, extent), Vec::new());
     }
     let break_hints =
         prepare_break_hints(fonts, &chapter.blocks, settings, chapter.id, 0, vertical);
-    let mut flow = Flow {
+    let mut flow = Flow::<EMIT> {
         fonts,
         settings,
         extent,
@@ -1833,6 +2008,9 @@ pub fn chapter_layout(
         y: margin_y,
         page: Page::default(),
         pages: Vec::new(),
+        starts: Vec::new(),
+        counted: [0; 4],
+        first_hit: None,
         atom_index: 0,
         chapter: chapter.id,
         in_cell: false,
@@ -1846,15 +2024,80 @@ pub fn chapter_layout(
         flow.block(block);
     }
     flow.fresh_page();
-    if flow.pages.is_empty() {
-        flow.pages.push(Page::default());
+    if EMIT {
+        if flow.pages.is_empty() {
+            flow.pages.push(Page::default());
+        }
+    } else if flow.starts.is_empty() {
+        flow.starts.push(None);
     }
-    BookLayout { pages: flow.pages }
+    (BookLayout { pages: flow.pages }, flow.starts)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_only_output_matches_every_rendered_page_start_for_rich_content() {
+        let rows = (0..24).map(|row| format!(
+            "<tr><td>{row}</td><td>日本語の文章と<ruby>漢字<rt>かんじ</rt></ruby>。</td><td>{row}.5</td></tr>"
+        )).collect::<String>();
+        let table = format!(
+            "<table><thead><tr><th rowspan='2'>項目</th><th colspan='2'>説明</th></tr><tr><th>本文</th><th>数</th></tr></thead><tbody>{rows}</tbody></table>"
+        );
+        let fixtures = [
+            "<h1>章の見出し</h1><h2>小見出し</h2><p style='text-indent:1em'>甲乙丙丁戊「<ruby>東京<rt>とうきょう</rt></ruby>」と<ruby>文章<rt>ぶんしょう</rt></ruby>。<span>」</span></p><p><span>』</span></p>".repeat(17),
+            "<p><b>太字</b><i>斜体</i><sup>上</sup><sub>下</sub><s>訂正</s><em>強調</em>。<span style='text-combine-upright:all'>12</span>年。fi ffi café e&#x301;.</p><pre>let value = 3;\n\tprintln!(\"value\");</pre>".repeat(13),
+            "<p>本文<img src='gaiji.png' alt='髙' style='width:1em;height:1em;vertical-align:super'/>の続き。</p><p><img src='illustration.png' width='240' height='180'/></p><p><ruby>図版<rt>ずはん</rt></ruby>の次を読む。</p>".repeat(11),
+            format!("<p>表の前。</p>{table}<p>表の後。</p>"),
+            "<p>数式の前。</p><math xmlns='http://www.w3.org/1998/Math/MathML' display='block'><mfrac><mrow><mi>x</mi><mo>+</mo><mn>1</mn></mrow><msqrt><mi>y</mi></msqrt></mfrac></math><p>数式の後。</p>".repeat(9),
+            "<ul><li>最初の項目</li><li>次の項目</li></ul><hr/><p>　空白と禁則（「文章」）。</p>".repeat(19),
+            "<p> </p><p>\t</p>".into(),
+        ];
+        for (fixture, body) in fixtures.iter().enumerate() {
+            let chapter = reader_core::parse_html(
+                &format!("<html><body>{body}</body></html>"),
+                3,
+                "exact.xhtml",
+                "",
+            )
+            .unwrap();
+            for mode in [ReadingMode::Horizontal, ReadingMode::Vertical] {
+                for (extent, show_ruby) in [(vec2(381., 427.), true), (vec2(647., 503.), false)] {
+                    let settings = Settings {
+                        reading_mode: mode,
+                        font_size: 23.,
+                        margins: 21.,
+                        margin_vertical: Some(27.),
+                        margin_horizontal: Some(19.),
+                        show_ruby,
+                        letter_spacing: 0.03,
+                        ..Settings::default()
+                    };
+                    let rendered =
+                        chapter_layout(&mut FontSystem::new(), &chapter, extent, &settings);
+                    let counted =
+                        chapter_page_starts(&mut FontSystem::new(), &chapter, extent, &settings);
+                    let expected: Vec<_> = rendered.pages.iter().map(Page::first_locator).collect();
+                    assert_eq!(
+                        counted, expected,
+                        "fixture={fixture}, mode={mode:?}, extent={extent:?}, ruby={show_ruby}"
+                    );
+                    // Count mode never materializes output vectors, including
+                    // textless, image-only and MathML pages.
+                    let (output, starts) = chapter_output::<false>(
+                        &mut FontSystem::new(),
+                        &chapter,
+                        extent,
+                        &settings,
+                    );
+                    assert!(output.pages.is_empty());
+                    assert_eq!(starts, expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn horizontal_and_vertical_margins_are_independent_in_both_writing_modes() {
