@@ -217,9 +217,14 @@ def package(root: Path, target: str, output_dir: Path) -> Path:
         }, indent=2), encoding="utf-8")
         if "apple-darwin" in target:
             # Ad-hoc signing needs no credentials. This is not Apple notarization.
+            # Sign nested code inside out (Apple TN2206). Signing the main
+            # CFBundleExecutable also inspects its enclosing .app, so unsigned
+            # Intel helpers must already be signed before that bundle is sealed.
             for binary in binaries:
-                subprocess.run(["codesign", "--force", "--sign", "-", str(executable_dir / binary.name)], check=True)
-            subprocess.run(["codesign", "--force", "--deep", "--sign", "-", str(staging / "Voice Over Book Reader.app")], check=True)
+                if binary.name != "voice-over-book-reader":
+                    subprocess.run(["codesign", "--force", "--sign", "-", str(executable_dir / binary.name)], check=True)
+            subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True)
+            subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
             for path in sorted(staging.rglob("*")):
                 if path.is_file():

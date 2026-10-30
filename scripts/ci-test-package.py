@@ -3,15 +3,74 @@
 import hashlib
 import importlib.util
 import json
+import plistlib
 import struct
+import subprocess
 from pathlib import Path, PurePosixPath
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 spec = importlib.util.spec_from_file_location("ci_package", Path(__file__).with_name("ci-package.py"))
 packager = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(packager)
+
+class AdHocSigningContract:
+    """Model TN2206 nested-code sealing; this does not implement Mach-O signing."""
+
+    marker = b"fixture-ad-hoc-signature\n"
+
+    def __init__(self, corrupt_before_verify=False):
+        self.corrupt_before_verify = corrupt_before_verify
+        self.verified = False
+        self.seals = {}
+
+    def sign_file(self, path):
+        path.write_bytes(self.marker + path.read_bytes().removeprefix(self.marker))
+
+    def run(self, command, check):
+        if command[0] != "codesign" or not check:
+            raise AssertionError("This fixture only handles checked codesign operations")
+        target = Path(command[-1])
+        app = target if target.suffix == ".app" else next(
+            parent for parent in target.parents if parent.suffix == ".app"
+        )
+        with (app / "Contents/Info.plist").open("rb") as file:
+            main_name = plistlib.load(file)["CFBundleExecutable"]
+        executable_dir = app / "Contents/MacOS"
+        main = executable_dir / main_name
+        helpers = [path for path in executable_dir.iterdir() if path.is_file() and path != main]
+
+        if "--verify" in command:
+            if "--deep" not in command or "--strict" not in command:
+                raise AssertionError("Nested-code verification must be recursive and strict")
+            if self.corrupt_before_verify:
+                helpers[0].write_bytes(helpers[0].read_bytes() + b"modified after sealing")
+            actual = {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                      for path in executable_dir.iterdir() if path.is_file()}
+            if self.seals.get(app) != actual:
+                raise subprocess.CalledProcessError(1, command, stderr="invalid nested-code seal")
+            self.verified = True
+        elif target == app or target == main:
+            # Signing CFBundleExecutable inside its .app has the outer bundle's
+            # nesting contract too. This is where the original Intel CI failed.
+            unsigned = [path for path in helpers if not path.read_bytes().startswith(self.marker)]
+            if unsigned and "--deep" not in command:
+                raise subprocess.CalledProcessError(1, command, stderr="unsigned nested helper")
+            for helper in unsigned:
+                self.sign_file(helper)
+            self.sign_file(main)
+            self.seals[app] = {
+                path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                for path in executable_dir.iterdir() if path.is_file()
+            }
+            signature_dir = app / "Contents/_CodeSignature"
+            signature_dir.mkdir(exist_ok=True)
+            (signature_dir / "CodeResources").write_text(json.dumps(self.seals[app]), encoding="utf-8")
+        else:
+            self.sign_file(target)
+        return subprocess.CompletedProcess(command, 0)
 
 
 class PackageTests(unittest.TestCase):
@@ -103,6 +162,56 @@ class PackageTests(unittest.TestCase):
             (release / "voice-over-book-reader").write_bytes(b"fixture only")
             with self.assertRaises(FileNotFoundError):
                 packager.package(root, "x86_64-unknown-linux-gnu", root / "packages")
+
+    def test_mac_bundles_seal_unsigned_intel_and_already_signed_arm_helpers(self):
+        for target, already_signed in [
+            ("x86_64-apple-darwin", False),
+            ("aarch64-apple-darwin", True),
+        ]:
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                metadata = self.fixture(root)
+                packager.cargo_metadata = lambda *_: metadata
+                release = root / "target" / target / "release"
+                release.mkdir(parents=True)
+                originals = {}
+                for name in ("voice-over-book-reader", "reader-dictionary-popup"):
+                    data = b"original compiled fixture " + name.encode()
+                    if already_signed:
+                        data = AdHocSigningContract.marker + data
+                    (release / name).write_bytes(data)
+                    originals[name] = data
+                contract = AdHocSigningContract()
+                with patch.object(packager.subprocess, "run", side_effect=contract.run):
+                    archive_path = packager.package(root, target, root / "packages")
+                self.assertTrue(contract.verified)
+                with zipfile.ZipFile(archive_path) as archive:
+                    prefix = archive.namelist()[0].split("/", 1)[0] + "/Voice Over Book Reader.app/Contents/"
+                    seal = json.loads(archive.read(prefix + "_CodeSignature/CodeResources"))
+                    self.assertEqual(set(seal), set(originals))
+                    for name, original in originals.items():
+                        signed = archive.read(prefix + "MacOS/" + name)
+                        self.assertTrue(signed.startswith(contract.marker))
+                        self.assertEqual(hashlib.sha256(signed).hexdigest(), seal[name])
+                        self.assertEqual((release / name).read_bytes(), original)
+                self.assertEqual(archive_path.with_suffix(".zip.sha256").read_text().split()[0],
+                                 hashlib.sha256(archive_path.read_bytes()).hexdigest())
+
+    def test_mac_signature_verification_failure_never_publishes_a_zip(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata = self.fixture(root)
+            packager.cargo_metadata = lambda *_: metadata
+            target = "aarch64-apple-darwin"
+            release = root / "target" / target / "release"
+            release.mkdir(parents=True)
+            for name in ("voice-over-book-reader", "reader-dictionary-popup"):
+                (release / name).write_bytes(AdHocSigningContract.marker + b"fixture")
+            contract = AdHocSigningContract(corrupt_before_verify=True)
+            with patch.object(packager.subprocess, "run", side_effect=contract.run):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    packager.package(root, target, root / "packages")
+            self.assertEqual(list((root / "packages").iterdir()), [])
 
     def test_packaged_readme_links_resolve_without_changing_source_readme(self):
         with tempfile.TemporaryDirectory(prefix="voice-over-book-reader-package-test-") as temporary:
