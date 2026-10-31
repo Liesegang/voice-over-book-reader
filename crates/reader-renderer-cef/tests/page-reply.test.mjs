@@ -48,6 +48,19 @@ test('superseded frame callbacks cannot complete a new request',()=>{
     assert.equal(result.events[1].page,2);assert.equal(h.dispatches,2);
 });
 
+test('late polls for an older key cannot redispatch or drain the newer request',()=>{
+    const h=harness();h.queue.push({type:'selection',revision:9});
+    h.reply(1,'9007199254740993');h.reply(2,'9007199254740994');
+    h.queue.push({type:'rects',revision:9});
+    assert.deepEqual(h.reply(1,'9007199254740993'),{pending:false,cancelled:true,events:[]});
+    assert.equal(h.dispatches,2);
+    h.frame();assert.equal(h.reply(2,'9007199254740994').pending,true);
+    h.frame();const result=h.reply(2,'9007199254740994');
+    assert.equal(result.pending,false);assert.equal(result.cancelled,false);
+    assert.deepEqual(result.events.map(event=>event.type),['selection','position','rects']);
+    assert.equal(result.events[1].page,2);assert.equal(h.dispatches,2);
+});
+
 test('document or turn invalidation drops stale Position and preserves unrelated events',()=>{
     for(const field of ['serial','revision','ticket']){
         const h=harness();h.queue.push({type:'selection',revision:9});h.reply(1);h.frame();
@@ -68,4 +81,5 @@ test('completion keys remain strings and cannot change the target',()=>{
     const h=harness();h.reply(1,'9007199254740993');
     assert.throws(()=>h.reply(2,'9007199254740993'),/changed target/);
     assert.throws(()=>h.reply(1,9007199254740993),/Invalid Page/);
+    assert.throws(()=>h.reply(1,'09007199254740993'),/Invalid Page/);
 });

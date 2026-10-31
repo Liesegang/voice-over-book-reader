@@ -7,7 +7,8 @@
         const matches=(event,value)=>event.type==='position'&&event.revision===value.command.revision&&event.page===value.command.index;
         const current=value=>{const now=state();return now.serial===value.guard.serial&&now.revision===value.guard.revision&&now.ticket===value.guard.ticket;};
         return (command,key)=>{
-            if(command?.type!=='page'||typeof key!=='string'||!/^\d{1,20}$/.test(key))throw Error('Invalid Page completion request');
+            if(command?.type!=='page'||typeof key!=='string'||!/^(0|[1-9]\d{0,19})$/.test(key))throw Error('Invalid Page completion request');
+            if(job&&BigInt(key)<BigInt(job.key))return {pending:false,cancelled:true,events:[]};
             if(!job||job.key!==key){
                 const carried=job&&!job.delivered?job.events.filter(event=>!matches(event,job)):[];
                 dispatch(command);
