@@ -87,6 +87,41 @@ fn next_document_revision(current: Revision, settings_revision: u64) -> Revision
     Revision(current.0.max(settings_revision) + 1)
 }
 
+#[derive(Clone, Copy)]
+struct WarmPaneState {
+    chapter: usize,
+    loaded: bool,
+    ready: bool,
+    idle: bool,
+    has_frame: bool,
+}
+impl WarmPaneState {
+    fn can_promote(self, target: usize) -> bool {
+        self.chapter == target && self.loaded && self.ready && self.idle && self.has_frame
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PrewarmAction {
+    Retain,
+    PollPending,
+    Continue,
+    Reuse,
+    Create,
+}
+
+fn prewarm_action(existing: Option<WarmPaneState>, target: Option<usize>) -> PrewarmAction {
+    let Some(target) = target else {
+        return PrewarmAction::Retain;
+    };
+    match existing {
+        Some(state) if state.chapter == target => PrewarmAction::Continue,
+        Some(state) if !state.loaded => PrewarmAction::PollPending,
+        Some(_) => PrewarmAction::Reuse,
+        None => PrewarmAction::Create,
+    }
+}
+
 fn pane_target(
     plan: crate::reading_surface::ChapterSpread,
     slot: usize,
@@ -283,6 +318,16 @@ impl PageFlight {
 }
 
 impl Pane {
+    fn warm_state(&self) -> WarmPaneState {
+        WarmPaneState {
+            chapter: self.chapter,
+            loaded: self.loaded,
+            ready: self.ready,
+            idle: self.navigation_idle(),
+            has_frame: self.surface.frame().is_some(),
+        }
+    }
+
     fn navigation_idle(&self) -> bool {
         self.page_flight.target.is_none()
             && !self.page_flight.force_page_sync
@@ -759,14 +804,48 @@ impl CefReader {
     }
     fn prewarm_next(&mut self, app: &ReaderApp, viewport: egui::Vec2, scale: f32, p: Palette) {
         let next = app.chapter + app.spread_plan.consumed();
-        if next >= app.book.chapters.len() {
-            let old = self.next_pane.take();
-            self.release_pane(old);
-            return;
+        let target = (next < app.book.chapters.len()
+            && app.book.chapters[next].loaded
+            && self.prewarm_failed != Some((next, self.revision)))
+        .then_some(next);
+        let action = prewarm_action(self.next_pane.as_ref().map(Pane::warm_state), target);
+        if matches!(action, PrewarmAction::Retain | PrewarmAction::PollPending) {
+            if let Some(mut pane) = self.next_pane.take() {
+                // A quick reversal may change the desired next chapter before
+                // CEF creates this browser. Finish that creation instead of
+                // repeatedly closing and spawning a cold renderer.
+                let result = Self::poll_pane(&self.render, &mut pane, &mut Vec::new(), false);
+                if let Err(error) = result {
+                    self.prewarm_failed = Some((pane.chapter, self.revision));
+                    self.release_pane(Some(pane));
+                    tracing::debug!(%error, "Could not retain the prepared book document");
+                    return;
+                }
+                if pane.surface.is_closed() {
+                    self.release_pane(Some(pane));
+                    return;
+                }
+                if action == PrewarmAction::Retain || !pane.loaded {
+                    if pane.ready
+                        && let Err(error) = pane.request_page()
+                    {
+                        self.prewarm_failed = Some((pane.chapter, self.revision));
+                        self.release_pane(Some(pane));
+                        tracing::debug!(%error, "Could not retain the prepared book page");
+                        return;
+                    }
+                    self.next_pane = Some(pane);
+                    return;
+                }
+                self.next_pane = Some(pane);
+            }
+            if action == PrewarmAction::Retain {
+                return;
+            }
         }
-        if !app.book.chapters[next].loaded || self.prewarm_failed == Some((next, self.revision)) {
+        let Some(next) = target else {
             return;
-        }
+        };
         let plan = crate::reading_surface::chapter_spread(&app.book, next, viewport, &app.settings);
         let extent = plan.extent(viewport);
         let previous = self.next_pane.take();
@@ -1410,7 +1489,10 @@ impl ReaderApp {
                 .is_none_or(|pane| pane.chapter != target);
             if replace {
                 let old = reader.panes[slot].take();
-                if let Some(mut warmed) = reader.next_pane.take_if(|pane| pane.chapter == target) {
+                if let Some(mut warmed) = reader
+                    .next_pane
+                    .take_if(|pane| pane.warm_state().can_promote(target))
+                {
                     warmed.displayed = false;
                     reader.panes[slot] = Some(warmed);
                     reader.next_pane = old.map(|mut pane| {
@@ -2416,10 +2498,58 @@ impl Drop for CefReader {
 #[cfg(test)]
 mod auxiliary_tests {
     use super::{
-        LocationFlight, Locator, PageFlight, PositionAck, Revision, auxiliary_regions,
-        next_document_revision, options, pane_target,
+        LocationFlight, Locator, PageFlight, PositionAck, PrewarmAction, Revision, WarmPaneState,
+        auxiliary_regions, next_document_revision, options, pane_target, prewarm_action,
     };
     use eframe::egui::{self, Id, Pos2, Rect, TextStyle, vec2};
+
+    #[test]
+    fn pending_warm_reversal_waits_for_the_existing_browser_and_end_retains_it() {
+        let pending = WarmPaneState {
+            chapter: 5,
+            loaded: false,
+            ready: false,
+            idle: false,
+            has_frame: false,
+        };
+        assert_eq!(
+            prewarm_action(Some(pending), Some(5)),
+            PrewarmAction::Continue
+        );
+        for target in [4, 3, 2, 1] {
+            assert_eq!(
+                prewarm_action(Some(pending), Some(target)),
+                PrewarmAction::PollPending
+            );
+        }
+        let loaded = WarmPaneState {
+            loaded: true,
+            ..pending
+        };
+        assert_eq!(prewarm_action(Some(loaded), Some(1)), PrewarmAction::Reuse);
+        assert_eq!(prewarm_action(None, Some(1)), PrewarmAction::Create);
+        for existing in [None, Some(pending), Some(loaded)] {
+            assert_eq!(prewarm_action(existing, None), PrewarmAction::Retain);
+        }
+    }
+
+    #[test]
+    fn matching_warm_chapter_is_promoted_only_after_loaded_layout_and_paint_settle() {
+        for flags in 0..16 {
+            let state = WarmPaneState {
+                chapter: 1,
+                loaded: flags & 1 != 0,
+                ready: flags & 2 != 0,
+                idle: flags & 4 != 0,
+                has_frame: flags & 8 != 0,
+            };
+            assert_eq!(state.can_promote(1), flags == 15);
+            assert!(
+                !state.can_promote(0),
+                "a ready different chapter is never promoted"
+            );
+        }
+    }
 
     #[test]
     fn legacy_image_display_and_counter_options_use_the_same_atomic_geometry() {
