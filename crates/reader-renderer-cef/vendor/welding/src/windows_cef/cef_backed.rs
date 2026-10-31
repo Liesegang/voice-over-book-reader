@@ -113,7 +113,10 @@ cef::wrap_render_handler! {
                 PhysicalSize::new(width, height),
                 format,
                 generation,
-            ) {
+            ).and_then(|frame| frame.with_visible_rect([
+                info.extra.visible_rect.x, info.extra.visible_rect.y,
+                info.extra.visible_rect.width, info.extra.visible_rect.height,
+            ])) {
                 Ok(frame) => frame,
                 Err(error) => {
                     log::error!("failed to wrap duplicated CEF D3D handle: {error}");

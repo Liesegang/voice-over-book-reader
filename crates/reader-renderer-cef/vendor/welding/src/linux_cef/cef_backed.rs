@@ -134,6 +134,10 @@ cef::wrap_render_handler! {
                     generation,
                 )
             };
+            let image = image.and_then(|image| image.with_visible_rect([
+                info.extra.visible_rect.x, info.extra.visible_rect.y,
+                info.extra.visible_rect.width, info.extra.visible_rect.height,
+            ]));
             match image {
                 Ok(image) => {
                     slot.store(crate::native_frame::NativeFrame::DmaBufImage(image));

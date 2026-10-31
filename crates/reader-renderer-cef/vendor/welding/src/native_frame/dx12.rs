@@ -123,6 +123,7 @@ impl D3d11CallbackFrameCopier {
         let size = frame.size;
         let format = frame.format;
         let generation = frame.generation;
+        let visible_rect = frame.visible_rect;
         let source_handle = frame.into_owned_handle()?;
         let source = unsafe {
             self.device1
@@ -167,10 +168,10 @@ impl D3d11CallbackFrameCopier {
         };
         let target_handle =
             unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(target_handle.0) };
-        Ok((
-            Dx12SharedTexture::from_owned_handle(target_handle, size, format, generation)?,
-            target,
-        ))
+        let mut copied =
+            Dx12SharedTexture::from_owned_handle(target_handle, size, format, generation)?;
+        copied.visible_rect = visible_rect;
+        Ok((copied, target))
     }
 
     fn flush_and_wait_for_gpu(&self) -> Result<(), ImportError> {
@@ -326,6 +327,7 @@ pub(super) fn import_dx12(
     // owned shared handle.
     let frame_format = frame.format();
     let frame_generation = frame.generation();
+    let visible_rect = frame.visible_rect();
     let owned_handle = frame.into_owned_handle()?;
     let g_host = grafting::HostWgpuContext::new(ctx.device.clone(), ctx.queue.clone());
     let g_resource = grafting::Dx12SharedResource::from_owned_handle(owned_handle);
@@ -356,5 +358,6 @@ pub(super) fn import_dx12(
         },
         format: frame_format,
         generation: frame_generation,
+        visible_rect,
     })
 }

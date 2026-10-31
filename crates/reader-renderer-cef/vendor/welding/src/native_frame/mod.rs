@@ -145,6 +145,7 @@ pub struct Dx12SharedTexture {
     size: PhysicalSize<u32>,
     format: wgpu::TextureFormat,
     generation: u64,
+    visible_rect: Option<[u32; 4]>,
 }
 
 /// Pixel format metadata that does not require a host to name welding's wgpu
@@ -193,6 +194,7 @@ impl Dx12SharedTexture {
             size,
             format,
             generation,
+            visible_rect: None,
         })
     }
 
@@ -307,6 +309,7 @@ pub struct MetalTextureRef {
     size: PhysicalSize<u32>,
     format: wgpu::TextureFormat,
     generation: u64,
+    visible_rect: Option<[u32; 4]>,
 }
 
 // SAFETY: this frame owns only one retained `IOSurfaceRef` plus copyable
@@ -338,6 +341,7 @@ impl MetalTextureRef {
             size,
             format,
             generation,
+            visible_rect: None,
         })
     }
 
@@ -426,6 +430,7 @@ pub struct DmaBufImage {
     drm_format: u32,
     modifier: u64,
     generation: u64,
+    visible_rect: Option<[u32; 4]>,
 }
 
 impl DmaBufImage {
@@ -528,7 +533,55 @@ pub struct ImportedTexture {
     pub size: wgpu::Extent3d,
     pub format: wgpu::TextureFormat,
     pub generation: u64,
+    /// Visible pixel window inside the coded texture; no rescaling is implied.
+    pub visible_rect: [u32; 4],
 }
+
+fn checked_visible_rect(
+    size: PhysicalSize<u32>,
+    rect: [i32; 4],
+) -> Result<Option<[u32; 4]>, ImportError> {
+    // Some non-video producers omit the crop metadata. Their complete coded
+    // texture remains visible, preserving the established constructor contract.
+    if rect == [0, 0, 0, 0] {
+        return Ok(None);
+    }
+    let [x, y, width, height] = rect;
+    if x < 0 || y < 0 || width <= 0 || height <= 0 {
+        return Err(ImportError::InvalidFrame("Invalid visible frame rectangle"));
+    }
+    let rect = [x as u32, y as u32, width as u32, height as u32];
+    if rect[0]
+        .checked_add(rect[2])
+        .is_none_or(|right| right > size.width)
+        || rect[1]
+            .checked_add(rect[3])
+            .is_none_or(|bottom| bottom > size.height)
+    {
+        return Err(ImportError::InvalidFrame(
+            "Visible frame rectangle exceeds coded texture",
+        ));
+    }
+    Ok(Some(rect))
+}
+
+macro_rules! visible_frame_metadata {
+    ($kind:ty) => {
+        impl $kind {
+            pub fn with_visible_rect(mut self, rect: [i32; 4]) -> Result<Self, ImportError> {
+                self.visible_rect = checked_visible_rect(self.size, rect)?;
+                Ok(self)
+            }
+            pub fn visible_rect(&self) -> [u32; 4] {
+                self.visible_rect
+                    .unwrap_or([0, 0, self.size.width, self.size.height])
+            }
+        }
+    };
+}
+visible_frame_metadata!(Dx12SharedTexture);
+visible_frame_metadata!(MetalTextureRef);
+visible_frame_metadata!(DmaBufImage);
 
 // ── Importer ─────────────────────────────────────────────────────────────────
 
@@ -685,6 +738,7 @@ impl WgpuTextureImporter {
             size,
             format: frame.format,
             generation: frame.generation,
+            visible_rect: [0, 0, size.width, size.height],
         })
     }
 }
@@ -692,6 +746,36 @@ impl WgpuTextureImporter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visible_frame_metadata_rejects_invalid_crops_and_preserves_full_frame_default() {
+        let size = PhysicalSize::new(1288, 768);
+        assert_eq!(checked_visible_rect(size, [0, 0, 0, 0]).unwrap(), None);
+        assert_eq!(
+            checked_visible_rect(size, [4, 2, 1280, 760]).unwrap(),
+            Some([4, 2, 1280, 760])
+        );
+        for rect in [
+            [-1, 0, 1, 1],
+            [0, 0, 0, 1],
+            [1280, 0, 16, 1],
+            [0, 760, 1, 16],
+            [i32::MAX, 0, i32::MAX, 1],
+        ] {
+            assert!(checked_visible_rect(size, rect).is_err());
+        }
+        let NativeFrame::DmaBufImage(frame) = empty_dmabuf_frame(size, 1) else {
+            unreachable!()
+        };
+        assert_eq!(frame.visible_rect(), [0, 0, 1288, 768]);
+        assert_eq!(
+            frame
+                .with_visible_rect([4, 2, 1280, 760])
+                .unwrap()
+                .visible_rect(),
+            [4, 2, 1280, 760]
+        );
+    }
 
     fn empty_dmabuf_frame(size: PhysicalSize<u32>, generation: u64) -> NativeFrame {
         NativeFrame::DmaBufImage(DmaBufImage {
@@ -703,6 +787,7 @@ mod tests {
             drm_format: 0,
             modifier: 0,
             generation,
+            visible_rect: None,
         })
     }
 

@@ -43,6 +43,7 @@ impl DmaBufImage {
             drm_format,
             modifier,
             generation,
+            visible_rect: None,
         })
     }
 
@@ -149,6 +150,7 @@ pub(super) fn import_vulkan(
     let frame_size = frame.size;
     let frame_format = frame.format;
     let frame_generation = frame.generation;
+    let visible_rect = frame.visible_rect();
     let drm_format = frame.drm_format;
     let graft_host = grafting::HostWgpuContext::new(ctx.device.clone(), ctx.queue.clone());
     let (buffers, planes) = frame.into_owned_parts();
@@ -179,6 +181,7 @@ pub(super) fn import_vulkan(
         },
         format: frame_format,
         generation: frame_generation,
+        visible_rect,
     })
 }
 

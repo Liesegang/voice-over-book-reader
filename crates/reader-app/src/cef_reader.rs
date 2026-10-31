@@ -1,5 +1,6 @@
 //! Chromium draws book content into the same GPU device as the native controls.
 use super::*;
+use crate::cef_geometry::{ViewportGeometry, crop_uv, view_point};
 use crate::cef_resources::BookOrigin;
 use anyhow::{Context, Result};
 use reader_renderer_cef::{
@@ -14,6 +15,7 @@ pub(super) struct CefReader {
     book_key: String,
     layout_key: String,
     revision: u64,
+    display_scale: f32,
     panes: [Option<Pane>; 2],
     next_pane: Option<Pane>,
     prewarm_failed: Option<(usize, u64)>,
@@ -94,6 +96,8 @@ struct Pane {
     options: LayoutOptions,
     size: [u32; 2],
     scale: f32,
+    visible_rect: [u32; 4],
+    texture_uv: Rect,
     ready: bool,
     writing_mode: Option<reader_core::WritingMode>,
     page: usize,
@@ -442,6 +446,16 @@ impl PageFlight {
 }
 
 impl Pane {
+    fn paint_rect(&self, geometry: ViewportGeometry, available: Rect, slot: usize) -> Result<Rect> {
+        let visible =
+            if self.texture.is_some() && self.visible_rect[2] > 0 && self.visible_rect[3] > 0 {
+                [self.visible_rect[2], self.visible_rect[3]]
+            } else {
+                geometry.physical
+            };
+        Ok(geometry.paint_rect(available, slot, visible)?)
+    }
+
     fn warm_state(&self) -> WarmPaneState {
         WarmPaneState {
             chapter: self.chapter,
@@ -606,6 +620,7 @@ impl CefReader {
             book_key: String::new(),
             layout_key: String::new(),
             revision: 0,
+            display_scale: 1.,
             panes: [None, None],
             next_pane: None,
             prewarm_failed: None,
@@ -813,25 +828,22 @@ impl CefReader {
         &self,
         app: &ReaderApp,
         chapter: usize,
-        extent: egui::Vec2,
+        viewport: ViewportGeometry,
         scale: f32,
         p: Palette,
     ) -> Result<Pane> {
-        self.make_document_pane(app, &app.book.chapters[chapter], extent, scale, p)
+        self.make_document_pane(app, &app.book.chapters[chapter], viewport, scale, p)
     }
     fn make_document_pane(
         &self,
         app: &ReaderApp,
         chapter: &reader_core::Chapter,
-        extent: egui::Vec2,
+        viewport: ViewportGeometry,
         scale: f32,
         p: Palette,
     ) -> Result<Pane> {
         let _create = crate::latency::span("chromium_pane_create", chapter.id as u64);
-        let size = [
-            (extent.x * scale).round().max(1.) as u32,
-            (extent.y * scale).round().max(1.) as u32,
-        ];
+        let size = viewport.physical;
         let url = self
             .origin
             .as_ref()
@@ -860,6 +872,8 @@ impl CefReader {
             options: options(chapter, &app.settings, p, &self.font_css),
             size,
             scale,
+            visible_rect: [0; 4],
+            texture_uv: Rect::from_min_max(Pos2::ZERO, pos2(1., 1.)),
             ready: false,
             writing_mode: None,
             page: 0,
@@ -890,7 +904,7 @@ impl CefReader {
         app: &ReaderApp,
         previous: Option<Pane>,
         chapter: usize,
-        extent: egui::Vec2,
+        viewport: ViewportGeometry,
         scale: f32,
         p: Palette,
     ) -> Result<Pane> {
@@ -944,7 +958,7 @@ impl CefReader {
             // completed. Retire it without blocking the native frame loop.
             self.release_pane(Some(pane));
         }
-        self.make_pane(app, chapter, extent, scale, p)
+        self.make_pane(app, chapter, viewport, scale, p)
     }
     fn prewarm_next(&mut self, app: &ReaderApp, viewport: egui::Vec2, scale: f32, p: Palette) {
         let next = app.chapter + app.spread_plan.consumed();
@@ -991,11 +1005,13 @@ impl CefReader {
             return;
         };
         let plan = crate::reading_surface::chapter_spread(&app.book, next, viewport, &app.settings);
-        let extent = plan.extent(viewport);
+        let Ok(geometry) = ViewportGeometry::new(viewport, plan.columns, plan.gap, scale) else {
+            return;
+        };
         let previous = self.next_pane.take();
         let mut pane = match previous {
             Some(pane) if pane.chapter == next => pane,
-            previous => match self.reuse_or_make_pane(app, previous, next, extent, scale, p) {
+            previous => match self.reuse_or_make_pane(app, previous, next, geometry, scale, p) {
                 Ok(pane) => pane,
                 Err(error) => {
                     self.prewarm_failed = Some((next, self.revision));
@@ -1022,10 +1038,7 @@ impl CefReader {
                 }
                 pane.configure_document()?;
             }
-            let size = [
-                (extent.x * scale).round().max(1.) as u32,
-                (extent.y * scale).round().max(1.) as u32,
-            ];
+            let size = geometry.physical;
             if pane.size != size || (pane.scale - scale).abs() > f32::EPSILON {
                 pane.surface.resize(size, scale)?;
                 pane.size = size;
@@ -1190,6 +1203,16 @@ impl CefReader {
         if (changed || (visible && pane.texture.is_none()))
             && let Some(frame) = pane.surface.frame()
         {
+            pane.visible_rect = frame.visible_rect;
+            pane.texture_uv = crop_uv(
+                [frame.size.width, frame.size.height],
+                frame.visible_rect.map(|value| value as i32),
+            )?;
+            tracing::info!(target: "vobr_perf", phase="cef_frame_geometry", chapter=pane.chapter,
+                coded_width=frame.size.width,coded_height=frame.size.height,
+                visible_x=frame.visible_rect[0],visible_y=frame.visible_rect[1],
+                visible_width=frame.visible_rect[2],visible_height=frame.visible_rect[3],
+                requested_width=pane.size[0],requested_height=pane.size[1],scale=pane.scale);
             let mut renderer = render.renderer.write();
             if let Some(id) = pane.texture {
                 renderer.update_egui_texture_from_wgpu_texture(
@@ -1215,12 +1238,14 @@ impl CefReader {
         }
         Ok(())
     }
-    fn configure(&mut self, app: &ReaderApp, extent: egui::Vec2, p: Palette) {
+    fn configure(&mut self, app: &ReaderApp, extent: egui::Vec2, scale: f32, p: Palette) {
+        self.display_scale = scale;
         let key = format!(
-            "chromium-layout-5:{}:{}:{:?}:{}:{}:{:?}",
+            "chromium-layout-6:{}:{}:{:?}:{}:{}:{}:{:?}",
             reader_core::default_reader_css_revision(),
             self.book_key,
             extent,
+            scale,
             app.settings.horizontal_margin(),
             app.settings.vertical_margin(),
             (
@@ -1294,6 +1319,7 @@ impl CefReader {
         let font_css = self.font_css.clone();
         let epoch = self.count_epoch.clone();
         let generation = self.revision;
+        let scale = self.display_scale;
         let ctx = app.worker_context.clone();
         // Only the worker can wait for capacity. Dropping the receiver on a
         // book/layout change immediately releases an obsolete blocked sender.
@@ -1313,7 +1339,8 @@ impl CefReader {
                     let plan = crate::reading_surface::chapter_spread(
                         &metadata, chapter, extent, &settings,
                     );
-                    let size = plan.extent(extent);
+                    let size =
+                        ViewportGeometry::new(extent, plan.columns, plan.gap, scale)?.extent();
                     let source = &metadata.chapters[chapter];
                     let mut layout_options = options(source, &settings, p, &font_css);
                     layout_options.adapt_monochrome_images = false;
@@ -1637,7 +1664,8 @@ impl ReaderApp {
         reader.bind_book(self)?;
         reader.runtime.as_ref().unwrap().pump();
         let previous_key = reader.layout_key.clone();
-        reader.configure(self, rect.size(), p);
+        let scale = ui.ctx().pixels_per_point();
+        reader.configure(self, rect.size(), scale, p);
         if previous_key != reader.layout_key {
             if self.pending_page_index.is_none() && self.pending_page_fraction.is_none() {
                 self.pending_restore = self.current_book_locator().or(self.pending_restore);
@@ -1658,7 +1686,7 @@ impl ReaderApp {
         self.spread_pages = plan.columns;
         self.cross_chapter_spread = plan.second.is_some();
         reader.expected_panes = plan.columns;
-        let extent = plan.extent(rect.size());
+        let geometry = ViewportGeometry::new(rect.size(), plan.columns, plan.gap, scale)?;
         let mut events = Vec::new();
         for slot in 0..plan.columns {
             let (target, target_page) = pane_target(plan, slot, self.page);
@@ -1677,10 +1705,6 @@ impl ReaderApp {
             } else {
                 1 - plan.first_slot
             };
-            let target_rect = Rect::from_min_size(
-                rect.min + vec2(physical_slot as f32 * (extent.x + plan.gap), 0.),
-                extent,
-            );
             if !self.book.chapters[target].loaded {
                 let old = reader.panes[slot].take();
                 reader.release_pane(old);
@@ -1709,14 +1733,13 @@ impl ReaderApp {
                         self,
                         old,
                         target,
-                        extent,
+                        geometry,
                         ui.ctx().pixels_per_point(),
                         p,
                     )?);
                 }
             }
             let pane = reader.panes[slot].as_mut().unwrap();
-            pane.last_rect = Some(target_rect);
             pane.location_page_step = if slot == 0 && plan.columns == 2 && plan.second.is_none() {
                 2
             } else {
@@ -1752,11 +1775,7 @@ impl ReaderApp {
                 }
                 pane.configure_document()?;
             }
-            let scale = ui.ctx().pixels_per_point();
-            let pixels = [
-                (extent.x * scale).round().max(1.) as u32,
-                (extent.y * scale).round().max(1.) as u32,
-            ];
+            let pixels = geometry.physical;
             if pane.size != pixels || (pane.scale - scale).abs() > f32::EPSILON {
                 pane.surface.resize(pixels, scale)?;
                 pane.size = pixels;
@@ -1770,10 +1789,22 @@ impl ReaderApp {
             // CEF creates its browser asynchronously. Native page gestures are
             // already captured above; DOM input needs a live, loaded document.
             if pane.ready && !pane.surface.is_closed() {
-                Self::poll_chromium_input(ui, target_rect, pane)?;
+                Self::poll_chromium_input(
+                    ui,
+                    pane.paint_rect(geometry, rect, physical_slot)?,
+                    pane,
+                )?;
             }
             let mut pane_events = Vec::new();
             CefReader::poll_pane(&reader.render, pane, &mut pane_events, true)?;
+            let target_rect = pane.paint_rect(geometry, rect, physical_slot)?;
+            if pane.last_rect != Some(target_rect) {
+                tracing::info!(target: "vobr_perf", phase="cef_present_geometry",chapter=pane.chapter,
+                    css_width=geometry.css[0],css_height=geometry.css[1],scale,
+                    device_x=target_rect.left()*scale,device_y=target_rect.top()*scale,
+                    device_width=target_rect.width()*scale,device_height=target_rect.height()*scale);
+            }
+            pane.last_rect = Some(target_rect);
             if slot > 0 && target == self.chapter && pane.ready && target_page >= pane.starts.len()
             {
                 // The secondary document may finish repagination later than
@@ -1884,10 +1915,10 @@ impl ReaderApp {
                 && (pane.displayed
                     || (pane.ready && !pane.awaiting_location && pane.waiting_paint.is_none()))
             {
-                ui.painter().image(
+                ui.painter().with_clip_rect(rect).image(
                     texture,
                     target_rect,
-                    Rect::from_min_max(Pos2::ZERO, pos2(1., 1.)),
+                    pane.texture_uv,
                     Color32::WHITE,
                 );
                 pane.displayed = true;
@@ -1952,17 +1983,17 @@ impl ReaderApp {
                 } else {
                     1 - plan.first_slot
                 };
-                let target_rect = Rect::from_min_size(
-                    rect.min + vec2(physical_slot as f32 * (extent.x + plan.gap), 0.),
-                    extent,
-                );
+                let target_rect = pane
+                    .last_rect
+                    .unwrap_or(geometry.pane_rect(rect, physical_slot)?);
                 if !target_rect.contains(position) {
                     continue;
                 }
+                let local = view_point(target_rect, position);
                 pane.surface.command(&BookCommand::HitTest {
                     revision: pane.revision,
-                    x: (position.x - target_rect.left()) as f64,
-                    y: (position.y - target_rect.top()) as f64,
+                    x: local.x as f64,
+                    y: local.y as f64,
                 })?;
             }
         }
@@ -2164,7 +2195,8 @@ impl ReaderApp {
         document: &reader_core::LinkedDocument,
     ) -> Result<()> {
         let (rect, response, mut footer) = auxiliary_regions(ui);
-        let extent = rect.size();
+        let scale = ui.ctx().pixels_per_point();
+        let geometry = ViewportGeometry::new(rect.size(), 1, 0., scale)?;
         let chapter = &document.chapter;
         if reader
             .auxiliary
@@ -2176,7 +2208,7 @@ impl ReaderApp {
             reader.auxiliary = Some(reader.make_document_pane(
                 self,
                 chapter,
-                extent,
+                geometry,
                 ui.ctx().pixels_per_point(),
                 p,
             )?);
@@ -2186,11 +2218,7 @@ impl ReaderApp {
         let mut layout_options = options(chapter, &self.settings, p, &reader.font_css);
         layout_options.measurement_marker = false;
         layout_options.margins = [20.; 4];
-        let scale = ui.ctx().pixels_per_point();
-        let size = [
-            (extent.x * scale).round().max(1.) as u32,
-            (extent.y * scale).round().max(1.) as u32,
-        ];
+        let size = geometry.physical;
         if pane.size != size
             || (pane.scale - scale).abs() > f32::EPSILON
             || serde_json::to_string(&pane.options)? != serde_json::to_string(&layout_options)?
@@ -2208,10 +2236,12 @@ impl ReaderApp {
             pane.revision.0 += 1;
             pane.configure_document()?;
         }
-        Self::poll_chromium_input(ui, rect, pane)?;
+        Self::poll_chromium_input(ui, pane.paint_rect(geometry, rect, 0)?, pane)?;
         let mut events = Vec::new();
         let previous_revision = pane.revision;
         CefReader::poll_pane(&reader.render, pane, &mut events, true)?;
+        let paint_rect = pane.paint_rect(geometry, rect, 0)?;
+        pane.last_rect = Some(paint_rect);
         if pane.revision != previous_revision {
             // DOM/font invalidation also rebuilds pagination. Keep the original
             // source position instead of applying a page number from the old layout.
@@ -2250,7 +2280,7 @@ impl ReaderApp {
                     pane.auxiliary_location = start.map(from_source).or(pane.auxiliary_location);
                 }
                 NavigatorEvent::Link { href, x, y, .. } => {
-                    let anchor = rect.min + vec2(x as f32, y as f32);
+                    let anchor = paint_rect.min + vec2(x as f32, y as f32);
                     if let Some(origin) = reader.origin.as_ref()
                         && let Ok(path) = origin.path_from_url(&href)
                     {
@@ -2278,7 +2308,7 @@ impl ReaderApp {
                     text,
                     ..
                 } => {
-                    if let Some(mut hit) = self.chromium_hit(from_source(start), rect.min) {
+                    if let Some(mut hit) = self.chromium_hit(from_source(start), paint_rect.min) {
                         hit.end = from_source(end);
                         hit.text = text;
                         self.selected = Some(hit);
@@ -2291,10 +2321,10 @@ impl ReaderApp {
             && (pane.displayed
                 || (pane.ready && !pane.awaiting_location && pane.waiting_paint.is_none()))
         {
-            ui.painter().image(
+            ui.painter().with_clip_rect(rect).image(
                 texture,
-                rect,
-                Rect::from_min_max(Pos2::ZERO, pos2(1., 1.)),
+                paint_rect,
+                pane.texture_uv,
                 Color32::WHITE,
             );
             pane.displayed = true;
@@ -2412,7 +2442,7 @@ impl ReaderApp {
                 MouseAction::Moved if inside || pane.captured_buttons != 0 => {}
                 _ => continue,
             }
-            let local = position - rect.min;
+            let local = view_point(rect, position);
             pane.surface.send_mouse(MouseEvent {
                 x: (local.x * pane.scale).round() as i32,
                 y: (local.y * pane.scale).round() as i32,

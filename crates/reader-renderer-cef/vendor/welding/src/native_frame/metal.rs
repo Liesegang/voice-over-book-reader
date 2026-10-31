@@ -94,6 +94,7 @@ pub(super) fn import_metal(
         },
         format: frame.format,
         generation: frame.generation,
+        visible_rect: frame.visible_rect(),
     })
 }
 
