@@ -146,7 +146,9 @@ jobs:
       - name: Workspace build
         # Reuse the shipping profile for tests and packages. Building optimized
         # Japanese dictionaries in both dev and release doubles cold CI work.
-        run: cargo +1.97.1 build --workspace --all-targets --release --locked --target "${{ matrix.target }}"
+        # Explicit targets avoid forced empty test/bench harnesses for the two
+        # application launchers. The next step builds and runs the real tests.
+        run: cargo +1.97.1 build --workspace --lib --bins --examples --release --locked --target "${{ matrix.target }}"
 
       - name: Offline-capable unit and fixture tests
         # The default tests never synthesize speech, download neural models,
