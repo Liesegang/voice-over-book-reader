@@ -118,32 +118,6 @@ pub fn run_native_shell() -> anyhow::Result<()> {
     .map_err(|error| anyhow::anyhow!("{error}"))
 }
 
-#[cfg(test)]
-mod diagnostic_tests {
-    use super::*;
-    #[test]
-    fn diagnostic_viewport_accepts_odd_dimensions_and_fractional_zoom() {
-        assert_eq!(
-            parse_diagnostic_viewport("1281x761@1.25").unwrap(),
-            DiagnosticViewport {
-                size: [1281., 761.],
-                zoom: 1.25
-            }
-        );
-        for invalid in [
-            "1281x761",
-            "0x761@1",
-            "1281x100@1",
-            "9000x761@1",
-            "1281x761@NaN",
-            "1281x761@0",
-            "1281x761@5",
-        ] {
-            assert!(parse_diagnostic_viewport(invalid).is_err(), "{invalid}");
-        }
-    }
-}
-
 /// Windows CEF bootstrap owns the sandbox context throughout this call.
 ///
 /// # Safety
@@ -168,4 +142,30 @@ pub fn run() -> anyhow::Result<()> {
 
 pub fn run_cef_helper() -> anyhow::Result<()> {
     bootstrap::run_helper()
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+    #[test]
+    fn diagnostic_viewport_accepts_odd_dimensions_and_fractional_zoom() {
+        assert_eq!(
+            parse_diagnostic_viewport("1281x761@1.25").unwrap(),
+            DiagnosticViewport {
+                size: [1281., 761.],
+                zoom: 1.25
+            }
+        );
+        for invalid in [
+            "1281x761",
+            "0x761@1",
+            "1281x100@1",
+            "9000x761@1",
+            "1281x761@NaN",
+            "1281x761@0",
+            "1281x761@5",
+        ] {
+            assert!(parse_diagnostic_viewport(invalid).is_err(), "{invalid}");
+        }
+    }
 }

@@ -2,13 +2,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import vm from 'node:vm';
 await import('./font_choice.test.mjs');
-const context={TextEncoder,console,setTimeout,clearTimeout};
+const context={TextEncoder,console,setTimeout,clearTimeout,performance:{now:()=>0}};
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(new URL('./src/font_choice.js',import.meta.url),'utf8'),context);
 vm.runInContext(fs.readFileSync(new URL('./src/navigator.js',import.meta.url),'utf8'),context);
 const {toUtf16,toUtf8}=context.__vobrBook.testing;
 assert.equal(typeof context.__vobrInstallNavigator,'function');
-const childView={TextEncoder,setTimeout,clearTimeout};
+const childView={TextEncoder,setTimeout,clearTimeout,performance:{now:()=>0}};
 const childBridge=context.__vobrInstallNavigator(childView);
 assert.equal(childView.__vobrBook,childBridge);
 assert.notEqual(childBridge,context.__vobrBook,'counter iframe state is independent of the visible book');
@@ -96,7 +96,7 @@ function documentFixture({imageOnly=false,broken=false,authorFamily='JA, serif',
         };},
     };
     const family=element=>element?.style.getPropertyValue('font-family')||element?.family||(element?.parentElement?family(element.parentElement):'serif');
-    const view={document:doc,innerWidth:500,innerHeight:400,setTimeout,clearTimeout,addEventListener(){},
+    const view={document:doc,innerWidth:500,innerHeight:400,setTimeout,clearTimeout,performance:{now:()=>0},console:{debug(){}},addEventListener(){},
         getComputedStyle:element=>({writingMode:'horizontal-tb',direction:'ltr',fontFamily:family(element)}),
         MutationObserver:class{observe(){}disconnect(){}},CSS:{highlights:new Map()},Highlight:class{constructor(...ranges){this.ranges=ranges;}},
     };

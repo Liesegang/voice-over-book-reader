@@ -1,9 +1,46 @@
 // Book DOM only; original UTF-8 source identities survive pagination.
 (() => {
+    const waitForFonts=async(doc,root,options,fixed,text)=>{
+        const family=typeof options.font_family==='string'?options.font_family.trim():'';
+        if(!fixed&&family&&typeof doc.fonts?.load==='function'){
+            const size=Number.isFinite(options.font_size)&&options.font_size>0?options.font_size:16;
+            try{await doc.fonts.load(`${size}px ${JSON.stringify(family)}`,text());}catch{}
+        }
+        // Retain author-font and fallback readiness after the selected face.
+        root.getBoundingClientRect();await doc.fonts?.ready;
+    };
+    // Synchronous CEF evaluations poll this slot; no Promise crosses the IPC
+    // boundary. Keep the Page acknowledgement until two rendering opportunities.
+    const createPageReply=(view,dispatch,drain,state)=>{
+        let job=null;
+        const matches=(event,value)=>event.type==='position'&&event.revision===value.command.revision&&event.page===value.command.index;
+        const current=value=>{const now=state();return now.serial===value.guard.serial&&now.revision===value.guard.revision&&now.ticket===value.guard.ticket;};
+        return (command,key)=>{
+            if(command?.type!=='page'||typeof key!=='string'||!/^\d{1,20}$/.test(key))throw Error('Invalid Page completion request');
+            if(!job||job.key!==key){
+                const carried=job&&!job.delivered?job.events.filter(event=>!matches(event,job)):[];
+                dispatch(command);
+                const value={key,command,guard:state(),events:[...carried,...drain()],ready:false,delivered:false};job=value;
+                if(!value.events.some(event=>matches(event,value)||event.type==='error'&&event.revision===command.revision))throw Error('Page dispatch did not produce its acknowledgement');
+                if(value.events.some(event=>event.type==='error'&&event.revision===command.revision))value.ready=true;
+                else view.requestAnimationFrame(()=>{if(job!==value||!current(value))return;view.requestAnimationFrame(()=>{if(job===value&&current(value))value.ready=true;});});
+            }
+            if(job.command.revision!==command.revision||job.command.index!==command.index)throw Error('Page completion request changed target');
+            if(job.delivered)return {pending:false,cancelled:true,events:[]};
+            if(!current(job)){
+                job.delivered=true;
+                return {pending:false,cancelled:true,events:[...job.events.filter(event=>!matches(event,job)),...drain()]};
+            }
+            if(!job.ready)return {pending:true,cancelled:false,events:[]};
+            job.delivered=true;
+            return {pending:false,cancelled:false,events:[...job.events,...drain()]};
+        };
+    };
     // Counter iframes share this implementation without child eval.
     const install = view => {
     if (view.__vobrBook) return view.__vobrBook;
     const doc = view.document;
+    const clock=()=>view.performance.now(),installStarted=clock();
     const getComputedStyle=view.getComputedStyle?.bind(view);
     const MutationObserver=view.MutationObserver,Highlight=view.Highlight,CSS=view.CSS;
     const setTimeout=view.setTimeout.bind(view),clearTimeout=view.clearTimeout.bind(view);
@@ -25,7 +62,7 @@
         if (index && index < text.length && /[\uDC00-\uDFFF]/.test(text[index]) && /[\uD800-\uDBFF]/.test(text[index - 1])) throw Error('DOM offset splits a surrogate pair');
         return byteLength(text.slice(0, index));
     };
-    let revision = 0, chapter = 0, serial = 0, page = 0, pages = 1;
+    let revision = 0, chapter = 0, serial = 0, turnTicket = 0, page = 0, pages = 1;
     let vertical = false, reverse = false, stride = 1, fixed = false;
     let options, body, root, bindingList = [], byId = new Map(), byNode = new WeakMap();
     let starts = [null], queue = [], resizeTimer, observer, applying=false, confirmed=false, invalidationPending=false,typographyStyle,measurementMarker;
@@ -137,8 +174,14 @@
         };
         if(element)walk(element);return out;
     };
+    const snapshotStarted=clock();
     const originalNodes=snapshotSourceNodes(doc?.documentElement);
+    let originalText;
+    const readerFontText=()=>originalText??=(originalNodes.filter(node=>node.parts).map(node=>node.text).join(''));
+    const snapshotMs=clock()-snapshotStarted,fontChoiceStarted=clock();
     const fontChoice=globalThis.__vobrCreateFontChoice(view,originalNodes);
+    const fontChoiceMs=clock()-fontChoiceStarted;
+    let installMs=0;
     const originalByDom=new WeakMap();
     for(const b of originalNodes){for(const part of b.parts??[{dom:b.dom,prefix:0}])originalByDom.set(part.dom,b);}
     let rootStyle=doc?.documentElement?.getAttribute('style')??null;
@@ -196,8 +239,8 @@
         const coordinate = vertical ? (reverse ? view.innerHeight-bottom-r.bottom : r.top-top) : (reverse ? view.innerWidth-right-r.right : r.left-left);
         return Math.max(0,Math.min(pages-1,Math.floor((coordinate+page*stride+0.5)/stride)));
     };
-    const charPage = (b,index,next) => {const r=rangeFor({chapter,node:b.node,start:index,end:next});const box=r.getClientRects()[0];return box ? pageOfRect(box) : 0;};
-    const buildStarts = () => {
+    const charPage = (b,index,next,profile) => {if(profile)profile.char_queries++;const r=rangeFor({chapter,node:b.node,start:index,end:next});const box=r.getClientRects()[0];return box ? pageOfRect(box) : 0;};
+    const buildStarts = profile => {
         starts = Array(pages).fill(null);
         for (const b of bindingList) {
             if (!b.parts) {
@@ -205,6 +248,7 @@
                     const r=b.dom.getBoundingClientRect?.();if(r?.width && r.height){const p=pageOfRect(r);starts[p]??={chapter,node:b.node,offset:0};}
                 }continue;
             }
+            if(profile){profile.text_runs++;profile.range_queries++;}
             const range=rangeFor({chapter,node:b.node,start:0,end:byteLength(b.text)});
             const rects=[...range.getClientRects()].filter(r=>r.width>0 && r.height>0);
             if (!rects.length || !b.text.length || b.dom.parentElement?.closest('rt,rp,rtc,script,style,head')) continue;
@@ -212,8 +256,8 @@
             for(const p of [...occupied].sort((a,b)=>a-b)){
                 if(starts[p])continue;
                 let lo=0,hi=bytes.length-1;
-                while(lo<hi){const mid=Math.floor((lo+hi)/2);if(mid===bytes.length-1||charPage(b,bytes[mid],bytes[mid+1])>=p)hi=mid;else lo=mid+1;}
-                if(lo<bytes.length-1 && charPage(b,bytes[lo],bytes[lo+1])===p) starts[p]={chapter,node:b.node,offset:bytes[lo]};
+                while(lo<hi){const mid=Math.floor((lo+hi)/2);if(mid===bytes.length-1||charPage(b,bytes[mid],bytes[mid+1],profile)>=p)hi=mid;else lo=mid+1;}
+                if(lo<bytes.length-1 && charPage(b,bytes[lo],bytes[lo+1],profile)===p) starts[p]={chapter,node:b.node,offset:bytes[lo]};
             }
         }
     };
@@ -229,27 +273,33 @@
         const rgb=[16+((page&7)*32),16+(((page>>>3)&7)*32),128+((revision&3)*32)];css(measurementMarker,{'background-color':`rgb(${rgb.join(',')})`});return rgb;
     };
     const position = () => emit({type:'position',chapter,page,pages,start:starts[page]??null,marker:marker()});
-    const invalidate=reason=>{if(invalidationPending)return;confirmed=false;invalidationPending=true;emit({type:'invalidated',reason});};
+    const invalidate=reason=>{if(invalidationPending)return;turnTicket++;confirmed=false;invalidationPending=true;emit({type:'invalidated',reason});};
     const turn = (index, located=null) => {
         if(!confirmed)throw Error('Pagination is not confirmed for this revision');
         if (!Number.isInteger(index) || index<0 || index>=pages) throw Error('Page index outside confirmed pagination');
+        turnTicket++;
         page=index;
         if (!fixed) css(body,{'transform':`translate${vertical?'Y':'X'}(${(reverse?1:-1)*page*stride}px)`});
         if(located){marker();emit({type:'located',chapter,page,start:starts[page]??null,...located});}
         else position();
     };
-    const ready = async token => {
-        // Request used fonts before awaiting them.
-        root.getBoundingClientRect(); await doc.fonts?.ready;
-        await Promise.all([...doc.querySelectorAll('img')].map(async image=>{
+    const ready = async (token,profile) => {
+        let phaseStarted=profile?clock():0;
+        // Start the selected face before a full chapter layout requests it.
+        await waitForFonts(doc,root,options,fixed,readerFontText);
+        if(profile){profile.fonts_ms=clock()-phaseStarted;phaseStarted=clock();}
+        const images=[...doc.querySelectorAll('img')];if(profile)profile.images=images.length;
+        await Promise.all(images.map(async image=>{
             // Counters need intrinsic geometry, not decoded display bitmaps.
             // Failed or incomplete images retain the existing error path.
             if(options.pagination_only&&image.complete&&image.naturalWidth>0)return;
             try {if(image.decode)await image.decode();else if(!image.complete)await new Promise((resolve,reject)=>{image.addEventListener('load',resolve,{once:true});image.addEventListener('error',reject,{once:true});});}
             catch {fail(`Image could not be decoded: ${image.getAttribute('src')??''}`);}
         }));
+        if(profile){profile.images_ms=clock()-phaseStarted;phaseStarted=clock();}
         if(token!==serial)return;
         await adaptImages(token);if(token!==serial)return;
+        if(profile){profile.adapt_ms=clock()-phaseStarted;phaseStarted=clock();}
         // Ruby fonts can extend beyond their first line's allocated block edge.
         // Reserve only the measured overhang inside the existing page box;
         // page turns and speech highlights never repeat this layout step.
@@ -260,7 +310,8 @@
             let inset=0;
             for(let attempt=0;attempt<2;attempt++){
                 let overhang=0;
-                for(const annotation of doc.querySelectorAll('ruby rt')){
+                const annotations=doc.querySelectorAll('ruby rt');if(profile)profile.ruby_nodes=annotations.length;
+                for(const annotation of annotations){
                     const range=doc.createRange();range.selectNodeContents(annotation);
                     for(const rect of range.getClientRects())if(rect.width>0&&rect.height>0)overhang=Math.max(overhang,vertical?rect.right-edge:edge-rect.top);
                 }
@@ -272,8 +323,14 @@
             }
         }
         root.getBoundingClientRect();if(token!==serial)return;
+        if(profile){profile.ruby_ms=clock()-phaseStarted;phaseStarted=clock();}
         const content = fixed ? 1 : vertical ? body.scrollHeight : body.scrollWidth;
-        pages=fixed?1:Math.max(1,Math.ceil(content/stride));page=0;buildStarts();
+        pages=fixed?1:Math.max(1,Math.ceil(content/stride));page=0;buildStarts(profile);
+        if(profile){
+            profile.starts_ms=clock()-phaseStarted;profile.total_ms=clock()-profile.started+profile.bind_ms;
+            delete profile.started;profile.pages=pages;
+            view.console.debug('__VOBR_DOM_PROFILE_1__'+JSON.stringify(profile));
+        }
         confirmed=true;applying=false;
         emit({type:'pagination',chapter,pages,page_starts:starts,ready:{fonts:true,images:true},writing_mode:getComputedStyle(body??root).writingMode});
         turn(0);
@@ -289,7 +346,8 @@
         });
         observer.observe(root,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['class','style','src','srcset','href','width','height']});
     };
-    const layout = async () => {
+    const layout = async (bindMs=0) => {
+        const profile=options.measurement_marker?{revision,chapter,install_ms:installMs,snapshot_ms:snapshotMs,font_choice_ms:fontChoiceMs,bind_ms:bindMs,apply_ms:0,fonts_ms:0,images_ms:0,adapt_ms:0,ruby_ms:0,starts_ms:0,total_ms:0,source_nodes:originalNodes.length,text_runs:0,range_queries:0,char_queries:0,ruby_nodes:0,images:0,pages:0,started:clock()}:null;
         const token=++serial;applying=true;confirmed=false;invalidationPending=false;observer?.disconnect();page=0;root=doc.documentElement;body=doc.body??root;fixed=options.flow==='fixed';
         if(rootStyle===null)root.removeAttribute('style');else root.setAttribute('style',rootStyle);
         if(body!==root){if(bodyStyle===null)body.removeAttribute('style');else body.setAttribute('style',bodyStyle);}
@@ -328,7 +386,8 @@
             css(root,{'width':'100vw','height':'100vh','clip-path':columns===2?`inset(${t}px ${r}px ${b}px ${l}px)`:'none'});
             css(body,{'position':'absolute','top':`${t}px`,'left':`${l}px`,'margin':'0','padding':'0','box-sizing':'border-box','width':`${w}px`,'height':`${h}px`,'min-width':'0','max-width':'none','min-height':'0','max-height':'none','column-width':`${Math.max(1,(inline-gap*(columns-1))/columns)}px`,'column-gap':`${gap}px`,'column-fill':'auto','overflow':'visible','transform':'none','scroll-behavior':'auto'});
         }
-        await ready(token);
+        if(profile)profile.apply_ms=clock()-profile.started;
+        await ready(token,profile);
     };
     const rubyBase=node=>{
         const ruby=(isText(node)?node.parentElement:node)?.closest?.('rt,rp,rtc')?.closest('ruby');if(!ruby)return null;
@@ -381,7 +440,8 @@
                 if(options.fixed_horizontal_align!=null&&![-1,0,1].includes(options.fixed_horizontal_align))throw Error('Invalid fixed page alignment');
                 if(options.page_gap!=null&&(!Number.isFinite(options.page_gap)||options.page_gap<0))throw Error('Invalid page gap');
                 for(const name of ['background','foreground','highlight_color'])if(options[name]!=null&&(!Array.isArray(options[name])||options[name].length!==3||!options[name].every(v=>Number.isInteger(v)&&v>=0&&v<=255)))throw Error(`Invalid ${name}`);
-                bind(command.nodes);await layout();return;
+                const bindStarted=options.measurement_marker?clock():0;
+                bind(command.nodes);await layout(options.measurement_marker?clock()-bindStarted:0);return;
             }
             if(command.revision!==revision)return;
             switch(command.type){
@@ -426,7 +486,9 @@
             }
         }catch(error){fail(error);}
     };
-    const bridge={dispatch,drain:()=>queue.splice(0),testing:{toUtf16,toUtf8,byteLength,snapshotSourceNodes,originalNodes,metrics,exactIndex,monochromeMask}};
+    const drain=()=>queue.splice(0);
+    const pageReply=createPageReply(view,dispatch,drain,()=>({serial,revision,ticket:turnTicket}));
+    const bridge={dispatch,drain,pageReply,testing:{toUtf16,toUtf8,byteLength,snapshotSourceNodes,originalNodes,metrics,exactIndex,monochromeMask,createPageReply,waitForFonts}};
     Object.defineProperty(view,'__vobrBook',{value:bridge,configurable:true});
     view.addEventListener?.('resize',()=>{if(!options)return;confirmed=false;clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>invalidate('viewport_changed'),50);});
     doc?.fonts?.addEventListener?.('loadingdone',()=>{if(options&&!applying)invalidate('fonts_changed');});
@@ -439,6 +501,7 @@
     },true);
     doc?.addEventListener?.('dblclick',event=>pointer(event,'double_click'),true);
     doc?.addEventListener?.('contextmenu',event=>{if(!options)return;event.preventDefault();pointer(event,'context_menu');},true);
+    installMs=clock()-installStarted;
     return bridge;
     };
     Object.defineProperty(globalThis,'__vobrInstallNavigator',{value:install,configurable:true});

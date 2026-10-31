@@ -182,6 +182,72 @@ pub enum SurfaceEvent {
     Error(String),
 }
 
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DomLayoutProfile {
+    revision: u64,
+    chapter: u32,
+    install_ms: f64,
+    snapshot_ms: f64,
+    font_choice_ms: f64,
+    bind_ms: f64,
+    apply_ms: f64,
+    fonts_ms: f64,
+    images_ms: f64,
+    adapt_ms: f64,
+    ruby_ms: f64,
+    starts_ms: f64,
+    total_ms: f64,
+    source_nodes: u32,
+    text_runs: u32,
+    range_queries: u32,
+    char_queries: u32,
+    ruby_nodes: u32,
+    images: u32,
+    pages: u32,
+}
+
+fn dom_layout_profile(source: &str, message: &str) -> Option<DomLayoutProfile> {
+    if !matches!(source, "vobr://navigator" | "vobr://navigator/") || message.len() > 4096 {
+        return None;
+    }
+    let profile: DomLayoutProfile =
+        serde_json::from_str(message.strip_prefix("__VOBR_DOM_PROFILE_1__")?).ok()?;
+    let durations = [
+        profile.install_ms,
+        profile.snapshot_ms,
+        profile.font_choice_ms,
+        profile.bind_ms,
+        profile.apply_ms,
+        profile.fonts_ms,
+        profile.images_ms,
+        profile.adapt_ms,
+        profile.ruby_ms,
+        profile.starts_ms,
+        profile.total_ms,
+    ];
+    if profile.revision > 9_007_199_254_740_991
+        || durations
+            .iter()
+            .any(|value| !value.is_finite() || !(0.0..=600_000.0).contains(value))
+        || profile.source_nodes == 0
+        || [
+            profile.source_nodes,
+            profile.text_runs,
+            profile.range_queries,
+            profile.ruby_nodes,
+            profile.images,
+        ]
+        .iter()
+        .any(|value| *value > 10_000_000)
+        || profile.char_queries > 100_000_000
+        || !(1..=1_000_000).contains(&profile.pages)
+    {
+        return None;
+    }
+    Some(profile)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PageRequest {
     id: u64,
@@ -191,6 +257,8 @@ struct PageRequest {
 struct PendingPage {
     request: PageRequest,
     sent: Instant,
+    evaluating: bool,
+    next_poll: Instant,
 }
 #[derive(Default)]
 struct PageRequests {
@@ -218,8 +286,30 @@ impl PageRequests {
             revision,
             index,
         };
-        self.pending = Some(PendingPage { request, sent: now });
+        self.pending = Some(PendingPage {
+            request,
+            sent: now,
+            evaluating: true,
+            next_poll: now,
+        });
         Ok(Some(request))
+    }
+    fn evaluated(&mut self, id: u64, now: Instant) -> Option<PageRequest> {
+        let pending = self.pending.as_mut()?;
+        if pending.request.id != id || !pending.evaluating {
+            return None;
+        }
+        pending.evaluating = false;
+        pending.next_poll = now + Duration::from_millis(8);
+        Some(pending.request)
+    }
+    fn poll(&mut self, now: Instant) -> Option<PageRequest> {
+        let pending = self.pending.as_mut()?;
+        if pending.evaluating || now < pending.next_poll {
+            return None;
+        }
+        pending.evaluating = true;
+        Some(pending.request)
     }
     fn complete(&mut self, id: u64) -> Option<PageRequest> {
         if self
@@ -469,7 +559,7 @@ impl<'a> GpuBookSurface<'a> {
                 .page_requests
                 .begin(*revision, *index, Instant::now())?
             {
-                let script = page_reply_script(command)?;
+                let script = page_reply_script(request)?;
                 if let Err(error) = self
                     .producer
                     .request_script_result(WebRequestId::new(request.id), &script)
@@ -508,6 +598,25 @@ impl<'a> GpuBookSurface<'a> {
                     self.drain_requests.cancel();
                     self.navigator_installed = false;
                     self.closed = true;
+                }
+                CefSurfaceEvent::Navigation(NavigationEvent::ConsoleMessage {
+                    source,
+                    message,
+                    ..
+                }) => {
+                    if let Some(profile) = dom_layout_profile(&source, &message) {
+                        tracing::info!(target: "vobr_perf", phase="cef_dom_profile",
+                            revision=profile.revision,chapter=profile.chapter,
+                            install_ms=profile.install_ms,snapshot_ms=profile.snapshot_ms,
+                            font_choice_ms=profile.font_choice_ms,bind_ms=profile.bind_ms,
+                            apply_ms=profile.apply_ms,fonts_ms=profile.fonts_ms,
+                            images_ms=profile.images_ms,adapt_ms=profile.adapt_ms,
+                            ruby_ms=profile.ruby_ms,starts_ms=profile.starts_ms,
+                            total_ms=profile.total_ms,source_nodes=profile.source_nodes,
+                            text_runs=profile.text_runs,range_queries=profile.range_queries,
+                            char_queries=profile.char_queries,ruby_nodes=profile.ruby_nodes,
+                            images=profile.images,pages=profile.pages);
+                    }
                 }
                 CefSurfaceEvent::Navigation(NavigationEvent::LoadStart { url }) => {
                     if self.document.start(&url) {
@@ -556,12 +665,16 @@ impl<'a> GpuBookSurface<'a> {
                         continue;
                     }
                     match result {
-                        Ok(json) => match decode_events(&json) {
-                            Ok(events) => self
-                                .pending
-                                .extend(events.into_iter().map(SurfaceEvent::Navigator)),
-                            Err(e) => self.pending.push_back(SurfaceEvent::Error(e.to_string())),
-                        },
+                        Ok(json) => {
+                            match decode_drain_events(&json, self.page_requests.pending.is_some()) {
+                                Ok(events) => self
+                                    .pending
+                                    .extend(events.into_iter().map(SurfaceEvent::Navigator)),
+                                Err(e) => {
+                                    self.pending.push_back(SurfaceEvent::Error(e.to_string()))
+                                }
+                            }
+                        }
                         Err(e) => self.pending.push_back(SurfaceEvent::Error(e)),
                     }
                 }
@@ -570,17 +683,27 @@ impl<'a> GpuBookSurface<'a> {
                 {
                     // A cancelled/superseded request must not complete a newer
                     // page, nor be exposed as an unrelated ScriptResult.
-                    if let Some(request) = self.page_requests.complete(id.get()) {
+                    if let Some(request) = self.page_requests.evaluated(id.get(), Instant::now()) {
                         match result {
                             Ok(json) => match decode_page_reply(request, &json) {
-                                Ok(events) => self
-                                    .pending
-                                    .extend(events.into_iter().map(SurfaceEvent::Navigator)),
-                                Err(error) => self
-                                    .pending
-                                    .push_back(SurfaceEvent::Error(error.to_string())),
+                                Ok(reply) => {
+                                    if !reply.pending {
+                                        self.page_requests.complete(request.id);
+                                    }
+                                    self.pending.extend(
+                                        reply.events.into_iter().map(SurfaceEvent::Navigator),
+                                    );
+                                }
+                                Err(error) => {
+                                    self.page_requests.complete(request.id);
+                                    self.pending
+                                        .push_back(SurfaceEvent::Error(error.to_string()));
+                                }
                             },
-                            Err(error) => self.pending.push_back(SurfaceEvent::Error(error)),
+                            Err(error) => {
+                                self.page_requests.complete(request.id);
+                                self.pending.push_back(SurfaceEvent::Error(error));
+                            }
                         }
                     }
                 }
@@ -608,6 +731,20 @@ impl<'a> GpuBookSurface<'a> {
             self.pending.push_back(SurfaceEvent::Error(
                 "Book page acknowledgement timed out".into(),
             ));
+        }
+        if self.navigator_installed
+            && !self.closing
+            && !self.closed
+            && let Some(request) = self.page_requests.poll(Instant::now())
+        {
+            let script = page_reply_script(request)?;
+            if let Err(error) = self
+                .producer
+                .request_script_result(WebRequestId::new(request.id), &script)
+            {
+                self.page_requests.cancel();
+                return Err(platform(error));
+            }
         }
         if self.navigator_installed
             && !self.closing
@@ -749,29 +886,58 @@ impl Drop for GpuBookSurface<'_> {
 const DRAIN_REQUEST_PREFIX: u64 = 0x564f425200000000;
 const PAGE_REQUEST_PREFIX: u64 = 0x564f425300000000;
 
-fn page_reply_script(command: &Command) -> Result<String, RendererError> {
-    if !matches!(command, Command::Page { .. }) {
-        return Err(RendererError::Protocol(
-            "Only synchronous Page commands support an immediate reply".into(),
-        ));
+fn decode_drain_events(
+    json: &str,
+    page_pending: bool,
+) -> Result<Vec<NavigatorEvent>, RendererError> {
+    let mut events = decode_events(json)?;
+    if page_pending {
+        // A drain admitted before Page can reply later. Only the keyed Page
+        // completion slot may acknowledge the current numeric navigation.
+        events.retain(|event| !matches!(event, NavigatorEvent::Position { .. }));
     }
-    let json = serde_json::to_string(command)
-        .map_err(|error| RendererError::Protocol(error.to_string()))?;
-    // Page's async-declared dispatch branch executes turn()/Position without
-    // awaiting anything. A single evaluation task prevents a normal drain
-    // from consuming the acknowledgement between dispatch and this drain.
+    Ok(events)
+}
+
+fn page_reply_script(request: PageRequest) -> Result<String, RendererError> {
+    let json = serde_json::to_string(&Command::Page {
+        revision: request.revision,
+        index: request.index,
+    })
+    .map_err(|error| RendererError::Protocol(error.to_string()))?;
+    // The string key retains the complete u64 request identity in JavaScript.
+    // First evaluation dispatches Page. Later evaluations only poll its slot.
     Ok(format!(
-        "(()=>{{const book=globalThis.__vobrBook;if(!book)throw new Error('Book navigator is unavailable');book.dispatch({json});return book.drain();}})()"
+        "(()=>{{const book=globalThis.__vobrBook;if(!book)throw new Error('Book navigator is unavailable');return book.pageReply({json},'{}');}})()",
+        request.id
     ))
 }
-fn decode_page_reply(
-    request: PageRequest,
-    json: &str,
-) -> Result<Vec<NavigatorEvent>, RendererError> {
-    let events = decode_events(json)?;
-    let acknowledged=events.iter().any(|event|matches!(event,NavigatorEvent::Position{revision,page,..} if *revision==request.revision && *page==request.index));
-    if !acknowledged
-        && !events
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PageReply {
+    pending: bool,
+    cancelled: bool,
+    events: Vec<NavigatorEvent>,
+}
+fn decode_page_reply(request: PageRequest, json: &str) -> Result<PageReply, RendererError> {
+    if json.len() > 8 * 1024 * 1024 {
+        return Err(RendererError::Protocol(
+            "Page reply exceeds the supported size".into(),
+        ));
+    }
+    let reply: PageReply =
+        serde_json::from_str(json).map_err(|error| RendererError::Protocol(error.to_string()))?;
+    if reply.pending {
+        if reply.cancelled || !reply.events.is_empty() {
+            return Err(RendererError::Protocol(
+                "Pending Page reply contains completed events".into(),
+            ));
+        }
+        return Ok(reply);
+    }
+    let acknowledged=reply.events.iter().any(|event|matches!(event,NavigatorEvent::Position{revision,page,..} if *revision==request.revision && *page==request.index));
+    if !reply.cancelled && !acknowledged
+        && !reply.events
             .iter()
             .any(|event| matches!(event, NavigatorEvent::Error { revision,.. } if *revision==request.revision))
     {
@@ -779,7 +945,7 @@ fn decode_page_reply(
             "Page reply did not acknowledge its requested revision and target".into(),
         ));
     }
-    Ok(events)
+    Ok(reply)
 }
 fn book_runtime_switches() -> Vec<(String, Option<String>)> {
     [
@@ -796,6 +962,87 @@ fn platform(error: impl std::fmt::Display) -> RendererError {
 }
 fn winit_size(size: [u32; 2]) -> dpi::PhysicalSize<u32> {
     dpi::PhysicalSize::new(size[0].max(1), size[1].max(1))
+}
+
+#[cfg(test)]
+mod dom_layout_profile_tests {
+    use super::*;
+
+    fn sample() -> serde_json::Value {
+        serde_json::json!({
+            "revision": 7, "chapter": 8,
+            "install_ms": 5.0, "snapshot_ms": 1.0, "font_choice_ms": 2.0,
+            "bind_ms": 0.1, "apply_ms": 1.0, "fonts_ms": 3.25,
+            "images_ms": 0.2, "adapt_ms": 0.0, "ruby_ms": 1.0,
+            "starts_ms": 4.0, "total_ms": 10.0,
+            "source_nodes": 20, "text_runs": 10, "range_queries": 10,
+            "char_queries": 15, "ruby_nodes": 2, "images": 1, "pages": 5
+        })
+    }
+
+    fn message(value: &serde_json::Value) -> String {
+        format!("__VOBR_DOM_PROFILE_1__{value}")
+    }
+
+    #[test]
+    fn accepts_only_the_numeric_navigator_profile_schema() {
+        let profile = dom_layout_profile("vobr://navigator", &message(&sample())).unwrap();
+        assert_eq!(profile.chapter, 8);
+        assert_eq!(profile.fonts_ms, 3.25);
+        assert_eq!(profile.source_nodes, 20);
+        assert!(dom_layout_profile("vobr://navigator/", &message(&sample())).is_some());
+        for source in [
+            "https://publisher.example/chapter.xhtml",
+            "vobr://native-command",
+            "vobr://navigator?chapter=8",
+            "",
+        ] {
+            assert!(dom_layout_profile(source, &message(&sample())).is_none());
+        }
+        assert!(dom_layout_profile("vobr://navigator", &sample().to_string()).is_none());
+        assert!(dom_layout_profile("vobr://navigator", "__VOBR_DOM_PROFILE_1__{}").is_none());
+    }
+
+    #[test]
+    fn rejects_extra_fields_strings_and_nonfinite_numbers() {
+        let mut extra = sample();
+        extra["text"] = serde_json::json!("publisher content");
+        assert!(dom_layout_profile("vobr://navigator", &message(&extra)).is_none());
+        for value in [serde_json::json!("3.25"), serde_json::Value::Null] {
+            let mut wrong_type = sample();
+            wrong_type["fonts_ms"] = value;
+            assert!(dom_layout_profile("vobr://navigator", &message(&wrong_type)).is_none());
+        }
+        for invalid in ["NaN", "Infinity", "1e400"] {
+            let payload =
+                message(&sample()).replace("\"fonts_ms\":3.25", &format!("\"fonts_ms\":{invalid}"));
+            assert!(dom_layout_profile("vobr://navigator", &payload).is_none());
+        }
+        let oversized = format!("__VOBR_DOM_PROFILE_1__{}", "0".repeat(4096));
+        assert!(dom_layout_profile("vobr://navigator", &oversized).is_none());
+    }
+
+    #[test]
+    fn rejects_out_of_range_durations_counts_and_revisions() {
+        for (field, value) in [
+            ("fonts_ms", serde_json::json!(-0.01)),
+            ("fonts_ms", serde_json::json!(600_000.01)),
+            ("source_nodes", serde_json::json!(0)),
+            ("source_nodes", serde_json::json!(10_000_001)),
+            ("text_runs", serde_json::json!(-1)),
+            ("char_queries", serde_json::json!(100_000_001)),
+            ("pages", serde_json::json!(0)),
+            ("pages", serde_json::json!(1_000_001)),
+            ("revision", serde_json::json!(9_007_199_254_740_992_u64)),
+        ] {
+            let mut invalid = sample();
+            invalid[field] = value;
+            assert!(
+                dom_layout_profile("vobr://navigator", &message(&invalid)).is_none(),
+                "{field}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -883,36 +1130,89 @@ mod page_reply_tests {
             index: 2,
         };
         let position = |revision, page| serde_json::json!({"type":"position","revision":revision,"chapter":0,"page":page,"pages":5,"start":null});
-        let valid = serde_json::json!([position(9, 0), position(9, 2)]).to_string();
-        assert_eq!(decode_page_reply(request, &valid).unwrap().len(), 2);
+        let reply = |events| {
+            serde_json::json!({"pending":false,"cancelled":false,"events":events}).to_string()
+        };
+        let valid = reply(serde_json::json!([position(9, 0), position(9, 2)]));
+        assert_eq!(decode_page_reply(request, &valid).unwrap().events.len(), 2);
         for invalid in [position(8, 2), position(9, 3)] {
-            assert!(decode_page_reply(request, &serde_json::json!([invalid]).to_string()).is_err());
+            assert!(decode_page_reply(request, &reply(serde_json::json!([invalid]))).is_err());
         }
         assert!(decode_page_reply(request, "[]").is_err());
-        let failed = r#"[{"type":"error","revision":9,"message":"invalid page"}]"#;
+        let failed =
+            reply(serde_json::json!([{"type":"error","revision":9,"message":"invalid page"}]));
         assert!(matches!(
-            &decode_page_reply(request, failed).unwrap()[0],
+            &decode_page_reply(request, &failed).unwrap().events[0],
             NavigatorEvent::Error { .. }
         ));
-        let stale_error = r#"[{"type":"error","revision":8,"message":"old error"}]"#;
-        assert!(decode_page_reply(request, stale_error).is_err());
+        let stale_error =
+            reply(serde_json::json!([{"type":"error","revision":8,"message":"old error"}]));
+        assert!(decode_page_reply(request, &stale_error).is_err());
     }
 
     #[test]
-    fn only_synchronous_page_commands_are_encoded_with_an_atomic_dispatch_and_drain() {
-        let script = page_reply_script(&Command::Page {
+    fn page_completion_uses_an_exact_string_key_in_a_synchronous_poll() {
+        let request = PageRequest {
+            id: PAGE_REQUEST_PREFIX | 1,
             revision: Revision(12),
             index: 4,
-        })
-        .unwrap();
-        assert!(script.contains(
-            r#"book.dispatch({"type":"page","revision":12,"index":4});return book.drain();"#
-        ));
-        assert!(
-            page_reply_script(&Command::Refresh {
-                revision: Revision(12)
-            })
-            .is_err()
+        };
+        let script = page_reply_script(request).unwrap();
+        assert!(script.contains(&format!(
+            r#"book.pageReply({{"type":"page","revision":12,"index":4}},'{}')"#,
+            request.id
+        )));
+        assert!(!script.contains("Promise"));
+        assert!(!script.contains("book.drain()"));
+    }
+
+    #[test]
+    fn pending_page_poll_is_single_flight_and_retains_the_original_timeout() {
+        let now = Instant::now();
+        let mut requests = PageRequests::default();
+        let request = requests.begin(Revision(4), 3, now).unwrap().unwrap();
+        assert!(requests.poll(now + Duration::from_secs(1)).is_none());
+        assert_eq!(requests.evaluated(request.id, now), Some(request));
+        assert!(requests.evaluated(request.id, now).is_none());
+        assert!(requests.poll(now + Duration::from_millis(7)).is_none());
+        assert_eq!(requests.poll(now + Duration::from_millis(8)), Some(request));
+        assert!(requests.poll(now + Duration::from_millis(100)).is_none());
+        assert_eq!(
+            requests.evaluated(request.id, now + Duration::from_secs(4)),
+            Some(request)
         );
+        assert_eq!(requests.expire(now + Duration::from_secs(5)), Some(request));
+        assert!(requests.poll(now + Duration::from_secs(6)).is_none());
+    }
+
+    #[test]
+    fn pending_page_reply_cannot_release_position_before_render_opportunities() {
+        let request = PageRequest {
+            id: PAGE_REQUEST_PREFIX | 1,
+            revision: Revision(9),
+            index: 2,
+        };
+        let pending = r#"{"pending":true,"cancelled":false,"events":[]}"#;
+        assert!(decode_page_reply(request, pending).unwrap().pending);
+        assert!(
+            decode_page_reply(request, r#"{"pending":true,"cancelled":true,"events":[]}"#).is_err()
+        );
+        assert!(decode_page_reply(request, r#"{"pending":true,"cancelled":false,"events":[{"type":"position","revision":9,"chapter":0,"page":2,"pages":5,"start":null}]}"#).is_err());
+        let cancelled = decode_page_reply(request, r#"{"pending":false,"cancelled":true,"events":[{"type":"invalidated","revision":9,"reason":"viewport_changed"}]}"#).unwrap();
+        assert!(!cancelled.pending);
+        assert!(matches!(
+            cancelled.events[0],
+            NavigatorEvent::Invalidated { .. }
+        ));
+    }
+
+    #[test]
+    fn older_normal_drain_cannot_bypass_the_keyed_page_completion_slot() {
+        let events = r#"[{"type":"position","revision":9,"chapter":0,"page":0,"pages":5,"start":null},{"type":"hit","revision":9,"location":null},{"type":"invalidated","revision":9,"reason":"viewport_changed"}]"#;
+        assert_eq!(decode_drain_events(events, false).unwrap().len(), 3);
+        let pending = decode_drain_events(events, true).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(pending[0], NavigatorEvent::Hit { .. }));
+        assert!(matches!(pending[1], NavigatorEvent::Invalidated { .. }));
     }
 }

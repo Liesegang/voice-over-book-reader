@@ -178,6 +178,7 @@ jobs:
         run: |
           node --version
           node crates/reader-renderer-cef/navigator.test.mjs
+          node --test crates/reader-renderer-cef/tests/page-reply.test.mjs
           node crates/reader-app/src/cef_counter.test.mjs
 
       - name: Packaging fixture tests
