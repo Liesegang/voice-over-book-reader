@@ -2,8 +2,8 @@
   "scope": "Local Windows application comparison, 3 fresh app-cache runs and 3 cached-index restarts per backend per fixture; descriptive measurements only",
   "before_commit": "98d2c8dd9f126c0abceed4a651926dd492c9ef47",
   "before_diagnostic_exe_sha256": "7976778b3b896f551cc388744f0b3a0ff8171a0d63a45094ce40afa44a5dff80",
-  "after_commit": "77428d52de21ed5fd830bfb1a9cfc0077c5bf57d",
-  "after_loaded_dll_sha256": "acdc2506176964da77a77ecb5e3d396c0cb31923324debd28f29509d4d5ac627",
+  "after_commit": "6cf9e70111e3de38515b4119316e6665c90e1f4d",
+  "after_loaded_dll_sha256": "2ece1b7bfff0c21ed0d34aa1fe6defc04c69840e9ad5b48560f0822d3480b69a",
   "driver_sha256": "f086e47a6da974cd4539d20e1b215e91778aa890761ba34e3c03e7f73a4912a2",
   "fixture_hashes": {
     "single": {
@@ -44,44 +44,44 @@
       "runs": 3,
       "metrics": {
         "first_book_readback_ms": {
-          "median": 989.9516,
-          "min": 974.4148,
-          "max": 1042.247
+          "median": 938.6749,
+          "min": 934.8677,
+          "max": 1088.4952
         },
         "total_pages_ready_ms": {
-          "median": 975.4662,
-          "min": 961.2124,
-          "max": 1043.3586
+          "median": 939.7599,
+          "min": 936.0849,
+          "max": 1089.798
         },
         "turn_median_ms": {
-          "median": 65.11374999999975,
-          "min": 65.048,
-          "max": 65.35834999999997
+          "median": 65.16925000000003,
+          "min": 65.02610000000004,
+          "max": 65.19054999999992
         },
         "turn_p95_ms": {
-          "median": 131.17180000000008,
-          "min": 65.39820000000009,
-          "max": 148.11709999999994
+          "median": 65.53909999999996,
+          "min": 65.50960000000032,
+          "max": 65.6252000000004
         },
         "burst_ms": {
-          "median": 115.03849999999966,
-          "min": 114.90369999999984,
-          "max": 115.55360000000019
+          "median": 115.8481999999999,
+          "min": 115.5295000000001,
+          "max": 115.98320000000012
         },
         "sampled_private_peak_mib": {
-          "median": 441.734375,
-          "min": 440.99609375,
-          "max": 445.1875
+          "median": 441.50390625,
+          "min": 441.3828125,
+          "max": 445.1328125
         },
         "observed_cpu_ms": {
-          "median": 1406.25,
-          "min": 1328.125,
-          "max": 1703.125
+          "median": 1500.0,
+          "min": 1312.5,
+          "max": 1609.375
         },
         "sample_interval_median_ms": {
-          "median": 204.61010000000002,
-          "min": 198.10014999999999,
-          "max": 205.62269999999995
+          "median": 191.6887999999999,
+          "min": 190.8668,
+          "max": 194.34175000000005
         }
       }
     },
@@ -89,44 +89,44 @@
       "runs": 3,
       "metrics": {
         "first_book_readback_ms": {
-          "median": 980.0119,
-          "min": 952.3523,
-          "max": 1000.2595
+          "median": 914.2498,
+          "min": 895.6702,
+          "max": 1056.3594
         },
         "total_pages_ready_ms": {
-          "median": 966.1595,
-          "min": 937.5736,
-          "max": 984.7892
+          "median": 896.9074,
+          "min": 881.8169,
+          "max": 1015.6677
         },
         "turn_median_ms": {
-          "median": 65.14405,
-          "min": 65.03480000000002,
-          "max": 65.14985000000013
+          "median": 65.10685000000012,
+          "min": 65.07849999999996,
+          "max": 65.23610000000008
         },
         "turn_p95_ms": {
-          "median": 65.67070000000012,
-          "min": 65.55310000000009,
-          "max": 132.07839999999987
+          "median": 66.16850000000022,
+          "min": 66.14699999999993,
+          "max": 98.52190000000019
         },
         "burst_ms": {
-          "median": 116.56669999999986,
-          "min": 115.85269999999991,
-          "max": 116.82310000000007
+          "median": 115.18690000000015,
+          "min": 114.27179999999998,
+          "max": 115.27060000000029
         },
         "sampled_private_peak_mib": {
-          "median": 444.4921875,
-          "min": 440.80859375,
-          "max": 444.84375
+          "median": 444.421875,
+          "min": 440.4140625,
+          "max": 444.9140625
         },
         "observed_cpu_ms": {
-          "median": 1453.125,
-          "min": 1421.875,
-          "max": 1562.5
+          "median": 1312.5,
+          "min": 1281.25,
+          "max": 1359.375
         },
         "sample_interval_median_ms": {
-          "median": 196.31554999999997,
-          "min": 195.10235,
-          "max": 198.27350000000004
+          "median": 191.30849999999998,
+          "min": 190.50099999999998,
+          "max": 196.7373500000001
         }
       }
     },
@@ -134,44 +134,44 @@
       "runs": 3,
       "metrics": {
         "first_book_readback_ms": {
-          "median": 1932.2955,
-          "min": 1898.2128,
-          "max": 2160.2306
+          "median": 1801.5518,
+          "min": 1774.3061,
+          "max": 1943.9737
         },
         "total_pages_ready_ms": {
-          "median": 1878.8058,
-          "min": 1833.007,
-          "max": 2097.1729
+          "median": 1747.5473,
+          "min": 1721.5186,
+          "max": 1829.4053
         },
         "turn_median_ms": {
-          "median": 62.31485000000043,
-          "min": 48.35490000000004,
-          "max": 63.95174999999972
+          "median": 63.404450000000224,
+          "min": 48.27350000000001,
+          "max": 63.55650000000014
         },
         "turn_p95_ms": {
-          "median": 67.78550000000041,
-          "min": 49.28810000000021,
-          "max": 82.61180000000013
+          "median": 67.1903000000002,
+          "min": 49.04520000000002,
+          "max": 81.92879999999968
         },
         "burst_ms": {
-          "median": 251.47779999999966,
-          "min": 248.19669999999996,
-          "max": 330.47630000000026
+          "median": 346.7650000000003,
+          "min": 262.7964000000002,
+          "max": 402.9380999999994
         },
         "sampled_private_peak_mib": {
-          "median": 747.5390625,
-          "min": 739.66796875,
-          "max": 748.5234375
+          "median": 743.890625,
+          "min": 739.3359375,
+          "max": 746.109375
         },
         "observed_cpu_ms": {
-          "median": 5609.375,
-          "min": 5593.75,
-          "max": 6140.625
+          "median": 5765.625,
+          "min": 5562.5,
+          "max": 6078.125
         },
         "sample_interval_median_ms": {
-          "median": 209.07970000000023,
-          "min": 205.3327999999999,
-          "max": 212.01529999999997
+          "median": 201.3284000000001,
+          "min": 199.10380000000032,
+          "max": 202.4314
         }
       }
     },
@@ -179,44 +179,44 @@
       "runs": 3,
       "metrics": {
         "first_book_readback_ms": {
-          "median": 1876.3386,
-          "min": 1863.9243,
-          "max": 2076.0447
+          "median": 1857.0642,
+          "min": 1800.8262,
+          "max": 2018.713
         },
         "total_pages_ready_ms": {
-          "median": 1812.2017,
-          "min": 1801.4533,
-          "max": 2011.5577
+          "median": 1792.721,
+          "min": 1735.826,
+          "max": 1904.2118
         },
         "turn_median_ms": {
-          "median": 62.76409999999987,
-          "min": 48.19854999999984,
-          "max": 64.44535000000019
+          "median": 63.00754999999981,
+          "min": 48.26080000000002,
+          "max": 63.6884
         },
         "turn_p95_ms": {
-          "median": 67.24209999999994,
-          "min": 49.72589999999991,
-          "max": 101.61779999999999
+          "median": 67.37830000000031,
+          "min": 49.691899999999805,
+          "max": 83.72410000000036
         },
         "burst_ms": {
-          "median": 246.32490000000053,
-          "min": 244.83290000000034,
-          "max": 250.32030000000032
+          "median": 331.6090000000004,
+          "min": 263.9663000000005,
+          "max": 399.58519999999953
         },
         "sampled_private_peak_mib": {
-          "median": 746.42578125,
-          "min": 745.921875,
-          "max": 760.71875
+          "median": 745.09375,
+          "min": 744.12109375,
+          "max": 748.8984375
         },
         "observed_cpu_ms": {
-          "median": 5906.25,
-          "min": 5687.5,
-          "max": 5937.5
+          "median": 5609.375,
+          "min": 5078.125,
+          "max": 5921.875
         },
         "sample_interval_median_ms": {
-          "median": 201.75930000000017,
-          "min": 201.4431000000004,
-          "max": 203.19039999999995
+          "median": 199.91979999999967,
+          "min": 194.97585000000015,
+          "max": 200.69085000000007
         }
       }
     },
@@ -224,29 +224,29 @@
       "runs": 3,
       "metrics": {
         "first_book_readback_ms": {
-          "median": 937.9697,
-          "min": 903.6727,
-          "max": 981.2822
+          "median": 974.7078,
+          "min": 938.5352,
+          "max": 1023.199
         },
         "total_pages_ready_ms": {
-          "median": 922.8553,
-          "min": 904.9215,
-          "max": 965.6432
+          "median": 959.4222,
+          "min": 920.8389,
+          "max": 1007.2626
         },
         "sampled_private_peak_mib": {
-          "median": 433.83203125,
-          "min": 381.9921875,
-          "max": 434.7265625
+          "median": 367.7734375,
+          "min": 365.921875,
+          "max": 424.08203125
         },
         "observed_cpu_ms": {
-          "median": 968.75,
-          "min": 937.5,
-          "max": 1078.125
+          "median": 1046.875,
+          "min": 1015.625,
+          "max": 1156.25
         },
         "sample_interval_median_ms": {
-          "median": 201.14260000000002,
-          "min": 194.66675,
-          "max": 202.6225
+          "median": 200.83370000000002,
+          "min": 191.59715000000003,
+          "max": 205.4139
         }
       }
     },
@@ -254,29 +254,29 @@
       "runs": 3,
       "metrics": {
         "first_book_readback_ms": {
-          "median": 942.8636,
-          "min": 919.059,
-          "max": 975.3019
+          "median": 942.6437,
+          "min": 910.2616,
+          "max": 991.7582
         },
         "total_pages_ready_ms": {
-          "median": 929.0632,
-          "min": 905.4405,
-          "max": 960.2858
+          "median": 927.1993,
+          "min": 895.4985,
+          "max": 975.4326
         },
         "sampled_private_peak_mib": {
-          "median": 382.86328125,
-          "min": 366.18359375,
-          "max": 382.94921875
+          "median": 366.96875,
+          "min": 366.62890625,
+          "max": 426.7578125
         },
         "observed_cpu_ms": {
-          "median": 984.375,
-          "min": 984.375,
-          "max": 1000.0
+          "median": 953.125,
+          "min": 875.0,
+          "max": 1093.75
         },
         "sample_interval_median_ms": {
-          "median": 200.20820000000003,
-          "min": 195.92470000000003,
-          "max": 203.03620000000006
+          "median": 195.62470000000008,
+          "min": 189.00759999999997,
+          "max": 197.23860000000002
         }
       }
     },
@@ -284,29 +284,29 @@
       "runs": 3,
       "metrics": {
         "first_book_readback_ms": {
-          "median": 1633.2203,
-          "min": 1607.0288,
-          "max": 1702.8714
+          "median": 1708.2062,
+          "min": 1641.9037,
+          "max": 1739.0664
         },
         "total_pages_ready_ms": {
-          "median": 3329.2847,
-          "min": 3271.699,
-          "max": 3440.2411
+          "median": 3372.7664,
+          "min": 3296.9782,
+          "max": 3438.0644
         },
         "sampled_private_peak_mib": {
-          "median": 947.92578125,
-          "min": 946.2265625,
-          "max": 950.73828125
+          "median": 945.734375,
+          "min": 930.65234375,
+          "max": 951.9296875
         },
         "observed_cpu_ms": {
-          "median": 6265.625,
-          "min": 6171.875,
-          "max": 6328.125
+          "median": 6109.375,
+          "min": 6062.5,
+          "max": 6359.375
         },
         "sample_interval_median_ms": {
-          "median": 205.46704999999986,
-          "min": 204.45730000000003,
-          "max": 209.12849999999997
+          "median": 199.9613499999998,
+          "min": 198.1783499999999,
+          "max": 205.3778000000002
         }
       }
     },
@@ -314,29 +314,29 @@
       "runs": 3,
       "metrics": {
         "first_book_readback_ms": {
-          "median": 1625.0988,
-          "min": 1590.1854,
-          "max": 1740.4445
+          "median": 1689.0476,
+          "min": 1666.8235,
+          "max": 1713.3738
         },
         "total_pages_ready_ms": {
-          "median": 1560.0607,
-          "min": 1526.9724,
-          "max": 1675.6681
+          "median": 1609.5134,
+          "min": 1602.2179,
+          "max": 1649.1503
         },
         "sampled_private_peak_mib": {
-          "median": 629.171875,
-          "min": 612.1953125,
-          "max": 632.59765625
+          "median": 626.8828125,
+          "min": 608.0390625,
+          "max": 676.70703125
         },
         "observed_cpu_ms": {
-          "median": 3390.625,
-          "min": 3250.0,
-          "max": 3546.875
+          "median": 3484.375,
+          "min": 3281.25,
+          "max": 3625.0
         },
         "sample_interval_median_ms": {
-          "median": 212.0457,
-          "min": 201.61964999999998,
-          "max": 216.37750000000005
+          "median": 200.19629999999998,
+          "min": 199.42345,
+          "max": 207.95350000000008
         }
       }
     }
@@ -344,13 +344,13 @@
   "navigation_optimization_delta": {
     "cold": {
       "initial_chromium_burst_ms": 402.1328000000003,
-      "optimized_chromium_burst_ms": 251.47779999999966,
-      "reduction_percent": 37.46399199468448
+      "optimized_chromium_burst_ms": 346.7650000000003,
+      "reduction_percent": 13.768536165167312
     },
     "warm": {
       "initial_chromium_burst_ms": 400.83030000000053,
-      "optimized_chromium_burst_ms": 246.32490000000053,
-      "reduction_percent": 38.54633744005875
+      "optimized_chromium_burst_ms": 331.6090000000004,
+      "reduction_percent": 17.26947788128793
     },
     "baseline_after_loaded_dll_sha256": "0e1a03b489b5f5657a3fd622a0ecd3fdb446dd59ba9f18c30f1b557b71283fb3",
     "common_driver_sha256": "f086e47a6da974cd4539d20e1b215e91778aa890761ba34e3c03e7f73a4912a2",
