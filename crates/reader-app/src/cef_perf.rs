@@ -230,7 +230,7 @@ impl PerfDriver {
             self.finish(Some(
                 "Timed out waiting for confirmed book pixels or total pages",
             ));
-            return Some(PerfAction::Close);
+            return next_action(ctx, PerfAction::Close);
         }
         if ready && let Some(total) = total_pages.filter(|total| *total > 0) {
             self.total_pages = Some(total);
@@ -283,7 +283,7 @@ impl PerfDriver {
                         self.initial_toolbar_hash = Some(capture.toolbar_hash);
                         self.phase = Phase::OverlayOn;
                         self.after_frame = ctx.cumulative_frame_nr() + 6;
-                        return Some(PerfAction::ToggleChrome);
+                        return next_action(ctx, PerfAction::ToggleChrome);
                     }
                     Phase::OverlayOn | Phase::OverlayOff => {
                         self.overlay_checks.push(json!({
@@ -297,7 +297,7 @@ impl PerfDriver {
                         if self.phase == Phase::OverlayOn {
                             self.phase = Phase::OverlayOff;
                             self.after_frame = ctx.cumulative_frame_nr() + 6;
-                            return Some(PerfAction::ToggleChrome);
+                            return next_action(ctx, PerfAction::ToggleChrome);
                         }
                         self.phase = Phase::Turns;
                     }
@@ -335,11 +335,11 @@ impl PerfDriver {
             Phase::WaitCount if self.total_ready_ms.is_some() && ready => {
                 if self.count_only {
                     self.finish(None);
-                    return Some(PerfAction::Close);
+                    return next_action(ctx, PerfAction::Close);
                 }
                 if current_page != 0 {
                     self.finish(Some("Turn fixture must start at chapter page zero"));
-                    return Some(PerfAction::Close);
+                    return next_action(ctx, PerfAction::Close);
                 }
                 self.phase = Phase::Baseline;
                 self.after_frame = ctx.cumulative_frame_nr() + 1;
@@ -377,27 +377,31 @@ impl PerfDriver {
                             dispatched_ms: self.clock.ms(),
                             dispatched_frame: ctx.cumulative_frame_nr(),
                         });
-                        return Some(PerfAction::Turn(target > current_page));
+                        return next_action(ctx, PerfAction::Turn(target > current_page));
                     }
                     if let Some(marker) = expected_marker {
                         if current_page != 0 {
                             self.finish(Some(
                                 "Rapid-wheel fixture must begin at chapter page zero",
                             ));
-                            return Some(PerfAction::Close);
+                            return next_action(ctx, PerfAction::Close);
                         }
                         self.phase = Phase::Burst;
                         self.burst_started_ms = Some(self.clock.ms());
                         self.burst_chapter = current_chapter;
                         self.burst_blue = marker[2];
-                        return Some(PerfAction::WheelBurst(5));
+                        // eframe processes screenshot viewport commands after
+                        // painting; arm before enqueue to capture the first
+                        // native page, rather than starting on its successor.
+                        self.capture_burst(ctx, current_chapter);
+                        return next_action(ctx, PerfAction::WheelBurst(5));
                     }
                 }
             }
             Phase::Burst => {
                 if let Err(error) = self.collect_burst(physical_size) {
                     self.finish(Some(error));
-                    return Some(PerfAction::Close);
+                    return next_action(ctx, PerfAction::Close);
                 }
                 if self.burst_observed == [1, 2, 3, 4, 5]
                     && ready
@@ -405,7 +409,7 @@ impl PerfDriver {
                     && current_page == 5
                 {
                     self.finish(None);
-                    return Some(PerfAction::Close);
+                    return next_action(ctx, PerfAction::Close);
                 }
                 self.capture_burst(ctx, current_chapter);
             }
@@ -562,6 +566,7 @@ impl PerfDriver {
             self.total_ready_ms.is_some() && self.total_pages.is_some_and(|pages| pages > 0);
         let report = json!({
             "measurement":"Native app GPU screenshot callback; includes GPU readback and callback delivery, excludes display-photon latency",
+            "screenshot_cadence":"eframe applies screenshot commands after painting, so requests read a subsequent rendered frame; initial burst request is armed before wheel enqueue. Synthetic actions explicitly wake repaint as real input would",
             "marker_validation":"3x3 marker-center pixels, at least five matches, maximum channel error 8; ordered page fixture uses pages 0 through 5",
             "turn_input":"30 sequential native actions followed by a separate five-notch wheel burst enqueued once; screenshot callbacks do not gate burst input dispatch",
             "turn_endpoint":"First confirmed target-page GPU screenshot readback, sampled before host readiness barriers; subsequent turn dispatch still awaits host readiness",
@@ -616,6 +621,13 @@ impl PerfDriver {
             eprintln!("Performance report could not be written: {error}");
         }
     }
+}
+
+fn next_action(ctx: &egui::Context, action: PerfAction) -> Option<PerfAction> {
+    // Returning an action bypasses tick's polling repaint. Match a real input
+    // wake instead of inheriting the native application's 250 ms idle timer.
+    ctx.request_repaint();
+    Some(action)
 }
 
 fn observe_burst(observed: &mut Vec<usize>, page: usize) -> Result<bool, &'static str> {
@@ -731,6 +743,23 @@ fn percentile(values: &[f64], fraction: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn synthetic_actions_wake_the_host_instead_of_waiting_for_its_idle_timer() {
+        let ctx = egui::Context::default();
+        let delays = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&delays);
+        ctx.set_repaint_observer(move |request| observed.lock().unwrap().push(request.delay));
+        for action in [
+            PerfAction::Turn(true),
+            PerfAction::WheelBurst(5),
+            PerfAction::ToggleChrome,
+            PerfAction::Close,
+        ] {
+            assert_eq!(next_action(&ctx, action), Some(action));
+        }
+        assert_eq!(*delays.lock().unwrap(), vec![Duration::ZERO; 4]);
+    }
+
     #[test]
     fn pending_turn_marker_cannot_accept_previous_page_pixels() {
         let old_marker = page_marker(0, 160);
