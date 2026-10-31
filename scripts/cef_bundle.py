@@ -17,7 +17,10 @@ FRAMEWORK = "Chromium Embedded Framework.framework"
 MAC_HELPERS = ("Helper", "Helper (GPU)", "Helper (Renderer)", "Helper (Plugin)", "Helper (Alerts)")
 COMMON = ("icudtl.dat", "resources.pak", "chrome_100_percent.pak", "chrome_200_percent.pak", "v8_context_snapshot.bin")
 WINDOWS = ("libcef.dll", "chrome_elf.dll", "d3dcompiler_47.dll", "dxcompiler.dll", "dxil.dll", "vk_swiftshader.dll", "vk_swiftshader_icd.json", "vulkan-1.dll")
-LINUX = ("libcef.so", "chrome-sandbox", "libEGL.so", "libGLESv2.so", "libvk_swiftshader.so", "vk_swiftshader_icd.json")
+# CEF 154's CEF_BINARY_FILES / README.redistrib.txt: ANGLE is no longer
+# distributed as separate libEGL/libGLESv2 libraries on Linux. Keep the Vulkan
+# loader with SwiftShader so software rendering has all of its SDK components.
+LINUX = ("libcef.so", "chrome-sandbox", "libvk_swiftshader.so", "libvulkan.so.1", "vk_swiftshader_icd.json")
 
 
 def required(version: str) -> bool:

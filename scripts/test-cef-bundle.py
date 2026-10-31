@@ -78,7 +78,10 @@ class CefPackageTests(unittest.TestCase):
             (framework / "Libraries/libEGL.dylib").write_bytes(b"dylib fixture")
             (framework / "Chromium Embedded Framework").write_bytes(b"framework fixture")
         else:
-            for name in cef.COMMON + (cef.WINDOWS + ("bootstrap.exe",) if "windows" in target else cef.LINUX):
+            # Model the pinned Linux SDK independently of the package allowlist;
+            # deriving both from cef.LINUX hid an obsolete libEGL requirement.
+            linux_sdk = ("libcef.so", "chrome-sandbox", "libvk_swiftshader.so", "libvulkan.so.1", "vk_swiftshader_icd.json")
+            for name in cef.COMMON + (cef.WINDOWS + ("bootstrap.exe",) if "windows" in target else linux_sdk):
                 data = client_dll(b"CEFExport") if name.endswith(".dll") else executable() if name == "bootstrap.exe" else b"sdk fixture: " + name.encode()
                 (sdk / name).write_bytes(data)
             (sdk / "locales").mkdir()
@@ -155,6 +158,10 @@ class CefPackageTests(unittest.TestCase):
             installed = root / "verify" / package.stem
             names = cef.validate_manifest(installed)
             self.assertIn("libcef.so", names)
+            self.assertIn("libvulkan.so.1", names)
+            self.assertIn("libvk_swiftshader.so", names)
+            self.assertNotIn("libEGL.so", names)
+            self.assertNotIn("libGLESv2.so", names)
             self.assertIn(cef.HELPER, names)
             self.assertIn("chrome-sandbox", names)
             self.assertFalse((installed / "chrome-sandbox").stat().st_mode & 0o6000)
@@ -164,6 +171,15 @@ class CefPackageTests(unittest.TestCase):
             (installed / "libcef.so").write_bytes(b"corrupt runtime")
             with self.assertRaisesRegex(ValueError, "hash differs"):
                 cef.validate_manifest(installed)
+
+    def test_linux_software_renderer_loader_is_required_before_packaging(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            metadata, _, sdk = self.fixture(root, "x86_64-unknown-linux-gnu")
+            (sdk / "libvulkan.so.1").unlink()
+            with patch.object(base.packager, "cargo_metadata", return_value=metadata):
+                with self.assertRaisesRegex(FileNotFoundError, "libvulkan.so.1"):
+                    base.packager.package(root, "x86_64-unknown-linux-gnu", root / "packages", sdk)
 
     def test_mac_has_all_helpers_and_signs_framework_before_outer_bundle(self):
         with tempfile.TemporaryDirectory() as temporary:
