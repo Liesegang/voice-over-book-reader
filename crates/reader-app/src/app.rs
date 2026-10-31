@@ -2403,6 +2403,9 @@ impl ReaderApp {
         if self.book.chapters.is_empty() {
             return;
         }
+        // Reopened image books need their cached source-page classifications
+        // before deriving margins, spread grouping or a normalized chapter.
+        self.restore_native_pagination_cache();
         let rect = crate::reading_surface::content_rect(
             rect,
             &self.book.chapters[self.chapter],
@@ -4764,13 +4767,10 @@ impl ReaderApp {
         self.resume_locator = None;
         self.pending_fragment = None;
     }
-    fn ensure_pagination_index(&mut self) {
-        if self.opening || self.book.chapters.is_empty() || self.layout.pages.is_empty() {
-            return;
-        }
+    fn native_pagination_key(&self) -> String {
         let e = self.reading_extent;
-        let key = format!(
-            "native-pages-v022:css:{}:{:?}",
+        format!(
+            "native-pages-v023:css:{}:{:?}",
             reader_core::default_reader_css_revision(),
             (
                 self.book.content_identity(),
@@ -4793,7 +4793,45 @@ impl ReaderApp {
                     self.book.chapters.len()
                 )
             )
-        );
+        )
+    }
+
+    fn restore_native_pagination_cache(&mut self) {
+        let key = self.native_pagination_key();
+        if key == self.pagination_key {
+            return;
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hash);
+        let path = self
+            .store
+            .data_dir()
+            .join("pagination-v023")
+            .join(format!("{:016x}.json", hash.finish()));
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+            && value.get("key").and_then(|value| value.as_str()) == Some(key.as_str())
+            && let Ok(index) =
+                serde_json::from_value::<crate::pagination::PageIndex>(value["index"].clone())
+            && index.restore_geometry(&self.book).is_ok()
+        {
+            self.pagination_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.pagination_key = key;
+            self.pagination_index = Some(index);
+            self.pagination_pending = false;
+            self.pagination_error = None;
+            self.layout_key.clear();
+        }
+    }
+
+    fn ensure_pagination_index(&mut self) {
+        if self.opening || self.book.chapters.is_empty() || self.layout.pages.is_empty() {
+            return;
+        }
+        let e = self.reading_extent;
+        let key = self.native_pagination_key();
         if key == self.pagination_key
             && (self.pagination_pending
                 || self.pagination_index.is_some()
@@ -4839,7 +4877,7 @@ impl ReaderApp {
         let epoch = self.pagination_epoch.clone();
         let tx = self.tx.clone();
         let ctx = self.worker_context.clone();
-        let directory = self.store.data_dir().join("pagination-v022");
+        let directory = self.store.data_dir().join("pagination-v023");
         std::thread::spawn(move || {
             let _worker = crate::latency::span("page_count_worker", generation);
             use std::hash::{Hash, Hasher};
@@ -4855,6 +4893,7 @@ impl ReaderApp {
                         value["index"].clone(),
                     )
                     && index.counts.len() == book.chapters.len()
+                    && index.restore_geometry(&book).is_ok()
                 {
                     crate::latency::event("page_count_cache_hit", generation);
                     return Ok(index);

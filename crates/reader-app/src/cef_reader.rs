@@ -1068,7 +1068,7 @@ impl CefReader {
     }
     fn configure(&mut self, app: &ReaderApp, extent: egui::Vec2, p: Palette) {
         let key = format!(
-            "chromium-layout-4:{}:{}:{:?}:{}:{}:{:?}",
+            "chromium-layout-5:{}:{}:{:?}:{}:{}:{:?}",
             reader_core::default_reader_css_revision(),
             self.book_key,
             extent,
@@ -1114,6 +1114,7 @@ impl CefReader {
         if let Ok(bytes) = std::fs::read(&path)
             && let Ok(index) = serde_json::from_slice::<crate::pagination::PageIndex>(&bytes)
             && index.starts.len() == self.counted.len()
+            && index.restore_geometry(&app.book).is_ok()
         {
             self.counted = index.starts.into_iter().map(Some).collect();
         }
@@ -1285,7 +1286,8 @@ impl CefReader {
             let index = crate::pagination::PageIndex::new_with_starts(
                 starts.iter().map(Vec::len).collect(),
                 starts,
-            )?;
+            )?
+            .capture_geometry(&app.book);
             if let Some(path) = self.cache_path.take() {
                 if let Some(parent) = path.parent() {
                     let _ = std::fs::create_dir_all(parent);

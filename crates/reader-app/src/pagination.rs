@@ -14,7 +14,7 @@ pub fn known_chromium_page_starts(chapter: &reader_core::Chapter) -> Option<Vec<
     reader_core::page_document_geometry(chapter).map(|_| vec![chapter.start_locator()])
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct PageIndex {
     pub counts: Vec<usize>,
     /// Prefix offsets, including a final `total` sentinel.
@@ -24,6 +24,8 @@ pub struct PageIndex {
     /// counts-only indexes. `None` is an explicitly source-less page.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub starts: Vec<Vec<Option<Locator>>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub geometry: Vec<reader_core::PageGeometrySnapshot>,
     #[serde(skip)]
     ordered: Vec<bool>,
 }
@@ -37,10 +39,18 @@ impl<'de> Deserialize<'de> for PageIndex {
             counts: Vec<usize>,
             #[serde(default)]
             starts: Vec<Vec<Option<Locator>>>,
+            #[serde(default)]
+            geometry: Vec<reader_core::PageGeometrySnapshot>,
         }
         let stored = Stored::deserialize(deserializer)?;
         // Derived prefix sums are rebuilt, never trusted from a disk cache.
-        Self::new_with_starts(stored.counts, stored.starts).map_err(serde::de::Error::custom)
+        let mut index = Self::new_with_starts(stored.counts, stored.starts)
+            .map_err(serde::de::Error::custom)?;
+        if !stored.geometry.is_empty() && stored.geometry.len() != index.counts.len() {
+            return Err(serde::de::Error::custom("Chapter geometry count differs"));
+        }
+        index.geometry = stored.geometry;
+        Ok(index)
     }
 }
 
@@ -107,8 +117,48 @@ impl PageIndex {
             offsets,
             total,
             starts,
+            geometry: Vec::new(),
             ordered,
         })
+    }
+
+    pub fn capture_geometry(mut self, book: &Book) -> Self {
+        self.geometry = book
+            .chapters
+            .iter()
+            .map(reader_core::page_geometry_snapshot)
+            .collect();
+        self
+    }
+
+    /// Call before deriving spread grouping or viewport geometry on a cache hit.
+    /// Old counts-only indexes remain readable but cannot bypass classification.
+    pub fn restore_geometry(&self, book: &Book) -> Result<()> {
+        ensure!(
+            self.geometry.len() == book.chapters.len(),
+            "Cached chapter geometry is missing"
+        );
+        ensure!(
+            self.counts.len() == book.chapters.len(),
+            "Cached page counts differ"
+        );
+        for (snapshot, count) in self.geometry.iter().zip(&self.counts) {
+            ensure!(
+                snapshot.is_valid_known(),
+                "Cached chapter classification is unknown or invalid"
+            );
+            ensure!(
+                !matches!(snapshot, reader_core::PageGeometrySnapshot::Page(_)) || *count == 1,
+                "Cached atomic page count differs"
+            );
+        }
+        for (chapter, snapshot) in book.chapters.iter().zip(&self.geometry) {
+            ensure!(
+                reader_core::restore_page_geometry(chapter, *snapshot),
+                "Could not restore chapter geometry"
+            );
+        }
+        Ok(())
     }
 
     /// Resolve a retained source position against this layout's actual page
@@ -230,7 +280,8 @@ fn compute_output<const EMIT: bool>(
                 .iter()
                 .map(|chapter| vec![chapter.start_locator()])
                 .collect(),
-        );
+        )
+        .map(|index| index.capture_geometry(book));
     }
     let next = AtomicUsize::new(0);
     let worker = || -> Result<Vec<(usize, Vec<Option<Locator>>)>> {
@@ -347,6 +398,7 @@ fn compute_output<const EMIT: bool>(
     }
     check()?;
     PageIndex::new_with_starts(starts.iter().map(Vec::len).collect(), starts)
+        .map(|index| index.capture_geometry(book))
 }
 
 #[cfg(test)]

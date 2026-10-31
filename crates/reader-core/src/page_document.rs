@@ -1,13 +1,73 @@
 use crate::{Chapter, CssLength, ImageRef, RenditionLayout};
+use serde::{Deserialize, Serialize};
 use std::sync::{Arc, OnceLock};
 
 /// One complete source document/page, independent of the reader's spread size.
 /// A missing viewport is valid for unloaded, explicitly fixed-layout metadata.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PageDocumentGeometry {
     pub viewport: Option<[f32; 2]>,
     /// Legacy image-only HTML inferred from its authored/intrinsic geometry.
     pub inferred_image: bool,
+}
+
+/// Persist classifications separately from publisher metadata. A parsed flow
+/// document is different from an unloaded chapter that has not been examined.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "geometry", rename_all = "snake_case")]
+pub enum PageGeometrySnapshot {
+    Unknown,
+    Flow,
+    Page(PageDocumentGeometry),
+}
+
+impl PageGeometrySnapshot {
+    pub fn is_valid_known(self) -> bool {
+        match self {
+            Self::Unknown => false,
+            Self::Flow => true,
+            Self::Page(geometry) => match geometry.viewport {
+                Some(size) => valid_size(size).is_some(),
+                None => !geometry.inferred_image,
+            },
+        }
+    }
+}
+
+pub fn page_geometry_snapshot(chapter: &Chapter) -> PageGeometrySnapshot {
+    if chapter.loaded || chapter.fixed_page.is_some() || chapter.presentation.layout.is_some() {
+        return page_document_geometry(chapter)
+            .map(PageGeometrySnapshot::Page)
+            .unwrap_or(PageGeometrySnapshot::Flow);
+    }
+    match chapter.geometry_cache.get() {
+        Some(Some(geometry)) => PageGeometrySnapshot::Page(geometry),
+        Some(None) => PageGeometrySnapshot::Flow,
+        None => PageGeometrySnapshot::Unknown,
+    }
+}
+
+pub fn restore_page_geometry(chapter: &Chapter, snapshot: PageGeometrySnapshot) -> bool {
+    if !snapshot.is_valid_known() {
+        return false;
+    }
+    if matches!(
+        snapshot,
+        PageGeometrySnapshot::Page(PageDocumentGeometry {
+            viewport: None,
+            inferred_image: false
+        })
+    ) {
+        // OPF already establishes the fixed-page role. Do not occupy the
+        // once-cell with missing dimensions before parsing its XHTML viewport.
+        return true;
+    }
+    chapter.geometry_cache.store(match snapshot {
+        PageGeometrySnapshot::Page(geometry) => Some(geometry),
+        PageGeometrySnapshot::Flow => None,
+        PageGeometrySnapshot::Unknown => unreachable!("validated known classification"),
+    });
+    true
 }
 
 /// Derived metadata shared by an EPUB stub, its parsed source and background
@@ -164,6 +224,45 @@ mod tests {
             css,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn persisted_unknown_and_negative_classifications_are_distinct_and_do_not_poison_stubs() {
+        let values = [
+            PageGeometrySnapshot::Unknown,
+            PageGeometrySnapshot::Flow,
+            PageGeometrySnapshot::Page(PageDocumentGeometry {
+                viewport: Some([977., 1280.]),
+                inferred_image: true,
+            }),
+        ];
+        let encoded = serde_json::to_value(values).unwrap();
+        assert_ne!(encoded[0], encoded[1]);
+        let decoded: [PageGeometrySnapshot; 3] = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, values);
+        let mut chapter = parsed("", "");
+        chapter.loaded = false;
+        assert!(!restore_page_geometry(
+            &chapter,
+            PageGeometrySnapshot::Unknown
+        ));
+        assert_eq!(chapter.geometry_cache.get(), None);
+        assert!(restore_page_geometry(&chapter, PageGeometrySnapshot::Flow));
+        assert_eq!(chapter.geometry_cache.get(), Some(None));
+
+        let chapter = parsed("", "");
+        assert!(restore_page_geometry(
+            &chapter,
+            PageGeometrySnapshot::Page(PageDocumentGeometry {
+                viewport: None,
+                inferred_image: false
+            })
+        ));
+        assert_eq!(
+            chapter.geometry_cache.get(),
+            None,
+            "fixed metadata without dimensions leaves room for XHTML geometry"
+        );
     }
 
     #[test]

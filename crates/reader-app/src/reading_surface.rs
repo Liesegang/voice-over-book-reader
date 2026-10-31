@@ -242,6 +242,14 @@ pub fn chapter_spread(
 pub fn chapter_spread_start(book: &Book, index: usize, extent: Vec2, settings: &Settings) -> usize {
     let mut cursor = 0;
     while cursor < index {
+        if matches!(
+            reader_core::page_geometry_snapshot(&book.chapters[cursor]),
+            reader_core::PageGeometrySnapshot::Unknown
+        ) {
+            // Unparsed legacy chapters must not be assumed to be flow when
+            // normalizing a retained source position on a cold cache miss.
+            return index;
+        }
         let plan = chapter_spread(book, cursor, extent, settings);
         if plan.second == Some(index) {
             return cursor;
@@ -741,12 +749,12 @@ mod publisher_tests {
         let path = temporary.path().join("legacy-image-cache.epub");
         let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
         let options = zip::write::SimpleFileOptions::default();
-        let manifest = (0..7)
+        let manifest = (0..19)
             .map(|id| {
                 format!("<item id='p{id}' href='{id}.xhtml' media-type='application/xhtml+xml'/>")
             })
             .collect::<String>();
-        let spine = (0..7)
+        let spine = (0..19)
             .map(|id| format!("<itemref idref='p{id}'/>"))
             .collect::<String>();
         let mut files = vec![
@@ -754,7 +762,7 @@ mod publisher_tests {
             ("META-INF/container.xml".to_owned(), "<container xmlns='urn:oasis:names:tc:opendocument:xmlns:container'><rootfiles><rootfile full-path='package.opf'/></rootfiles></container>".to_owned()),
             ("package.opf".to_owned(), format!("<package xmlns='http://www.idpf.org/2007/opf' version='2.0' unique-identifier='id'><metadata xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:identifier id='id'>geometry-cache-fixture</dc:identifier><dc:title>Image pages</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>")),
         ];
-        for id in 0..7 {
+        for id in 0..19 {
             files.push((format!("{id}.xhtml"), "<html xmlns='http://www.w3.org/1999/xhtml'><body><img src='plate.jpeg' style='width:977px;height:1280px'/></body></html>".to_owned()));
         }
         for (name, contents) in files {
@@ -777,7 +785,7 @@ mod publisher_tests {
         // The global counter parses its own Book clone. Its derived metadata
         // must reach original stubs even when those chapters were never opened.
         let background = book.clone();
-        for index in 1..7 {
+        for index in 1..19 {
             assert!(is_image_chapter(&background.load_chapter(index).unwrap()));
         }
         assert!(!book.chapters[1].loaded);
@@ -802,6 +810,46 @@ mod publisher_tests {
         assert_eq!(
             chapter_spread(&book, 3, viewport, &settings).second,
             Some(4)
+        );
+
+        let cached =
+            crate::pagination::PageIndex::new_with_starts(vec![1; 19], vec![vec![None]; 19])
+                .unwrap()
+                .capture_geometry(&book);
+        let bytes = serde_json::to_vec(&cached).unwrap();
+        let cached: crate::pagination::PageIndex = serde_json::from_slice(&bytes).unwrap();
+        let mut cold = reader_core::open(&path).unwrap();
+        cold.cover = Some("plate.jpeg".into());
+        for index in 12..18 {
+            cold.ensure_chapter_loaded(index).unwrap();
+        }
+        cold.unload_chapters_except(&(12..18).collect::<Vec<_>>());
+        let parsed_before = cold.archive_stats().unwrap().chapters_parsed;
+        assert_eq!(
+            chapter_spread_start(&cold, 13, viewport, &settings),
+            13,
+            "a partial-classification cache miss preserves the requested source chapter"
+        );
+        assert!(!is_image_chapter(&cold.chapters[1]));
+        let legacy = crate::pagination::PageIndex::new(vec![1; 19]).unwrap();
+        assert!(
+            legacy.restore_geometry(&cold).is_err(),
+            "counts alone cannot establish spread parity"
+        );
+        let mut unknown = cached.clone();
+        unknown.geometry[1] = reader_core::PageGeometrySnapshot::Unknown;
+        assert!(unknown.restore_geometry(&cold).is_err());
+        assert!(!is_image_chapter(&cold.chapters[1]));
+        cached.restore_geometry(&cold).unwrap();
+        assert!(!cold.chapters[1].loaded);
+        assert!(is_image_chapter(&cold.chapters[1]));
+        assert_eq!(previous_chapter_spread(&cold, 13, viewport, &settings), 11);
+        assert_eq!(chapter_spread_start(&cold, 13, viewport, &settings), 13);
+        assert_eq!(chapter_spread_start(&cold, 14, viewport, &settings), 13);
+        assert_eq!(
+            cold.archive_stats().unwrap().chapters_parsed,
+            parsed_before,
+            "restoring a complete pagination cache never reparses the book"
         );
 
         let serialized = serde_json::to_value(&book.chapters[1]).unwrap();

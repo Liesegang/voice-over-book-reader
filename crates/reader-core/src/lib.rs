@@ -11,7 +11,10 @@ mod words;
 pub use document::*;
 pub use epub::{ArchiveLoadStats, EpubSource};
 pub use import::{open, parse_html};
-pub use page_document::{PageDocumentGeometry, PageGeometryCache, page_document_geometry};
+pub use page_document::{
+    PageDocumentGeometry, PageGeometryCache, PageGeometrySnapshot, page_document_geometry,
+    page_geometry_snapshot, restore_page_geometry,
+};
 pub use pdf::{PdfPageRef, pdfium_runtime_path, render_pdf_page};
 pub use words::{WordSpan, word_at};
 
