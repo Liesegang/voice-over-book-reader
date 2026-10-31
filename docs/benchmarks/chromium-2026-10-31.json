@@ -1,0 +1,361 @@
+{
+  "scope": "Local Windows application comparison, 3 fresh app-cache runs and 3 cached-index restarts per backend per fixture; descriptive measurements only",
+  "before_commit": "98d2c8dd9f126c0abceed4a651926dd492c9ef47",
+  "before_diagnostic_exe_sha256": "7976778b3b896f551cc388744f0b3a0ff8171a0d63a45094ce40afa44a5dff80",
+  "after_commit": "77428d52de21ed5fd830bfb1a9cfc0077c5bf57d",
+  "after_loaded_dll_sha256": "acdc2506176964da77a77ecb5e3d396c0cb31923324debd28f29509d4d5ac627",
+  "driver_sha256": "f086e47a6da974cd4539d20e1b215e91778aa890761ba34e3c03e7f73a4912a2",
+  "fixture_hashes": {
+    "single": {
+      "sha256": "9cb6d0c8adad3dfccd655d54596d341f84ad68c39f1e39af6da78ab10136611f"
+    },
+    "thirty": {
+      "sha256": "75772cbc647720b95acf4c53e8e6b7bde5f4a8b2a8eb000fd70309c7e80a8e91"
+    }
+  },
+  "clock": "external parent QPC immediately before Process.Start; full application/bootstrap loading included",
+  "cold_definition": "fresh settings-only database and no app pagination cache; OS filesystem/GPU caches are not flushed",
+  "warm_definition": "restart same backend/profile with its persisted pagination cache; position removed and identical settings restored; Chromium uses a new per-PID engine profile",
+  "endpoints": {
+    "first_book_readback_ms": "launch to input-ready book marker confirmed in actual GPU screenshot; includes readback/callback delivery",
+    "total_pages_ready_ms": "launch to UI observation of complete current-layout pagination index while book is ready",
+    "turn_median_ms": "30 separate native turn actions to first confirmed target-page GPU screenshot; next dispatch awaits host readiness",
+    "burst": "one five-notch enqueue through production FIFO; GPU readbacks must show pages 1,2,3,4,5 in order",
+    "memory": "maximum sampled sum of private bytes of root and observed descendants; excludes GPU VRAM"
+  },
+  "limitations": [
+    "not display-photon latency",
+    "three process repetitions are descriptive, not a statistical significance claim",
+    "page totals and source text per page can differ across layout engines",
+    "complete app configurations include their original toolchain/CRT differences; no isolated-renderer causality claim",
+    "no macOS/Linux performance conclusion"
+  ],
+  "quality": {
+    "runs": 24,
+    "all_timing_valid": true,
+    "single_runs": 12,
+    "all_single_overlay_pass": true,
+    "all_five_burst_frames_in_order": true,
+    "all_after_loaded_hashes_match": true,
+    "all_warm_cache_hashes_unchanged": true
+  },
+  "summary": {
+    "single/before/cold": {
+      "runs": 3,
+      "metrics": {
+        "first_book_readback_ms": {
+          "median": 989.9516,
+          "min": 974.4148,
+          "max": 1042.247
+        },
+        "total_pages_ready_ms": {
+          "median": 975.4662,
+          "min": 961.2124,
+          "max": 1043.3586
+        },
+        "turn_median_ms": {
+          "median": 65.11374999999975,
+          "min": 65.048,
+          "max": 65.35834999999997
+        },
+        "turn_p95_ms": {
+          "median": 131.17180000000008,
+          "min": 65.39820000000009,
+          "max": 148.11709999999994
+        },
+        "burst_ms": {
+          "median": 115.03849999999966,
+          "min": 114.90369999999984,
+          "max": 115.55360000000019
+        },
+        "sampled_private_peak_mib": {
+          "median": 441.734375,
+          "min": 440.99609375,
+          "max": 445.1875
+        },
+        "observed_cpu_ms": {
+          "median": 1406.25,
+          "min": 1328.125,
+          "max": 1703.125
+        },
+        "sample_interval_median_ms": {
+          "median": 204.61010000000002,
+          "min": 198.10014999999999,
+          "max": 205.62269999999995
+        }
+      }
+    },
+    "single/before/warm": {
+      "runs": 3,
+      "metrics": {
+        "first_book_readback_ms": {
+          "median": 980.0119,
+          "min": 952.3523,
+          "max": 1000.2595
+        },
+        "total_pages_ready_ms": {
+          "median": 966.1595,
+          "min": 937.5736,
+          "max": 984.7892
+        },
+        "turn_median_ms": {
+          "median": 65.14405,
+          "min": 65.03480000000002,
+          "max": 65.14985000000013
+        },
+        "turn_p95_ms": {
+          "median": 65.67070000000012,
+          "min": 65.55310000000009,
+          "max": 132.07839999999987
+        },
+        "burst_ms": {
+          "median": 116.56669999999986,
+          "min": 115.85269999999991,
+          "max": 116.82310000000007
+        },
+        "sampled_private_peak_mib": {
+          "median": 444.4921875,
+          "min": 440.80859375,
+          "max": 444.84375
+        },
+        "observed_cpu_ms": {
+          "median": 1453.125,
+          "min": 1421.875,
+          "max": 1562.5
+        },
+        "sample_interval_median_ms": {
+          "median": 196.31554999999997,
+          "min": 195.10235,
+          "max": 198.27350000000004
+        }
+      }
+    },
+    "single/after/cold": {
+      "runs": 3,
+      "metrics": {
+        "first_book_readback_ms": {
+          "median": 1932.2955,
+          "min": 1898.2128,
+          "max": 2160.2306
+        },
+        "total_pages_ready_ms": {
+          "median": 1878.8058,
+          "min": 1833.007,
+          "max": 2097.1729
+        },
+        "turn_median_ms": {
+          "median": 62.31485000000043,
+          "min": 48.35490000000004,
+          "max": 63.95174999999972
+        },
+        "turn_p95_ms": {
+          "median": 67.78550000000041,
+          "min": 49.28810000000021,
+          "max": 82.61180000000013
+        },
+        "burst_ms": {
+          "median": 251.47779999999966,
+          "min": 248.19669999999996,
+          "max": 330.47630000000026
+        },
+        "sampled_private_peak_mib": {
+          "median": 747.5390625,
+          "min": 739.66796875,
+          "max": 748.5234375
+        },
+        "observed_cpu_ms": {
+          "median": 5609.375,
+          "min": 5593.75,
+          "max": 6140.625
+        },
+        "sample_interval_median_ms": {
+          "median": 209.07970000000023,
+          "min": 205.3327999999999,
+          "max": 212.01529999999997
+        }
+      }
+    },
+    "single/after/warm": {
+      "runs": 3,
+      "metrics": {
+        "first_book_readback_ms": {
+          "median": 1876.3386,
+          "min": 1863.9243,
+          "max": 2076.0447
+        },
+        "total_pages_ready_ms": {
+          "median": 1812.2017,
+          "min": 1801.4533,
+          "max": 2011.5577
+        },
+        "turn_median_ms": {
+          "median": 62.76409999999987,
+          "min": 48.19854999999984,
+          "max": 64.44535000000019
+        },
+        "turn_p95_ms": {
+          "median": 67.24209999999994,
+          "min": 49.72589999999991,
+          "max": 101.61779999999999
+        },
+        "burst_ms": {
+          "median": 246.32490000000053,
+          "min": 244.83290000000034,
+          "max": 250.32030000000032
+        },
+        "sampled_private_peak_mib": {
+          "median": 746.42578125,
+          "min": 745.921875,
+          "max": 760.71875
+        },
+        "observed_cpu_ms": {
+          "median": 5906.25,
+          "min": 5687.5,
+          "max": 5937.5
+        },
+        "sample_interval_median_ms": {
+          "median": 201.75930000000017,
+          "min": 201.4431000000004,
+          "max": 203.19039999999995
+        }
+      }
+    },
+    "thirty/before/cold": {
+      "runs": 3,
+      "metrics": {
+        "first_book_readback_ms": {
+          "median": 937.9697,
+          "min": 903.6727,
+          "max": 981.2822
+        },
+        "total_pages_ready_ms": {
+          "median": 922.8553,
+          "min": 904.9215,
+          "max": 965.6432
+        },
+        "sampled_private_peak_mib": {
+          "median": 433.83203125,
+          "min": 381.9921875,
+          "max": 434.7265625
+        },
+        "observed_cpu_ms": {
+          "median": 968.75,
+          "min": 937.5,
+          "max": 1078.125
+        },
+        "sample_interval_median_ms": {
+          "median": 201.14260000000002,
+          "min": 194.66675,
+          "max": 202.6225
+        }
+      }
+    },
+    "thirty/before/warm": {
+      "runs": 3,
+      "metrics": {
+        "first_book_readback_ms": {
+          "median": 942.8636,
+          "min": 919.059,
+          "max": 975.3019
+        },
+        "total_pages_ready_ms": {
+          "median": 929.0632,
+          "min": 905.4405,
+          "max": 960.2858
+        },
+        "sampled_private_peak_mib": {
+          "median": 382.86328125,
+          "min": 366.18359375,
+          "max": 382.94921875
+        },
+        "observed_cpu_ms": {
+          "median": 984.375,
+          "min": 984.375,
+          "max": 1000.0
+        },
+        "sample_interval_median_ms": {
+          "median": 200.20820000000003,
+          "min": 195.92470000000003,
+          "max": 203.03620000000006
+        }
+      }
+    },
+    "thirty/after/cold": {
+      "runs": 3,
+      "metrics": {
+        "first_book_readback_ms": {
+          "median": 1633.2203,
+          "min": 1607.0288,
+          "max": 1702.8714
+        },
+        "total_pages_ready_ms": {
+          "median": 3329.2847,
+          "min": 3271.699,
+          "max": 3440.2411
+        },
+        "sampled_private_peak_mib": {
+          "median": 947.92578125,
+          "min": 946.2265625,
+          "max": 950.73828125
+        },
+        "observed_cpu_ms": {
+          "median": 6265.625,
+          "min": 6171.875,
+          "max": 6328.125
+        },
+        "sample_interval_median_ms": {
+          "median": 205.46704999999986,
+          "min": 204.45730000000003,
+          "max": 209.12849999999997
+        }
+      }
+    },
+    "thirty/after/warm": {
+      "runs": 3,
+      "metrics": {
+        "first_book_readback_ms": {
+          "median": 1625.0988,
+          "min": 1590.1854,
+          "max": 1740.4445
+        },
+        "total_pages_ready_ms": {
+          "median": 1560.0607,
+          "min": 1526.9724,
+          "max": 1675.6681
+        },
+        "sampled_private_peak_mib": {
+          "median": 629.171875,
+          "min": 612.1953125,
+          "max": 632.59765625
+        },
+        "observed_cpu_ms": {
+          "median": 3390.625,
+          "min": 3250.0,
+          "max": 3546.875
+        },
+        "sample_interval_median_ms": {
+          "median": 212.0457,
+          "min": 201.61964999999998,
+          "max": 216.37750000000005
+        }
+      }
+    }
+  },
+  "navigation_optimization_delta": {
+    "cold": {
+      "initial_chromium_burst_ms": 402.1328000000003,
+      "optimized_chromium_burst_ms": 251.47779999999966,
+      "reduction_percent": 37.46399199468448
+    },
+    "warm": {
+      "initial_chromium_burst_ms": 400.83030000000053,
+      "optimized_chromium_burst_ms": 246.32490000000053,
+      "reduction_percent": 38.54633744005875
+    },
+    "baseline_after_loaded_dll_sha256": "0e1a03b489b5f5657a3fd622a0ecd3fdb446dd59ba9f18c30f1b557b71283fb3",
+    "common_driver_sha256": "f086e47a6da974cd4539d20e1b215e91778aa890761ba34e3c03e7f73a4912a2",
+    "baseline_run_count": 24,
+    "baseline_after_commit": "753a54e94fd070ba921c60087bd1fffd42645852"
+  },
+  "interpretation": "Normal page-turn readbacks remain comparable. Navigation optimization shortens the Chromium five-page burst, but it still exceeds the previous native application. Startup, full pagination time, and sampled private memory remain higher. Cold p95 values vary substantially across three repetitions; do not treat their ratio as an isolated renderer improvement."
+}
