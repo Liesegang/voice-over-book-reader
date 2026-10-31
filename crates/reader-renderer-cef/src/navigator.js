@@ -1,14 +1,5 @@
 // Book DOM only; original UTF-8 source identities survive pagination.
 (() => {
-    const waitForFonts=async(doc,root,options,fixed,text)=>{
-        const family=typeof options.font_family==='string'?options.font_family.trim():'';
-        if(!fixed&&family&&typeof doc.fonts?.load==='function'){
-            const size=Number.isFinite(options.font_size)&&options.font_size>0?options.font_size:16;
-            try{await doc.fonts.load(`${size}px ${JSON.stringify(family)}`,text());}catch{}
-        }
-        // Retain author-font and fallback readiness after the selected face.
-        root.getBoundingClientRect();await doc.fonts?.ready;
-    };
     // Synchronous CEF evaluations poll this slot; no Promise crosses the IPC
     // boundary. Keep the Page acknowledgement until two rendering opportunities.
     const createPageReply=(view,dispatch,drain,state)=>{
@@ -176,8 +167,6 @@
     };
     const snapshotStarted=clock();
     const originalNodes=snapshotSourceNodes(doc?.documentElement);
-    let originalText;
-    const readerFontText=()=>originalText??=(originalNodes.filter(node=>node.parts).map(node=>node.text).join(''));
     const snapshotMs=clock()-snapshotStarted,fontChoiceStarted=clock();
     const fontChoice=globalThis.__vobrCreateFontChoice(view,originalNodes);
     const fontChoiceMs=clock()-fontChoiceStarted;
@@ -285,8 +274,8 @@
     };
     const ready = async (token,profile) => {
         let phaseStarted=profile?clock():0;
-        // Start the selected face before a full chapter layout requests it.
-        await waitForFonts(doc,root,options,fixed,readerFontText);
+        // Request used fonts before awaiting them.
+        root.getBoundingClientRect();await doc.fonts?.ready;
         if(profile){profile.fonts_ms=clock()-phaseStarted;phaseStarted=clock();}
         const images=[...doc.querySelectorAll('img')];if(profile)profile.images=images.length;
         await Promise.all(images.map(async image=>{
@@ -488,7 +477,7 @@
     };
     const drain=()=>queue.splice(0);
     const pageReply=createPageReply(view,dispatch,drain,()=>({serial,revision,ticket:turnTicket}));
-    const bridge={dispatch,drain,pageReply,testing:{toUtf16,toUtf8,byteLength,snapshotSourceNodes,originalNodes,metrics,exactIndex,monochromeMask,createPageReply,waitForFonts}};
+    const bridge={dispatch,drain,pageReply,testing:{toUtf16,toUtf8,byteLength,snapshotSourceNodes,originalNodes,metrics,exactIndex,monochromeMask,createPageReply}};
     Object.defineProperty(view,'__vobrBook',{value:bridge,configurable:true});
     view.addEventListener?.('resize',()=>{if(!options)return;confirmed=false;clearTimeout(resizeTimer);resizeTimer=setTimeout(()=>invalidate('viewport_changed'),50);});
     doc?.fonts?.addEventListener?.('loadingdone',()=>{if(options&&!applying)invalidate('fonts_changed');});
