@@ -67,5 +67,8 @@ Binding generation needs SDK headers. A used application bundle lacks them.
 
 CI runs builds and unit/fixture checks for Windows x64, Linux x64 and both Macs.
 Passing builds do not certify untested GPUs, GUIs, audio devices or TTS backends.
-Windows accelerated rendering needs a separate real-application check.
-Other platform runtime claims also require actual testing.
+Windows x64 was checked in the actual native application with accelerated CEF.
+See the [GUI validation scope](epub-support.md#windowsで確認した範囲).
+The initial integration also exercised SAPI speech highlights and page following.
+These checks do not certify full EPUB conformance or other speech backends.
+macOS and Linux GUI/audio operation remains untested on real devices.

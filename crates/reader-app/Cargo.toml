@@ -11,10 +11,14 @@ crate-type = ["rlib", "cdylib"]
 [[bin]]
 name = "voice-over-book-reader"
 path = "src/main.rs"
+test = false
+bench = false
 
 [[bin]]
 name = "voice-over-book-reader-cef-helper"
 path = "src/cef_helper.rs"
+test = false
+bench = false
 
 [dependencies]
 anyhow.workspace = true

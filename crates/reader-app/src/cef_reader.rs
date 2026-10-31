@@ -60,6 +60,7 @@ struct Pane {
     requested_page: usize,
     starts: Vec<Option<Locator>>,
     waiting_paint: Option<u64>,
+    page_flight: PageFlight,
     displayed: bool,
     awaiting_location: bool,
     loaded: bool,
@@ -71,6 +72,160 @@ struct Pane {
     captured_buttons: u8,
     cursor: egui::CursorIcon,
     auxiliary_location: Option<Locator>,
+}
+
+#[derive(Default)]
+struct PageFlight {
+    target: Option<(Revision, usize)>,
+    acknowledged: bool,
+    last_position: Option<(Revision, usize)>,
+    force_page_sync: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum PositionAck {
+    Stale,
+    Duplicate,
+    Fresh,
+}
+
+impl PageFlight {
+    fn begin(&mut self, revision: Revision, page: usize) {
+        self.target = Some((revision, page));
+        self.acknowledged = false;
+        self.last_position = None;
+        self.force_page_sync = false;
+    }
+
+    fn supersede(&mut self, revision: Revision, page: usize) -> bool {
+        if self.target.is_none_or(|target| target == (revision, page)) {
+            return false;
+        }
+        self.cancel();
+        // The old command may already have changed the renderer. Returning to
+        // the last host page still requires a new command and a fresh paint.
+        self.force_page_sync = true;
+        true
+    }
+
+    fn needs_page(&self, page: usize, requested_page: usize) -> bool {
+        self.target.is_none() && (self.force_page_sync || page != requested_page)
+    }
+
+    fn position(
+        &mut self,
+        revision: Revision,
+        page: usize,
+        requested_page: usize,
+        awaiting_location: bool,
+    ) -> PositionAck {
+        let position = (revision, page);
+        if (!awaiting_location && page != requested_page)
+            || self.target.is_some_and(|target| target != position)
+        {
+            return PositionAck::Stale;
+        }
+        if self.last_position == Some(position) {
+            return PositionAck::Duplicate;
+        }
+        self.last_position = Some(position);
+        self.acknowledged = true;
+        PositionAck::Fresh
+    }
+
+    fn awaiting_position(&self) -> bool {
+        self.target.is_some() && !self.acknowledged
+    }
+
+    fn finish_paint(&mut self, generation: u64, barrier: Option<u64>) -> bool {
+        if self.awaiting_position() || !barrier.is_some_and(|barrier| generation > barrier) {
+            return false;
+        }
+        self.target = None;
+        self.acknowledged = false;
+        true
+    }
+
+    fn cancel(&mut self) {
+        *self = Self::default();
+    }
+}
+
+impl Pane {
+    fn navigation_idle(&self) -> bool {
+        self.page_flight.target.is_none()
+            && !self.page_flight.force_page_sync
+            && !self.awaiting_location
+            && self.waiting_paint.is_none()
+    }
+
+    fn cancel_navigation(&mut self) {
+        self.page_flight.cancel();
+        self.waiting_paint = None;
+        self.awaiting_location = false;
+    }
+
+    fn set_requested_page(&mut self, page: usize) {
+        if self.page_flight.supersede(self.revision, page) {
+            self.waiting_paint = None;
+            self.awaiting_location = false;
+        }
+        self.requested_page = page;
+    }
+
+    fn configure_document(&mut self) -> Result<()> {
+        self.cancel_navigation();
+        self.ready = false;
+        if self.loaded {
+            self.surface.command(&BookCommand::Configure {
+                revision: self.revision,
+                chapter: self.chapter as u32,
+                nodes: Vec::new(),
+                options: Box::new(self.options.clone()),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn request_page(&mut self) -> Result<()> {
+        if !self.ready
+            || self.awaiting_location
+            || self.waiting_paint.is_some()
+            || !self.page_flight.needs_page(self.page, self.requested_page)
+        {
+            return Ok(());
+        }
+        self.surface.command(&BookCommand::Page {
+            revision: self.revision,
+            index: self.requested_page as u32,
+        })?;
+        self.page_flight.begin(self.revision, self.requested_page);
+        // A natural paint can arrive before Position. Keep the command in
+        // flight until its matching acknowledgement AND the post-ack paint.
+        self.waiting_paint = Some(self.surface.frame_sequence());
+        crate::latency::event("cef_page_sent", self.requested_page as u64);
+        Ok(())
+    }
+
+    fn locate(&mut self, location: Locator) -> Result<()> {
+        self.cancel_navigation();
+        self.awaiting_location = true;
+        self.surface.command(&BookCommand::Locate {
+            revision: self.revision,
+            location: to_source(location),
+        })?;
+        Ok(())
+    }
+
+    fn fragment(&mut self, fragment: String) -> Result<()> {
+        self.cancel_navigation();
+        self.awaiting_location = true;
+        self.surface.command(&BookCommand::Fragment {
+            revision: self.revision,
+            fragment,
+        })?;
+        Ok(())
+    }
 }
 
 fn auxiliary_regions(ui: &mut Ui) -> (Rect, egui::Response, Ui) {
@@ -151,7 +306,7 @@ impl CefReader {
                 .panes
                 .iter()
                 .flatten()
-                .all(|p| p.ready && p.waiting_paint.is_none() && p.displayed)
+                .all(|p| p.ready && p.navigation_idle() && p.displayed)
     }
     pub(super) fn mark_turn(&mut self) {
         self.turn_pending = true;
@@ -324,6 +479,7 @@ impl CefReader {
             requested_page: 0,
             starts: Vec::new(),
             waiting_paint: None,
+            page_flight: PageFlight::default(),
             displayed: false,
             awaiting_location: false,
             loaded: false,
@@ -351,12 +507,7 @@ impl CefReader {
                 {
                     pane.surface.install_navigator()?;
                     pane.loaded = true;
-                    pane.surface.command(&BookCommand::Configure {
-                        revision: pane.revision,
-                        chapter: pane.chapter as u32,
-                        nodes: Vec::new(),
-                        options: Box::new(pane.options.clone()),
-                    })?;
+                    pane.configure_document()?;
                 }
                 SurfaceEvent::Navigator(event) => {
                     let current = match &event {
@@ -382,26 +533,31 @@ impl CefReader {
                                 pane.starts.push(None);
                             }
                             pane.ready = true;
-                            if pane.requested_page > 0 {
-                                pane.surface.command(&BookCommand::Page {
-                                    revision: pane.revision,
-                                    index: pane.requested_page.min(pane.starts.len() - 1) as u32,
-                                })?;
-                            }
                         }
                         NavigatorEvent::Position { page, .. } => {
-                            pane.page = *page as usize;
-                            pane.waiting_paint = Some(pane.surface.request_repaint()?);
+                            let page = *page as usize;
+                            if !pane.ready {
+                                continue;
+                            }
+                            match pane.page_flight.position(
+                                pane.revision,
+                                page,
+                                pane.requested_page,
+                                pane.awaiting_location,
+                            ) {
+                                PositionAck::Stale => continue,
+                                PositionAck::Duplicate => {}
+                                PositionAck::Fresh => {
+                                    crate::latency::event("cef_page_position", page as u64);
+                                    pane.waiting_paint = Some(pane.surface.request_repaint()?);
+                                    crate::latency::event("cef_page_freshpaint_armed", page as u64);
+                                }
+                            }
+                            pane.page = page;
                         }
                         NavigatorEvent::Invalidated { .. } => {
-                            pane.ready = false;
                             pane.revision.0 += 1;
-                            pane.surface.command(&BookCommand::Configure {
-                                revision: pane.revision,
-                                chapter: pane.chapter as u32,
-                                nodes: Vec::new(),
-                                options: Box::new(pane.options.clone()),
-                            })?;
+                            pane.configure_document()?;
                         }
                         NavigatorEvent::Error { message, .. } => anyhow::bail!("{message}"),
                         _ => {}
@@ -453,8 +609,8 @@ impl CefReader {
                 ));
             }
             if pane
-                .waiting_paint
-                .is_some_and(|barrier| pane.surface.frame_sequence() > barrier)
+                .page_flight
+                .finish_paint(pane.surface.frame_sequence(), pane.waiting_paint)
             {
                 pane.waiting_paint = None;
             }
@@ -891,15 +1047,7 @@ impl ReaderApp {
                 if fixed_alignment != 0 {
                     pane.options.margins[if physical_slot == 0 { 1 } else { 3 }] = 0.;
                 }
-                pane.ready = false;
-                if pane.loaded {
-                    pane.surface.command(&BookCommand::Configure {
-                        revision: pane.revision,
-                        chapter: target as u32,
-                        nodes: Vec::new(),
-                        options: Box::new(pane.options.clone()),
-                    })?;
-                }
+                pane.configure_document()?;
             }
             let scale = ui.ctx().pixels_per_point();
             let pixels = [
@@ -910,8 +1058,12 @@ impl ReaderApp {
                 pane.surface.resize(pixels, scale)?;
                 pane.size = pixels;
                 pane.scale = scale;
+                // A DPI-only resize can keep the logical viewport unchanged,
+                // so it need not produce a DOM resize invalidation.
+                pane.revision.0 += 1;
+                pane.configure_document()?;
             }
-            pane.requested_page = target_page;
+            pane.set_requested_page(target_page);
             Self::poll_chromium_input(ui, target_rect, pane)?;
             let mut pane_events = Vec::new();
             CefReader::poll_pane(&reader.render, pane, &mut pane_events, true)?;
@@ -920,6 +1072,9 @@ impl ReaderApp {
             }
             for mut event in pane_events {
                 if slot > 0 && matches!(event, NavigatorEvent::Position { .. }) {
+                    // Only slot zero changes the book's native page, but a
+                    // Locate acknowledgement also settles the secondary pane.
+                    pane.awaiting_location = false;
                     continue;
                 }
                 match &mut event {
@@ -962,29 +1117,15 @@ impl ReaderApp {
                             .round() as usize;
                     }
                     if let Some(location) = self.pending_restore.take() {
-                        pane.awaiting_location = true;
                         events.retain(|event| !matches!(event, NavigatorEvent::Position { .. }));
-                        pane.surface.command(&BookCommand::Locate {
-                            revision: pane.revision,
-                            location: to_source(location),
-                        })?;
+                        pane.locate(location)?;
                     } else if let Some(fragment) = self.pending_fragment.take() {
-                        pane.awaiting_location = true;
                         events.retain(|event| !matches!(event, NavigatorEvent::Position { .. }));
-                        pane.surface.command(&BookCommand::Fragment {
-                            revision: pane.revision,
-                            fragment,
-                        })?;
+                        pane.fragment(fragment)?;
                     }
-                    pane.requested_page = self.page;
+                    pane.set_requested_page(self.page);
                 }
-                if pane.page != pane.requested_page && pane.waiting_paint.is_none() {
-                    pane.surface.command(&BookCommand::Page {
-                        revision: pane.revision,
-                        index: pane.requested_page as u32,
-                    })?;
-                    pane.waiting_paint = Some(pane.surface.frame_sequence());
-                }
+                pane.request_page()?;
             }
             if let Some(texture) = pane.texture
                 && (pane.displayed || (pane.ready && pane.waiting_paint.is_none()))
@@ -1026,10 +1167,7 @@ impl ReaderApp {
         }
         if reader.panes_ready()
             && reader.panes[0].as_ref().is_some_and(|pane| {
-                pane.page == self.page
-                    && pane.ready
-                    && pane.waiting_paint.is_none()
-                    && pane.displayed
+                pane.page == self.page && pane.ready && pane.navigation_idle() && pane.displayed
             })
         {
             reader.turn_pending = false;
@@ -1122,7 +1260,7 @@ impl ReaderApp {
             && self.pagination_error.is_none()
             && reader.panes[0]
                 .as_ref()
-                .is_some_and(|pane| pane.ready && pane.displayed && pane.waiting_paint.is_none())
+                .is_some_and(|pane| pane.ready && pane.displayed && pane.navigation_idle())
         {
             match reader.count(self, rect, p) {
                 Ok(Some(index)) => {
@@ -1188,11 +1326,7 @@ impl ReaderApp {
                     && let Some((start, _)) = self.spoken_range
                     && start.chapter as usize == pane.chapter
                 {
-                    pane.awaiting_location = true;
-                    pane.surface.command(&BookCommand::Locate {
-                        revision: pane.revision,
-                        location: to_source(start),
-                    })?;
+                    pane.locate(start)?;
                 }
             }
         }
@@ -1283,21 +1417,13 @@ impl ReaderApp {
                 .or(pane.auxiliary_location)
                 .or_else(|| pane.starts.get(pane.page).copied().flatten());
             pane.requested_page = 0;
-            pane.awaiting_location = false;
+            pane.cancel_navigation();
             pane.surface.resize(size, scale)?;
             pane.size = size;
             pane.scale = scale;
             pane.options = layout_options;
             pane.revision.0 += 1;
-            pane.ready = false;
-            if pane.loaded {
-                pane.surface.command(&BookCommand::Configure {
-                    revision: pane.revision,
-                    chapter: chapter.id,
-                    nodes: Vec::new(),
-                    options: Box::new(pane.options.clone()),
-                })?;
-            }
+            pane.configure_document()?;
         }
         Self::poll_chromium_input(ui, rect, pane)?;
         let mut events = Vec::new();
@@ -1308,7 +1434,7 @@ impl ReaderApp {
             // source position instead of applying a page number from the old layout.
             self.auxiliary_scroll_target = self.auxiliary_scroll_target.or(pane.auxiliary_location);
             pane.requested_page = 0;
-            pane.awaiting_location = false;
+            pane.cancel_navigation();
         }
         if response.hovered() {
             ui.ctx().set_cursor_icon(pane.cursor);
@@ -1317,12 +1443,8 @@ impl ReaderApp {
             && let Some(locator) = self.auxiliary_scroll_target.take()
         {
             pane.auxiliary_location = Some(locator);
-            pane.awaiting_location = true;
             events.retain(|event| !matches!(event, NavigatorEvent::Position { .. }));
-            pane.surface.command(&BookCommand::Locate {
-                revision: pane.revision,
-                location: to_source(locator),
-            })?;
+            pane.locate(locator)?;
         }
         for event in events {
             match event {
@@ -1424,23 +1546,18 @@ impl ReaderApp {
                 pane.turns.push_back(true);
             }
         }
-        if pane.ready && !pane.awaiting_location && pane.waiting_paint.is_none() {
+        if pane.ready && pane.navigation_idle() {
             if let Some(forward) = pane.turns.pop_front() {
-                pane.requested_page = if forward {
+                let page = if forward {
                     (pane.page + 1).min(pane.starts.len().saturating_sub(1))
                 } else {
                     pane.page.saturating_sub(1)
                 };
+                pane.set_requested_page(page);
             }
-            if pane.page != pane.requested_page {
-                pane.surface.command(&BookCommand::Page {
-                    revision: pane.revision,
-                    index: pane.requested_page as u32,
-                })?;
-                pane.waiting_paint = Some(pane.surface.frame_sequence());
-            }
+            pane.request_page()?;
         }
-        if !pane.ready || pane.waiting_paint.is_some() || !pane.turns.is_empty() {
+        if !pane.ready || !pane.navigation_idle() || !pane.turns.is_empty() {
             ui.ctx().request_repaint_after(Duration::from_millis(8));
         }
         Ok(())
@@ -1788,8 +1905,141 @@ impl Drop for CefReader {
 
 #[cfg(test)]
 mod auxiliary_tests {
-    use super::auxiliary_regions;
+    use super::{PageFlight, PositionAck, Revision, auxiliary_regions};
     use eframe::egui::{self, Id, Pos2, Rect, TextStyle, vec2};
+
+    #[test]
+    fn page_flight_waits_for_matching_position_and_a_post_ack_frame() {
+        let revision = Revision(7);
+        let mut flight = PageFlight::default();
+        flight.begin(revision, 2);
+        assert!(flight.awaiting_position());
+        assert!(!flight.finish_paint(20, Some(10)));
+        assert_eq!(flight.target, Some((revision, 2)));
+        assert_eq!(flight.position(revision, 0, 2, false), PositionAck::Stale);
+        assert_eq!(
+            flight.position(Revision(6), 2, 2, false),
+            PositionAck::Stale
+        );
+        assert!(flight.awaiting_position());
+        assert_eq!(flight.position(revision, 2, 2, false), PositionAck::Fresh);
+        assert!(!flight.awaiting_position());
+        assert_eq!(flight.target, Some((revision, 2)));
+        // The acknowledgement raises the barrier past natural paints that
+        // were already imported; equality never releases the next turn.
+        assert!(!flight.finish_paint(20, Some(20)));
+        assert_eq!(
+            flight.position(revision, 2, 2, false),
+            PositionAck::Duplicate
+        );
+        assert!(flight.finish_paint(21, Some(20)));
+        assert!(flight.target.is_none());
+        assert_eq!(
+            flight.position(revision, 2, 2, false),
+            PositionAck::Duplicate
+        );
+        // A delayed drain containing the initial page must not roll back the
+        // completed target or arm another paint while no Page is in flight.
+        assert_eq!(flight.position(revision, 0, 2, false), PositionAck::Stale);
+    }
+
+    #[test]
+    fn cancelled_page_flight_cannot_ack_a_new_revision_or_position_request() {
+        let mut flight = PageFlight::default();
+        flight.begin(Revision(7), 2);
+        flight.cancel();
+        flight.begin(Revision(8), 3);
+        assert_eq!(
+            flight.position(Revision(7), 2, 3, false),
+            PositionAck::Stale
+        );
+        assert_eq!(
+            flight.position(Revision(8), 3, 3, false),
+            PositionAck::Fresh
+        );
+        flight.cancel();
+        // Locate/Fragment cancel the numeric target, whose result page is not
+        // known until Position arrives. Even the same page needs a fresh paint.
+        assert_eq!(flight.position(Revision(8), 3, 0, true), PositionAck::Fresh);
+        assert_eq!(
+            flight.position(Revision(8), 3, 3, false),
+            PositionAck::Duplicate
+        );
+        assert!(flight.finish_paint(11, Some(10)));
+        flight.begin(Revision(8), 3);
+        assert_eq!(
+            flight.position(Revision(8), 3, 3, false),
+            PositionAck::Fresh
+        );
+        assert_eq!(
+            flight.position(Revision(8), 3, 3, false),
+            PositionAck::Duplicate
+        );
+    }
+
+    #[test]
+    fn five_page_flights_each_arm_exactly_one_paint_despite_duplicate_replies() {
+        let revision = Revision(4);
+        let mut flight = PageFlight::default();
+        let mut armed = Vec::new();
+        for page in 1..=5 {
+            flight.begin(revision, page);
+            let barrier = page as u64 * 10;
+            assert!(!flight.finish_paint(barrier, Some(barrier - 1)));
+            for _ in 0..3 {
+                if flight.position(revision, page, page, false) == PositionAck::Fresh {
+                    armed.push(page);
+                }
+            }
+            assert_eq!(flight.target, Some((revision, page)));
+            assert!(!flight.finish_paint(barrier, Some(barrier)));
+            assert!(flight.finish_paint(barrier + 1, Some(barrier)));
+            assert_eq!(
+                flight.position(revision, page, page, false),
+                PositionAck::Duplicate
+            );
+        }
+        assert_eq!(armed, [1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn main_and_auxiliary_reverse_to_the_host_page_still_send_a_superseding_page() {
+        for pane in ["main", "auxiliary"] {
+            let revision = Revision(9);
+            let mut flight = PageFlight::default();
+            assert_eq!(flight.position(revision, 0, 0, false), PositionAck::Fresh);
+            assert!(flight.finish_paint(2, Some(1)));
+            flight.begin(revision, 2);
+            // Host still says zero while Page 2 can already be executing.
+            assert!(flight.supersede(revision, 0), "{pane}");
+            assert!(flight.needs_page(0, 0), "{pane} must send Page 0");
+            assert_eq!(flight.position(revision, 2, 0, false), PositionAck::Stale);
+            flight.begin(revision, 0);
+            assert!(!flight.force_page_sync);
+            assert!(!flight.needs_page(0, 0));
+            assert!(!flight.finish_paint(10, Some(2)));
+            assert_eq!(flight.position(revision, 0, 0, false), PositionAck::Fresh);
+            assert_eq!(
+                flight.position(revision, 0, 0, false),
+                PositionAck::Duplicate
+            );
+            assert!(flight.finish_paint(11, Some(10)));
+            assert!(!flight.needs_page(0, 0));
+        }
+    }
+
+    #[test]
+    fn non_numeric_navigation_cancels_forced_page_resynchronization() {
+        for navigation in ["configure", "resize", "locate", "fragment"] {
+            let mut flight = PageFlight::default();
+            flight.begin(Revision(2), 2);
+            assert!(flight.supersede(Revision(2), 0));
+            assert!(flight.needs_page(0, 0));
+            flight.cancel();
+            assert!(!flight.force_page_sync, "{navigation}");
+            assert!(!flight.needs_page(0, 0), "{navigation}");
+        }
+    }
 
     #[test]
     fn auxiliary_window_does_not_expand_between_frames() {

@@ -80,7 +80,7 @@ def third_party_notices(metadata: dict) -> str:
         "Voice Over Book Reader — third-party notices", "",
         "This file records the dependency versions and license expressions resolved for this build.",
         "Available license and notice files from the published crate packages follow each entry.",
-        "The Rust workspace is licensed MIT; bundled font notices are in licenses/fonts.",
+        "The reader's original code is licensed MIT; bundled font notices are in licenses/fonts.",
         "Sonic's Apache-2.0 notice is included separately in licenses/Sonic-LICENSE.txt.", "",
         "Covered source, including MPL-2.0 dependencies: each entry below provides the exact",
         "published crate version's source archive. Download that archive to obtain its covered",

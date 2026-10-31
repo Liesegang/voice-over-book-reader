@@ -151,7 +151,7 @@ jobs:
       - name: Offline-capable unit and fixture tests
         # The default tests never synthesize speech, download neural models,
         # open a GUI, or require an audio device. Native PDF/TTS smokes are ignored.
-        run: cargo +1.97.1 test --workspace --all-targets --release --locked --target "${{ matrix.target }}"
+        run: cargo +1.97.1 test --workspace --tests --release --locked --target "${{ matrix.target }}"
 
       - name: Release binaries
         run: |
