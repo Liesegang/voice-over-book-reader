@@ -21,6 +21,7 @@ pub(crate) struct ChapterSpec {
     pub href: String,
     pub title: String,
     pub presentation: crate::PagePresentation,
+    pub geometry_cache: crate::PageGeometryCache,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

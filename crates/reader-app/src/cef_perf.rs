@@ -97,6 +97,7 @@ struct Capture {
     page: usize,
     callback_ms: f64,
     marker_matches: bool,
+    chapter_matches: bool,
     expected_rgb: [u8; 3],
     sampled_rgb: [u8; 3],
     matching_pixels: usize,
@@ -146,6 +147,7 @@ pub(crate) struct PerfDriver {
     rejected_captures: usize,
     marker_samples: Vec<Value>,
     count_only: bool,
+    chapter_turns: bool,
     burst_started_ms: Option<f64>,
     burst_completed_ms: Option<f64>,
     burst_chapter: usize,
@@ -195,6 +197,9 @@ impl PerfDriver {
             rejected_captures: 0,
             marker_samples: Vec::new(),
             count_only: args.iter().any(|argument| argument == "--perf-count-only"),
+            chapter_turns: args
+                .iter()
+                .any(|argument| argument == "--perf-chapter-turns"),
             burst_started_ms: None,
             burst_completed_ms: None,
             burst_chapter: 0,
@@ -248,8 +253,9 @@ impl PerfDriver {
             // The native toolbar legitimately covers the diagnostic marker.
             // The visible-chrome quality sample may cover it. Overlay hashes
             // are scored independently and never gate timing measurements.
-            let marker_valid = capture.marker_matches
-                || matches!(self.phase, Phase::OverlayOn | Phase::OverlayOff);
+            let marker_valid = capture.chapter_matches
+                && (capture.marker_matches
+                    || matches!(self.phase, Phase::OverlayOn | Phase::OverlayOff));
             let valid = marker_valid
                 && capture.image_size == physical_size
                 && capture.chapter == current_chapter
@@ -263,6 +269,7 @@ impl PerfDriver {
                     "expected_rgb":capture.expected_rgb, "sampled_rgb":capture.sampled_rgb,
                     "matching_pixels":capture.matching_pixels,
                     "marker_pixels_confirmed":capture.marker_matches,
+                    "chapter_pixels_confirmed":capture.chapter_matches,
                     "native_chrome_occluded_marker":self.phase==Phase::OverlayOn && !capture.marker_matches,
                     "image_size":capture.image_size,
                 }));
@@ -371,13 +378,18 @@ impl PerfDriver {
                     }
                 } else if ready {
                     if let Some(target) = self.sequence.pop_front() {
+                        let (chapter, target, forward) = if self.chapter_turns {
+                            (target, 0, target > current_chapter)
+                        } else {
+                            (current_chapter, target, target > current_page)
+                        };
                         self.pending_turn = Some(PendingTurn {
-                            chapter: current_chapter,
+                            chapter,
                             target,
                             dispatched_ms: self.clock.ms(),
                             dispatched_frame: ctx.cumulative_frame_nr(),
                         });
-                        return next_action(ctx, PerfAction::Turn(target > current_page));
+                        return next_action(ctx, PerfAction::Turn(forward));
                     }
                     if let Some(marker) = expected_marker {
                         if current_page != 0 {
@@ -405,8 +417,11 @@ impl PerfDriver {
                 }
                 if self.burst_observed == [1, 2, 3, 4, 5]
                     && ready
-                    && current_chapter == self.burst_chapter
-                    && current_page == 5
+                    && if self.chapter_turns {
+                        current_chapter == self.burst_chapter + 5 && current_page == 0
+                    } else {
+                        current_chapter == self.burst_chapter && current_page == 5
+                    }
                 {
                     self.finish(None);
                     return next_action(ctx, PerfAction::Close);
@@ -440,6 +455,7 @@ impl PerfDriver {
         let result = Arc::clone(&self.captured);
         let scale = ctx.pixels_per_point();
         let clock = self.clock;
+        let chapter_turns = self.chapter_turns;
         ctx.request_screenshot(move |image| {
             let (matches, sampled_rgb, matching_pixels) = sample_marker(&image, marker, scale);
             let capture = Capture {
@@ -447,6 +463,7 @@ impl PerfDriver {
                 page,
                 callback_ms: clock.ms(),
                 marker_matches: matches,
+                chapter_matches: !chapter_turns || sample_chapter_marker(&image) == Some(chapter),
                 expected_rgb: marker,
                 sampled_rgb,
                 matching_pixels,
@@ -474,13 +491,18 @@ impl PerfDriver {
         let requested_ms = clock.ms();
         let scale = ctx.pixels_per_point();
         let blue = self.burst_blue;
+        let chapter_turns = self.chapter_turns;
         ctx.request_screenshot(move |image| {
             let (_, sampled_rgb, _) = sample_marker(&image, [0; 3], scale);
             // Decode actual GPU pixels independently of the host page number.
-            let observed_page = (0..=5).find(|page| {
-                let expected = [16 + ((*page & 7) * 32) as u8, 16, blue];
-                sample_marker(&image, expected, scale).0
-            });
+            let observed_page = if chapter_turns {
+                sample_chapter_marker(&image)
+            } else {
+                (0..=5).find(|page| {
+                    let expected = [16 + ((*page & 7) * 32) as u8, 16, blue];
+                    sample_marker(&image, expected, scale).0
+                })
+            };
             let capture = BurstCapture {
                 ordinal,
                 frame,
@@ -513,7 +535,9 @@ impl PerfDriver {
         // requests in their native rendered-frame order instead.
         while let Some(capture) = self.burst_buffer.remove(&self.burst_next_result) {
             self.burst_next_result += 1;
-            if capture.chapter != self.burst_chapter || capture.size != size {
+            if (!self.chapter_turns && capture.chapter != self.burst_chapter)
+                || capture.size != size
+            {
                 return Err("Rapid-wheel fixture changed chapter or viewport");
             }
             self.burst_frames.push(json!({
@@ -552,8 +576,19 @@ impl PerfDriver {
             .take(5)
             .filter_map(|turn| turn["page"].as_u64())
             .collect();
-        let expected_order =
-            self.count_only || (self.turns.len() == 30 && first_five == [1, 2, 3, 4, 5]);
+        let first_five_chapters: Vec<_> = self
+            .turns
+            .iter()
+            .take(5)
+            .filter_map(|turn| turn["chapter"].as_u64())
+            .collect();
+        let expected_order = self.count_only
+            || (self.turns.len() == 30
+                && if self.chapter_turns {
+                    first_five_chapters == [1, 2, 3, 4, 5]
+                } else {
+                    first_five == [1, 2, 3, 4, 5]
+                });
         let overlay_stable = self.count_only
             || (self.overlay_checks.len() == 2
                 && self.overlay_checks.iter().all(|check| {
@@ -574,6 +609,8 @@ impl PerfDriver {
             "clock":self.clock.description(),
             "requested_backend":self.requested_backend,
             "count_only":self.count_only,
+            "chapter_boundary_fixture":self.chapter_turns,
+            "chapter_pixel_validation":"Opt-in chapter fixtures put a solid original color at viewport center; decode independently of host chapter number",
             "success":error.is_none() && expected_order && burst_valid && count_valid,
             "timing_valid":error.is_none() && expected_order && burst_valid && count_valid,
             "complete_index_observed":count_valid,
@@ -587,6 +624,7 @@ impl PerfDriver {
             "turn_median_ms":percentile(&values,0.5),
             "turn_p95_ms":percentile(&values,0.95),
             "first_five_pages":first_five,
+            "first_five_chapters":first_five_chapters,
             "all_requested_pages_read_back":expected_order,
             "overlay_book_pixels_stable":overlay_stable,
             "overlay_checks":self.overlay_checks,
@@ -621,6 +659,28 @@ impl PerfDriver {
             eprintln!("Performance report could not be written: {error}");
         }
     }
+}
+
+/// Original boundary fixtures use one distinct, opaque center color per chapter.
+/// Read pixels rather than trusting the host's already-updated chapter number.
+fn sample_chapter_marker(image: &egui::ColorImage) -> Option<usize> {
+    let [width, height] = image.size;
+    if width < 5 || height < 5 {
+        return None;
+    }
+    (0..=5).find(|chapter| {
+        let expected = [24 + *chapter as u8 * 32, 74, 181];
+        let mut matching = 0;
+        for y in height / 2 - 2..=height / 2 + 2 {
+            for x in width / 2 - 2..=width / 2 + 2 {
+                let actual = image[(x, y)].to_array();
+                if (0..3).all(|i| actual[i].abs_diff(expected[i]) <= 8) {
+                    matching += 1;
+                }
+            }
+        }
+        matching >= 9
+    })
 }
 
 fn next_action(ctx: &egui::Context, action: PerfAction) -> Option<PerfAction> {
@@ -743,6 +803,24 @@ fn percentile(values: &[f64], fraction: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn chapter_boundary_proof_uses_chapter_pixels_when_every_page_number_is_zero() {
+        for chapter in 0..=5 {
+            let image = egui::ColorImage::new(
+                [16, 16],
+                vec![egui::Color32::from_rgb(24 + chapter as u8 * 32, 74, 181); 256],
+            );
+            assert_eq!(sample_chapter_marker(&image), Some(chapter));
+            assert_ne!(sample_chapter_marker(&image), Some((chapter + 1) % 6));
+        }
+        assert_eq!(
+            sample_chapter_marker(&egui::ColorImage::new(
+                [16, 16],
+                vec![egui::Color32::WHITE; 256]
+            )),
+            None
+        );
+    }
     #[test]
     fn synthetic_actions_wake_the_host_instead_of_waiting_for_its_idle_timer() {
         let ctx = egui::Context::default();

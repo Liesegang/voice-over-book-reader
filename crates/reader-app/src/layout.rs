@@ -250,10 +250,8 @@ struct FixedImage<'a> {
 }
 
 fn fixed_image(chapter: &Chapter) -> Result<FixedImage<'_>, &'static str> {
-    let [width, height] = chapter
-        .presentation
-        .viewport
-        .filter(|size| size.iter().all(|value| value.is_finite() && *value > 0.))
+    let [width, height] = reader_core::page_document_geometry(chapter)
+        .and_then(|geometry| geometry.viewport)
         .ok_or("固定レイアウトのページ寸法を取得できません。")?;
     if chapter.blocks.iter().any(|block| {
         block.table.is_some() || block.mathml.is_some() || matches!(block.kind, BlockKind::Rule)
@@ -1933,10 +1931,7 @@ fn chapter_output<const EMIT: bool>(
     extent: Vec2,
     settings: &Settings,
 ) -> (BookLayout, Vec<Option<Locator>>) {
-    if !EMIT
-        && (chapter.fixed_page.is_some()
-            || chapter.presentation.layout == Some(reader_core::RenditionLayout::PrePaginated))
-    {
+    if !EMIT && reader_core::page_document_geometry(chapter).is_some() {
         return (BookLayout::default(), vec![chapter.start_locator()]);
     }
     fonts.begin_layout(&settings.font_family);
@@ -1991,7 +1986,7 @@ fn chapter_output<const EMIT: bool>(
         }
         return (BookLayout { pages: vec![page] }, Vec::new());
     }
-    if chapter.presentation.layout == Some(reader_core::RenditionLayout::PrePaginated) {
+    if reader_core::page_document_geometry(chapter).is_some() {
         return (epub_fixed_layout(chapter, extent), Vec::new());
     }
     let break_hints =
@@ -2419,6 +2414,23 @@ mod tests {
         assert_eq!(layout.pages.len(), 1);
         assert_eq!(layout.pages[0].pictures[0].rect.size(), vec2(24., 24.));
         assert!(layout.pages[0].pictures[0].fixed_canvas.is_none());
+    }
+
+    #[test]
+    fn legacy_single_image_css_geometry_is_one_centered_page_in_native_output_and_count() {
+        let chapter=reader_core::parse_html("<html><body><div><img src='plate.jpeg' class='plate' width='2480' height='3248' alt='Page'/></div></body></html>",0,"plate.xhtml",".plate{width:977px;height:1280px}").unwrap();
+        let extent = vec2(1280., 760.);
+        let settings = Settings::default();
+        let layout = chapter_layout(&mut FontSystem::new(), &chapter, extent, &settings);
+        assert_eq!(layout.pages.len(), 1);
+        let picture = &layout.pages[0].pictures[0];
+        assert!((picture.rect.center().x - extent.x / 2.).abs() < 0.01);
+        assert!((picture.rect.center().y - extent.y / 2.).abs() < 0.01);
+        assert_eq!(picture.fixed_canvas.unwrap().extent, vec2(977., 1280.));
+        assert_eq!(
+            chapter_page_starts(&mut FontSystem::new(), &chapter, extent, &settings),
+            vec![chapter.start_locator()]
+        );
     }
 
     #[test]

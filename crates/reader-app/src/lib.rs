@@ -19,6 +19,7 @@ mod settings;
 mod settings_controls;
 mod speech_profiles;
 mod speech_settings;
+mod speech_smoke;
 mod theme;
 
 pub fn run_native_shell() -> anyhow::Result<()> {

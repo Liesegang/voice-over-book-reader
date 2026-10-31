@@ -138,6 +138,7 @@
         if(element)walk(element);return out;
     };
     const originalNodes=snapshotSourceNodes(doc?.documentElement);
+    const fontChoice=globalThis.__vobrCreateFontChoice(view,originalNodes);
     const originalByDom=new WeakMap();
     for(const b of originalNodes){for(const part of b.parts??[{dom:b.dom,prefix:0}])originalByDom.set(part.dom,b);}
     let rootStyle=doc?.documentElement?.getAttribute('style')??null;
@@ -229,22 +230,47 @@
     };
     const position = () => emit({type:'position',chapter,page,pages,start:starts[page]??null,marker:marker()});
     const invalidate=reason=>{if(invalidationPending)return;confirmed=false;invalidationPending=true;emit({type:'invalidated',reason});};
-    const turn = index => {
+    const turn = (index, located=null) => {
         if(!confirmed)throw Error('Pagination is not confirmed for this revision');
         if (!Number.isInteger(index) || index<0 || index>=pages) throw Error('Page index outside confirmed pagination');
         page=index;
         if (!fixed) css(body,{'transform':`translate${vertical?'Y':'X'}(${(reverse?1:-1)*page*stride}px)`});
-        position();
+        if(located){marker();emit({type:'located',chapter,page,start:starts[page]??null,...located});}
+        else position();
     };
     const ready = async token => {
         // Request used fonts before awaiting them.
         root.getBoundingClientRect(); await doc.fonts?.ready;
         await Promise.all([...doc.querySelectorAll('img')].map(async image=>{
+            // Counters need intrinsic geometry, not decoded display bitmaps.
+            // Failed or incomplete images retain the existing error path.
+            if(options.pagination_only&&image.complete&&image.naturalWidth>0)return;
             try {if(image.decode)await image.decode();else if(!image.complete)await new Promise((resolve,reject)=>{image.addEventListener('load',resolve,{once:true});image.addEventListener('error',reject,{once:true});});}
             catch {fail(`Image could not be decoded: ${image.getAttribute('src')??''}`);}
         }));
         if(token!==serial)return;
         await adaptImages(token);if(token!==serial)return;
+        // Ruby fonts can extend beyond their first line's allocated block edge.
+        // Reserve only the measured overhang inside the existing page box;
+        // page turns and speech highlights never repeat this layout step.
+        if(!fixed&&options.show_ruby!==false){
+            const [top,right,bottom,left]=options.margins;
+            const edge=vertical?view.innerWidth-right:top;
+            const available=vertical?view.innerWidth-left-right:view.innerHeight-top-bottom;
+            let inset=0;
+            for(let attempt=0;attempt<2;attempt++){
+                let overhang=0;
+                for(const annotation of doc.querySelectorAll('ruby rt')){
+                    const range=doc.createRange();range.selectNodeContents(annotation);
+                    for(const rect of range.getClientRects())if(rect.width>0&&rect.height>0)overhang=Math.max(overhang,vertical?rect.right-edge:edge-rect.top);
+                }
+                if(overhang<=.5)break;
+                const next=Math.min(Math.ceil(inset+overhang),Math.max(0,available-1));
+                if(next<=inset)break;
+                inset=next;css(body,{'padding-block-start':`${inset}px`});
+                root.getBoundingClientRect();
+            }
+        }
         root.getBoundingClientRect();if(token!==serial)return;
         const content = fixed ? 1 : vertical ? body.scrollHeight : body.scrollWidth;
         pages=fixed?1:Math.max(1,Math.ceil(content/stride));page=0;buildStarts();
@@ -284,6 +310,7 @@
         if(!fixed&&options.foreground)palette.push(`:where(body,body *):not(svg,svg *){color:${rgb(options.foreground)}!important}body :where(p,div,span,li,blockquote,td,th){background-color:transparent!important}`);
         const color=options.highlight_color??[43,112,235];
         style.textContent=`${options.default_css?`@layer vobr-default{${options.default_css}}`:''}html,body{${declarations.map(d=>d+'!important').join(';')}} rt{${!fixed&&options.ruby_scale?`font-size:${options.ruby_scale}em!important;`:''}}${!fixed&&options.show_ruby===false?'rt,rp,rtc{display:none!important}':''} ::highlight(vobr-speech){background:rgba(${color.join(',')},.33);color:inherit}::highlight(vobr-annotations){background:rgba(${color.join(',')},.2);text-decoration:underline;color:inherit}${palette.join('')}`;
+        fontChoice.apply(options.font_family,fixed,el=>nativeStyles.set(el,el.getAttribute('style')));
         if(fixed){
             const [w,h]=options.fixed_viewport??[view.innerWidth,view.innerHeight];
             if(!(w>0&&h>0&&Number.isFinite(w)&&Number.isFinite(h)))throw Error('Fixed layout requires a positive author viewport');
@@ -360,9 +387,22 @@
             switch(command.type){
                 case 'page':turn(command.index);break;
                 case 'locate':{
-                    const loc=command.location,b=byId.get(loc.node);if(loc.chapter!==chapter||!b)throw Error('Unmapped source locator');
-                    const r=doc.createRange();if(b.parts){const m=metrics(b),index=exactIndex(m.bytes,loc.offset);r.setStart(...resolveOffset(b,loc.offset));r.setEnd(...resolveOffset(b,m.bytes[Math.min(index+1,m.bytes.length-1)],true));}else r.selectNode(b.dom);
-                    const box=r.getClientRects()[0];if(box)turn(pageOfRect(box));break;
+                    const loc=command.location,request_id=command.request_id??0;
+                    let target=null,reason=null;
+                    try{
+                        const b=byId.get(loc.node);
+                        if(loc.chapter!==chapter||!b)throw Error('Unmapped source locator');
+                        const r=doc.createRange();
+                        if(b.parts){const m=metrics(b),index=exactIndex(m.bytes,loc.offset);r.setStart(...resolveOffset(b,loc.offset));r.setEnd(...resolveOffset(b,m.bytes[Math.min(index+1,m.bytes.length-1)],true));}
+                        else r.selectNode(b.dom);
+                        const box=[...r.getClientRects()].find(r=>r.width>0&&r.height>0);
+                        if(!box)throw Error('Source locator has no visible geometry');
+                        target=pageOfRect(box);
+                    }catch(error){reason=String(error?.message??error);}
+                    const fallback=Number.isInteger(command.fallback_page)?command.fallback_page:page;
+                    const step=command.page_step===2?2:1;
+                    const resolved=target??Math.max(0,Math.min(pages-1,fallback));
+                    turn(Math.floor(resolved/step)*step,{request_id,location:loc,found:target!==null,reason});break;
                 }
                 case 'fragment':fragment(command.fragment);break;
                 case 'hit_test':emit({type:'hit',location:hit(command.x,command.y)});break;

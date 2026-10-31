@@ -3,6 +3,192 @@ use reader_library::BookSource;
 use tempfile::TempDir;
 
 #[test]
+fn two_prose_panes_follow_only_the_primary_document_without_duplicating_the_page() {
+    let mut fixture = TestApp::new();
+    fixture.reading_fixture();
+    fixture.app.settings.spread = reader_library::SpreadMode::Double;
+    fixture.app.settings.text_spread = true;
+    fixture.app.settings.tts.auto_follow = true;
+    fixture.app.follow_playback = true;
+    let hit = fixture.app.layout.pages[1].hits.first().unwrap().clone();
+    fixture.app.spoken_range = Some((hit.locator, hit.end));
+    for mode in [
+        reader_library::ReadingMode::Horizontal,
+        reader_library::ReadingMode::Vertical,
+    ] {
+        fixture.app.settings.reading_mode = mode;
+        let plan = crate::reading_surface::chapter_spread(
+            &fixture.app.book,
+            0,
+            vec2(1280., 760.),
+            &fixture.app.settings,
+        );
+        assert_eq!(plan.columns, 2);
+        assert!(
+            plan.second.is_none(),
+            "both panes show different pages of this prose chapter"
+        );
+        assert!(!crate::reading_surface::is_image_chapter(
+            &fixture.app.book.chapters[0]
+        ));
+        assert_eq!(fixture.app.chromium_follow_target(0, 0), Some(hit.locator));
+        assert_eq!(
+            fixture.app.chromium_follow_target(1, 0),
+            None,
+            "locating both copies of one chapter would show the same page twice"
+        );
+        assert_eq!(fixture.app.chromium_follow_target(0, 1), None);
+    }
+    fixture.app.follow_playback = false;
+    assert_eq!(fixture.app.chromium_follow_target(0, 0), None);
+    fixture.app.follow_playback = true;
+    fixture.app.settings.tts.auto_follow = false;
+    assert_eq!(fixture.app.chromium_follow_target(0, 0), None);
+    assert!(fixture.app.speech.is_none());
+}
+
+#[test]
+fn retargeted_document_rejects_old_chapter_and_revision_navigation_events() {
+    use reader_renderer_cef::{NavigatorEvent, Revision};
+    for kind in ["located", "position", "pagination"] {
+        let mut payload = serde_json::json!({
+            "type":kind,"revision":12,"chapter":0,"page":1,"pages":3,"start":null,
+            "request_id":31,"location":{"chapter":0,"node":8,"offset":3},
+            "found":true,"reason":null,"page_starts":[null,null,null],
+            "ready":{"fonts":true,"images":true},"writing_mode":"vertical-rl"
+        });
+        let old: NavigatorEvent = serde_json::from_value(payload.clone()).unwrap();
+        assert!(!cef_reader::navigator_event_is_current(
+            &old,
+            Revision(13),
+            1
+        ));
+        assert!(
+            !cef_reader::navigator_event_is_current(&old, Revision(12), 1),
+            "same-revision {kind} from a previous chapter must not move the reused pane"
+        );
+        payload["chapter"] = 1.into();
+        payload["location"]["chapter"] = 1.into();
+        let current: NavigatorEvent = serde_json::from_value(payload).unwrap();
+        assert!(cef_reader::navigator_event_is_current(
+            &current,
+            Revision(12),
+            1
+        ));
+    }
+    let error: NavigatorEvent = serde_json::from_value(serde_json::json!({
+        "type":"error","revision":12,"message":"Invalid fixed page viewport"
+    }))
+    .unwrap();
+    assert!(!cef_reader::navigator_event_is_current(
+        &error,
+        Revision(13),
+        1
+    ));
+    assert!(
+        cef_reader::navigator_event_is_current(&error, Revision(12), 1),
+        "current real renderer errors must not be hidden by stale-event filtering"
+    );
+}
+
+#[test]
+fn chromium_speech_boundaries_leave_page_authority_to_the_dom() {
+    let mut fixture = TestApp::new();
+    fixture.reading_fixture();
+    fixture.app.follow_playback = true;
+    fixture.app.settings.tts.auto_follow = true;
+    fixture.app.page = 0;
+    let boundaries = fixture
+        .app
+        .layout
+        .pages
+        .iter()
+        .enumerate()
+        .skip(2)
+        .take(4)
+        .map(|(page, content)| (page, content.hits.first().unwrap().clone()))
+        .collect::<Vec<_>>();
+    assert!(boundaries.len() >= 3);
+    // A native hit/page number is not an acknowledgement from the Chromium
+    // document, even when that sparse compatibility anchor matches the word.
+    for (_, hit) in &boundaries {
+        fixture.app.apply_spoken_range(hit.locator, hit.end, true);
+        assert_eq!(
+            fixture.app.page, 0,
+            "speech must not overwrite the last DOM-confirmed page"
+        );
+        assert_eq!(fixture.app.resume_locator, Some(hit.locator));
+        assert_eq!(fixture.app.spoken_range, Some((hit.locator, hit.end)));
+    }
+    let (native_page, hit) = boundaries.last().unwrap();
+    fixture.app.apply_spoken_range(hit.locator, hit.end, false);
+    assert_eq!(
+        fixture.app.page, *native_page,
+        "the native fallback keeps its own hit-based follow behavior"
+    );
+    assert!(fixture.app.speech.is_none());
+}
+
+#[test]
+fn spoken_chapter_transition_keeps_the_latest_source_until_the_dom_is_ready() {
+    let mut fixture = TestApp::new();
+    fixture.reading_fixture();
+    let chapter = reader_core::parse_html(
+        "<html><body><p>次の章を読み続けます。</p></body></html>",
+        1,
+        "next.xhtml",
+        "Next",
+    )
+    .unwrap();
+    let atoms = chapter.atoms();
+    let first = atoms[0].locator_at(0).unwrap();
+    let next = atoms[0].locator_at(3).unwrap();
+    let end = atoms[0].locator_at(6).unwrap();
+    fixture.app.book.chapters.push(chapter);
+    fixture.app.follow_playback = true;
+    fixture.app.settings.tts.auto_follow = true;
+    fixture.app.apply_spoken_range(first, next, true);
+    assert_eq!((fixture.app.chapter, fixture.app.page), (1, 0));
+    assert!(fixture.app.layout.pages.is_empty());
+    assert_eq!(fixture.app.pending_restore, Some(first));
+    fixture.app.apply_spoken_range(next, end, true);
+    assert_eq!(
+        fixture.app.pending_restore,
+        Some(next),
+        "loading a chapter must not retain an obsolete spoken word"
+    );
+    assert_eq!(fixture.app.resume_locator, Some(next));
+    assert_eq!(fixture.app.spoken_range, Some((next, end)));
+    assert!(fixture.app.speech.is_none());
+}
+
+#[test]
+fn disabled_speech_follow_does_not_change_the_readers_chapter_or_page() {
+    let mut fixture = TestApp::new();
+    fixture.reading_fixture();
+    let chapter = reader_core::parse_html(
+        "<html><body><p>別の章です。</p></body></html>",
+        1,
+        "other.xhtml",
+        "Other",
+    )
+    .unwrap();
+    let atoms = chapter.atoms();
+    let start = atoms[0].locator_at(0).unwrap();
+    let end = atoms[0].locator_at(3).unwrap();
+    fixture.app.book.chapters.push(chapter);
+    let position = (fixture.app.chapter, fixture.app.page);
+    for (auto, following) in [(false, true), (true, false)] {
+        fixture.app.settings.tts.auto_follow = auto;
+        fixture.app.follow_playback = following;
+        fixture.app.apply_spoken_range(start, end, true);
+        assert_eq!((fixture.app.chapter, fixture.app.page), position);
+        assert_eq!(fixture.app.resume_locator, Some(start));
+        assert!(fixture.app.pending_restore.is_none());
+    }
+}
+
+#[test]
 fn composed_reader_pages_reuse_idle_geometry_and_invalidate_on_navigation_and_resize() {
     let mut fixture = TestApp::new();
     let chapter = reader_core::parse_html(
@@ -273,13 +459,17 @@ impl TestApp {
                 "",
             ).unwrap())
             .collect();
+        for chapter in &mut chapters {
+            chapter.presentation.layout = Some(reader_core::RenditionLayout::PrePaginated);
+            chapter.presentation.viewport = Some([600., 900.]);
+        }
         let first = chapters.remove(0);
         self.use_chapter(first);
         self.app.book.chapters.extend(chapters);
         for index in 0..count {
             self.app.book.resources.insert(
                 format!("plate-{index}.svg"),
-                b"<svg xmlns='http://www.w3.org/2000/svg' width='40' height='60'><rect width='40' height='60' fill='#2583eb'/></svg>".to_vec(),
+                b"<svg xmlns='http://www.w3.org/2000/svg' width='600' height='900'><rect width='600' height='900' fill='#2583eb'/></svg>".to_vec(),
             );
         }
         self.app.book.page_progression = reader_core::PageProgression::Rtl;

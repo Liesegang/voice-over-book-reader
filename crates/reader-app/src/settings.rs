@@ -94,7 +94,10 @@ impl ReaderApp {
                 all.max - vec2(24., 20.),
             );
             region(ui, "settings-dialog-content", body, |ui| {
-                if self.setting_tab == SettingTab::Appearance {
+                if matches!(
+                    self.setting_tab,
+                    SettingTab::Appearance | SettingTab::Reading
+                ) {
                     self.appearance_settings(ui, p);
                 } else {
                     if self.setting_tab == SettingTab::Keys {
@@ -125,7 +128,8 @@ impl ReaderApp {
     }
 
     fn appearance_settings(&mut self, ui: &mut Ui, p: Palette) {
-        controls::heading(ui, "外観", "", p);
+        let reading = self.setting_tab == SettingTab::Reading;
+        controls::heading(ui, if reading { "読書" } else { "外観" }, "", p);
         let area = ui.available_rect_before_wrap();
         let wide = area.width() >= 760.;
         let preview_width = if wide {
@@ -143,7 +147,7 @@ impl ReaderApp {
         };
         region(ui, "appearance-controls", form, |ui| {
             egui::ScrollArea::vertical()
-                .id_salt("appearance-controls-scroll")
+                .id_salt(("appearance-controls-scroll", reading))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if !wide {
@@ -152,7 +156,11 @@ impl ReaderApp {
                             .show(ui, |ui| self.appearance_preview(ui, p));
                         ui.add_space(8.);
                     }
-                    self.appearance_form(ui, p);
+                    if reading {
+                        self.reading_settings(ui, p);
+                    } else {
+                        self.appearance_form(ui, p);
+                    }
                 });
         });
         if wide {
@@ -258,6 +266,19 @@ impl ReaderApp {
             ui.color_edit_button_srgb(&mut self.settings.accent);
             ui.label(RichText::new("カスタム").size(12.).color(p.muted));
         });
+        ui.add_space(14.);
+        if ui
+            .add_sized([176., 34.], egui::Button::new("外観を初期値に戻す"))
+            .clicked()
+        {
+            let defaults = reader_library::Settings::default();
+            self.settings.set_theme(defaults.theme);
+            self.settings.accent = defaults.accent;
+            self.settings.adapt_monochrome_images = defaults.adapt_monochrome_images;
+        }
+    }
+
+    fn reading_typography(&mut self, ui: &mut Ui, p: Palette) {
         controls::section(ui, "文字組み", p);
         controls::row(ui, "書体", |ui, label_id| {
             let selected = self.settings.font_family.clone();
@@ -317,9 +338,9 @@ impl ReaderApp {
         if controls::slider_row(ui, "左右", &mut horizontal, 0.0..=160.0, 0, " px").changed() {
             self.settings.margin_horizontal = Some(horizontal);
         }
-        let image_pages = reading_surface::is_image_chapter(&self.settings_preview_source().0);
-        let mut gap = self.settings.spread_gap(image_pages);
-        if controls::slider_row(ui, "ページ間", &mut gap, 0.0..=120.0, 0, " px").changed() {
+        let mut gap = self.settings.spread_gap(false);
+        if controls::slider_row(ui, "文章のページ間", &mut gap, 0.0..=120.0, 0, " px").changed()
+        {
             self.settings.page_gap = Some(gap);
         }
         controls::section(ui, "ルビ", p);
@@ -334,27 +355,6 @@ impl ReaderApp {
                 "",
             );
         });
-        ui.add_space(14.);
-        if ui
-            .add_sized([176., 34.], egui::Button::new("外観を初期値に戻す"))
-            .clicked()
-        {
-            let defaults = reader_library::Settings::default();
-            self.settings.set_theme(defaults.theme);
-            self.settings.accent = defaults.accent;
-            self.settings.font_family = defaults.font_family;
-            self.settings.font_size = defaults.font_size;
-            self.settings.line_spacing = defaults.line_spacing;
-            self.settings.letter_spacing = defaults.letter_spacing;
-            self.settings.margins = defaults.margins;
-            self.settings.margin_horizontal = defaults.margin_horizontal;
-            self.settings.margin_vertical = defaults.margin_vertical;
-            self.settings.page_gap = defaults.page_gap;
-            self.settings.show_ruby = defaults.show_ruby;
-            self.settings.adapt_monochrome_images = defaults.adapt_monochrome_images;
-            self.settings.ruby_scale = defaults.ruby_scale;
-            self.font_query.clear();
-        }
     }
 
     fn appearance_preview(&mut self, ui: &mut Ui, p: Palette) {
@@ -543,7 +543,7 @@ impl ReaderApp {
     }
 
     fn reading_settings(&mut self, ui: &mut Ui, p: Palette) {
-        controls::heading(ui, "読書", "", p);
+        self.reading_typography(ui, p);
         controls::section(ui, "文字の方向", p);
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(
@@ -578,14 +578,6 @@ impl ReaderApp {
             &mut self.settings.text_spread,
             "指定がない本文を2ページに分けて表示",
         );
-        controls::slider_row(
-            ui,
-            "スクロール量",
-            &mut self.settings.scroll_speed,
-            0.5..=4.0,
-            2,
-            " ×",
-        );
         ui.add_space(16.);
         ui.separator();
         ui.add_space(12.);
@@ -594,6 +586,28 @@ impl ReaderApp {
             &mut self.settings.tts.auto_follow,
             "読み上げている位置を自動で表示する",
         );
+        ui.add_space(14.);
+        if ui
+            .add_sized([208., 34.], egui::Button::new("読書設定を初期値に戻す"))
+            .clicked()
+        {
+            let defaults = reader_library::Settings::default();
+            self.settings.font_family = defaults.font_family;
+            self.settings.font_size = defaults.font_size;
+            self.settings.line_spacing = defaults.line_spacing;
+            self.settings.letter_spacing = defaults.letter_spacing;
+            self.settings.margins = defaults.margins;
+            self.settings.margin_horizontal = defaults.margin_horizontal;
+            self.settings.margin_vertical = defaults.margin_vertical;
+            self.settings.page_gap = defaults.page_gap;
+            self.settings.show_ruby = defaults.show_ruby;
+            self.settings.ruby_scale = defaults.ruby_scale;
+            self.settings.reading_mode = defaults.reading_mode;
+            self.settings.spread = defaults.spread;
+            self.settings.text_spread = defaults.text_spread;
+            self.settings.tts.auto_follow = defaults.tts.auto_follow;
+            self.font_query.clear();
+        }
     }
 
     fn dictionary_settings(&mut self, ui: &mut Ui, p: Palette) {
@@ -752,6 +766,15 @@ impl ReaderApp {
 
     fn library_settings(&mut self, ui: &mut Ui, p: Palette) {
         controls::heading(ui, "本棚・Calibre", "", p);
+        controls::section(ui, "表示", p);
+        controls::slider_row(
+            ui,
+            "スクロール量",
+            &mut self.settings.scroll_speed,
+            0.5..=4.0,
+            2,
+            " ×",
+        );
         controls::section(ui, "Calibreライブラリ", p);
         let path = self
             .settings

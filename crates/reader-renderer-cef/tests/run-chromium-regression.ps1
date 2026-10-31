@@ -1,10 +1,27 @@
 param([Parameter(Mandatory=$true)][string]$Bundle,[Parameter(Mandatory=$true)][string]$Work,[ValidateSet('general','images','fixed')][string]$Suite='general')
 $ErrorActionPreference='Stop'
 $testRoot=$PSScriptRoot
+# Image recoloring and its iframe counter require one origin for canvas and
+# source access. Reuse the CSP-protected HTTP runner, never file:// exceptions.
+if($Suite -eq 'images' -and !$env:VOBR_NAV_FIXTURE_URL){
+    & node (Join-Path $testRoot 'run-chromium-regression.mjs') --bundle $Bundle --work $Work --suite $Suite
+    if($LASTEXITCODE -ne 0){throw 'Chromium image regression failed; see chromium.log'}
+    return
+}
 New-Item -ItemType Directory -Path $Work -Force | Out-Null
 $fixture=Join-Path $Work 'source.xhtml'
 $paragraph='<p>窓の外で、朝の風が<ruby>木立<rt>こだち</rt></ruby>を揺らしていた。「ここから先へ、歩いてみよう。」日本語の縦書きとルビ、閉じ括弧と句読点が自然に並ぶ。まだ誰も知らない道が続いている。</p>'
-$xml='<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Source regression</title><style>body{writing-mode:vertical-rl;font-family:"Yu Mincho",serif;font-size:24px;line-height:1.6}p{margin:0 0 0 1em;text-indent:1em}rt{font-size:.5em}</style></head><body><h1>原文のまま読む</h1><p>前<![CDATA[😀]]>後</p>'+($paragraph*180)+'</body></html>'
+$fixtures=Join-Path $testRoot 'fixtures'
+$xml=switch($Suite){
+    'images'{
+        foreach($resource in @('glyph.svg','colored.svg','gradient.svg')){
+            Copy-Item -LiteralPath (Join-Path $fixtures $resource) -Destination (Join-Path $Work $resource) -Force
+        }
+        [IO.File]::ReadAllText((Join-Path $fixtures 'text-images.xhtml')).Replace('<!-- prose -->',$paragraph*180)
+    }
+    'fixed'{[IO.File]::ReadAllText((Join-Path $fixtures 'fixed-page.xhtml'))}
+    default{'<?xml version="1.0" encoding="utf-8"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Source regression</title><style>body{writing-mode:vertical-rl;font-family:"Yu Mincho",serif;font-size:24px;line-height:1.6}p{margin:0 0 0 1em;text-indent:1em}rt{font-size:.5em}</style></head><body><h1>原文のまま読む</h1><p>前<![CDATA[😀]]>後</p>'+($paragraph*180)+'</body></html>'}
+}
 [IO.File]::WriteAllText($fixture,$xml,[Text.UTF8Encoding]::new($false))
 function Format-FixtureScript([string]$Source) {
     # Our fixture sources have no multiline string indentation. Keep newlines
@@ -13,8 +30,10 @@ function Format-FixtureScript([string]$Source) {
     return (($Source -split "\r?\n" | Where-Object { $_ -notmatch '^\s*//' } | ForEach-Object { $_.TrimStart() }) -join "`n")
 }
 $navigatorPath=Join-Path $testRoot '../src/navigator.js'
+$fontChoicePath=Join-Path $testRoot '../src/font_choice.js'
 $regressionPath=Join-Path $testRoot $(switch($Suite){'images'{'gaiji-regression.js'}'fixed'{'fixed-regression.js'}default{'chromium-regression.js'}})
-$navigator=Format-FixtureScript ([IO.File]::ReadAllText($navigatorPath))
+$navigatorSource=[IO.File]::ReadAllText($fontChoicePath)+"`n"+[IO.File]::ReadAllText($navigatorPath)
+$navigator=Format-FixtureScript $navigatorSource
 $regression=Format-FixtureScript ([IO.File]::ReadAllText($regressionPath))
 $script="(()=>{$navigator`n$regression`nreturn 'started';})()"
 if($script.Length -ge 32000){
@@ -23,7 +42,9 @@ if($script.Length -ge 32000){
     if(!$minifier -or ![IO.File]::Exists($minifier)){throw 'Large fixture requires esbuild 0.25.12; set VOBR_ESBUILD to its executable. Production navigator is not minified.'}
     if((& $minifier --version) -ne '0.25.12'){throw 'Fixture minifier must be esbuild 0.25.12'}
     $navCompact=Join-Path $Work 'navigator.min.js';$testCompact=Join-Path $Work 'regression.min.js'
-    & $minifier $navigatorPath --minify --charset=utf8 "--outfile=$navCompact"
+    $navFull=Join-Path $Work 'navigator.full.js'
+    [IO.File]::WriteAllText($navFull,$navigatorSource,[Text.UTF8Encoding]::new($false))
+    & $minifier $navFull --minify --charset=utf8 "--outfile=$navCompact"
     if($LASTEXITCODE -ne 0){throw 'Navigator test minification failed'}
     & $minifier $regressionPath --minify --charset=utf8 "--outfile=$testCompact"
     if($LASTEXITCODE -ne 0){throw 'Regression test minification failed'}

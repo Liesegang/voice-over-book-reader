@@ -218,6 +218,7 @@ fn chapter_narration(
 pub struct ReaderApp {
     cef_reader: Option<cef_reader::CefReader>,
     perf_driver: Option<crate::cef_perf::PerfDriver>,
+    speech_smoke: Option<crate::speech_smoke::Driver>,
     first_book_frame: Option<crate::latency::Pending>,
     page_count_ready: Option<crate::latency::Pending>,
     pagination_index: Option<crate::pagination::PageIndex>,
@@ -383,6 +384,7 @@ impl ReaderApp {
         .cloned()
     }
     pub fn new(cc: &eframe::CreationContext<'_>, args: &[String]) -> anyhow::Result<Self> {
+        let speech_smoke = crate::speech_smoke::Driver::from_args(args)?;
         let _init = crate::latency::span("app_initialize", 0);
         {
             let _fonts = crate::latency::span("ui_fonts_install", 0);
@@ -407,6 +409,7 @@ impl ReaderApp {
         let covers = crate::covers::CoverCache::new(store.data_dir());
         let mut app = Self {
             perf_driver: crate::cef_perf::PerfDriver::from_args(args),
+            speech_smoke,
             cef_reader: if !cfg!(test) && !args.iter().any(|a| a == "--native-renderer") {
                 cc.wgpu_render_state.clone().map(cef_reader::CefReader::new)
             } else {
@@ -3367,30 +3370,11 @@ impl ReaderApp {
                         .collect();
                     if let (Some(first), Some(last)) = (mapped.first(), mapped.last()) {
                         let (start, end) = (first.0, last.1);
-                        self.resume_locator = Some(start);
-                        self.spoken_range = Some((start, end));
-                        if self.settings.tts.auto_follow && self.follow_playback {
-                            if self.chapter != start.chapter as usize {
-                                self.persist_position();
-                                self.chapter = start.chapter as usize;
-                                self.page = 0;
-                                self.layout = BookLayout::default();
-                                self.composed_frame = None;
-                                self.layout_key.clear();
-                                self.pending_restore = Some(start);
-                            }
-                            if let Some(page) = self.layout.pages.iter().position(|p| {
-                                p.hits.iter().any(|h| h.locator >= start && h.locator < end)
-                            }) {
-                                self.page = crate::reading_surface::page_window(
-                                    &self.book.chapters[self.chapter],
-                                    page,
-                                    self.layout.pages.len(),
-                                    self.spread_pages,
-                                    self.next_to_left(),
-                                )
-                                .start;
-                            }
+                        let chromium = self.cef_reader.is_some() && self.book.epub.is_some();
+                        let before = [self.chapter, self.page];
+                        self.apply_spoken_range(start, end, chromium);
+                        if let Some(driver) = self.speech_smoke.as_mut() {
+                            driver.boundary(start, before, [self.chapter, self.page]);
                         }
                     }
                 }
@@ -3401,6 +3385,45 @@ impl ReaderApp {
                     self.notify(error);
                 }
             }
+        }
+    }
+    fn apply_spoken_range(&mut self, start: Locator, end: Locator, chromium: bool) {
+        self.resume_locator = Some(start);
+        self.spoken_range = Some((start, end));
+        if !(self.settings.tts.auto_follow && self.follow_playback) {
+            return;
+        }
+        if self.chapter != start.chapter as usize {
+            self.persist_position();
+            self.chapter = start.chapter as usize;
+            self.page = 0;
+            self.layout = BookLayout::default();
+            self.composed_frame = None;
+            self.layout_key.clear();
+            self.pending_restore = Some(start);
+        }
+        // Chromium's compatibility layout contains one start anchor per page,
+        // not native hit geometry. Only its correlated DOM result may move it.
+        if chromium {
+            if self.layout_key.is_empty() && self.pending_restore.is_some() {
+                self.pending_restore = Some(start);
+            }
+            return;
+        }
+        if let Some(page) = self
+            .layout
+            .pages
+            .iter()
+            .position(|p| p.hits.iter().any(|h| h.locator >= start && h.locator < end))
+        {
+            self.page = crate::reading_surface::page_window(
+                &self.book.chapters[self.chapter],
+                page,
+                self.layout.pages.len(),
+                self.spread_pages,
+                self.next_to_left(),
+            )
+            .start;
         }
     }
     fn shortcuts(&mut self, ctx: &egui::Context) {
@@ -3745,7 +3768,12 @@ impl eframe::App for ReaderApp {
             self.applied_palette = Some(p);
         }
         ctx.options_mut(|options| {
-            options.input_options.line_scroll_speed = 40. * self.settings.scroll_speed
+            options.input_options.line_scroll_speed = 40.
+                * if self.screen == Screen::Library {
+                    self.settings.scroll_speed
+                } else {
+                    1.
+                }
         });
         ui.reset_style();
         let all = ui.max_rect();
@@ -3909,6 +3937,13 @@ impl eframe::App for ReaderApp {
         }
         if self.frame_count >= 8
             && !self.busy
+            && (self.screen != Screen::Reader
+                || (!self.opening
+                    && !self.layout.pages.is_empty()
+                    && self
+                        .cef_reader
+                        .as_ref()
+                        .is_none_or(|reader| reader.turn_ready())))
             && let Some(path) = self.screenshot.take()
         {
             ctx.request_screenshot(move |image| {
@@ -3988,6 +4023,45 @@ impl eframe::App for ReaderApp {
                 None => {}
             }
         }
+        if let Some(mut driver) = self.speech_smoke.take() {
+            let reader = self.cef_reader.as_ref();
+            let action = driver.tick(
+                &ctx,
+                crate::speech_smoke::Frame {
+                    ready: self.screen == Screen::Reader
+                        && !self.opening
+                        && reader.is_some_and(|reader| reader.turn_ready())
+                        && self.pagination_index.is_some(),
+                    total: self.pagination_index.as_ref().map(|index| index.total),
+                    layout: &self.layout_key,
+                    chapter: self.chapter,
+                    page: self.page,
+                    error: self.open_error.is_some()
+                        || self.speech_error.is_some()
+                        || reader.is_some_and(|reader| reader.speech_has_error()),
+                    panes: reader
+                        .map(|reader| reader.speech_snapshot())
+                        .unwrap_or_default(),
+                },
+            );
+            self.speech_smoke = Some(driver);
+            match action {
+                Some(crate::speech_smoke::Action::Start) => {
+                    self.stop_speech();
+                    self.speech_provider = "system".into();
+                    self.speech_voice.clear();
+                    self.settings.tts.speed = 2.;
+                    self.settings.tts.auto_follow = true;
+                    self.follow_playback = true;
+                    self.start_speech(None);
+                }
+                Some(crate::speech_smoke::Action::Close) => {
+                    self.stop_speech();
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                None => {}
+            }
+        }
         ctx.request_repaint_after(
             if self.speaking
                 || !self.pending_wheel_turns.is_empty()
@@ -4038,7 +4112,7 @@ fn book_argument(args: &[String]) -> Option<PathBuf> {
     while let Some(arg) = args.next() {
         if matches!(
             arg.as_str(),
-            "--data-dir" | "--screenshot" | "--perf-output"
+            "--data-dir" | "--screenshot" | "--perf-output" | "--speech-smoke-output"
         ) {
             args.next();
             continue;

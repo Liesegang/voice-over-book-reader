@@ -291,6 +291,7 @@ pub(crate) fn open_pdf(path: &Path, id: String) -> Result<Book> {
                 height,
                 chars,
             }),
+            geometry_cache: Default::default(),
             loaded: true,
         });
     }

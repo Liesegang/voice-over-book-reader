@@ -2,7 +2,11 @@
 pub mod protocol;
 pub use protocol::*;
 
-pub const NAVIGATOR_SCRIPT: &str = include_str!("navigator.js");
+pub const NAVIGATOR_SCRIPT: &str = concat!(
+    include_str!("font_choice.js"),
+    "\n",
+    include_str!("navigator.js")
+);
 pub const DRAIN_SCRIPT: &str = "globalThis.__vobrBook?.drain() ?? []";
 
 #[cfg(any(windows, target_os = "macos", target_os = "linux"))]

@@ -608,6 +608,7 @@ pub(crate) fn open_epub<R: Read + Seek + Send + 'static>(reader: R, id: String) 
             anchors: BTreeMap::new(),
             fixed_page: None,
             presentation: spine_presentation(&package, presentation, itemref.attr("properties")),
+            geometry_cache: Default::default(),
             loaded: false,
         });
     }
@@ -705,6 +706,7 @@ pub(crate) fn open_epub<R: Read + Seek + Send + 'static>(reader: R, id: String) 
             href: chapter.href.clone(),
             title: chapter.title.clone(),
             presentation: chapter.presentation,
+            geometry_cache: chapter.geometry_cache.clone(),
         })
         .collect();
     // Keep auxiliary notes/resources addressable without treating them as
@@ -718,6 +720,7 @@ pub(crate) fn open_epub<R: Read + Seek + Send + 'static>(reader: R, id: String) 
                 .get(href)
                 .copied()
                 .unwrap_or(presentation),
+            geometry_cache: Default::default(),
         });
     }
     source.set_chapters(specs)?;
@@ -781,6 +784,10 @@ pub(crate) fn parse_epub_chapter(
     hydrate_image_dimensions(&mut chapter, |resource| {
         source.image_dimensions(resource).ok().flatten()
     });
+    chapter.geometry_cache = spec.geometry_cache.clone();
+    chapter
+        .geometry_cache
+        .store(crate::page_document_geometry(&chapter));
     if chapter.title.starts_with("Chapter ") {
         chapter.title = spec.title.clone();
     }
@@ -1518,6 +1525,7 @@ fn parse_tree(tree: &Node, chapter: u32, href: &str, stylesheets: &str) -> Chapt
             viewport: content_viewport(tree),
             ..PagePresentation::default()
         },
+        geometry_cache: Default::default(),
         loaded: true,
     }
 }

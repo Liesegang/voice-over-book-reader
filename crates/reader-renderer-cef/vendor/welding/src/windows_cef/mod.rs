@@ -1096,14 +1096,24 @@ impl CefSurfaceProducer for WindowsCefProducer {
 
     fn send_mouse_input(&mut self, event: MouseEvent) -> Result<(), WeldError> {
         #[cfg(feature = "cef-runtime")]
-        if let Some(host) = self.browser().and_then(|browser| browser.host()) {
-            // Hosts speak physical pixels; CEF wants DIP. Skipping this makes
-            // every click land at the wrong place on a scaled display.
-            let (x, y) = self.metrics.lock().unwrap().point_to_dip(event.x, event.y);
-            let event = MouseEvent { x, y, ..event };
-            crate::cef_input::send_mouse(&host, &event);
-            return Ok(());
+        {
+            return crate::cef_input::with_live_input_host(
+                self.browser(),
+                || {
+                    self.closed.load(Ordering::Acquire)
+                        || self.close_requested.load(Ordering::Acquire)
+                        || self.browser().is_none()
+                },
+                |browser| browser.host(),
+                |host| {
+                    // Hosts speak physical pixels; CEF wants DIP. Keep the
+                    // existing conversion for every live input delivery.
+                    let (x, y) = self.metrics.lock().unwrap().point_to_dip(event.x, event.y);
+                    crate::cef_input::send_mouse(host, &MouseEvent { x, y, ..event });
+                },
+            );
         }
+        #[cfg(not(feature = "cef-runtime"))]
         Err(pending("cef_browser_host_t mouse input"))
     }
 

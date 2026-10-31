@@ -70,12 +70,22 @@ pub fn page_count(extent: Vec2, mode: SpreadMode) -> usize {
 }
 
 pub fn is_image_chapter(chapter: &reader_core::Chapter) -> bool {
-    chapter.fixed_page.is_some()
-        || chapter.presentation.layout == Some(reader_core::RenditionLayout::PrePaginated)
-        || (!chapter.blocks.is_empty() && chapter.blocks.iter().all(|b| {
-            b.image.as_ref().is_some_and(|image| image.display == reader_core::ImageDisplay::FullPage || (matches!(image.width,Some(reader_core::CssLength::Percent(w)) if w>=100.) && matches!(image.height,Some(reader_core::CssLength::Percent(h)) if h>=100.)))
-                || (b.image.is_none() && b.atoms.iter().all(|a|a.text.trim().is_empty()))
-        }))
+    // Image-only flow can contain several local pages. It still uses image
+    // spread/spacing preferences, but is not an atomic cross-chapter page.
+    reader_core::page_document_geometry(chapter).is_some()
+        || (!chapter.blocks.is_empty()
+            && chapter.blocks.iter().any(|block| block.image.is_some())
+            && chapter.blocks.iter().all(|block| {
+                block.image.as_ref().is_some_and(|image| {
+                    image.display == reader_core::ImageDisplay::FullPage
+                        || (matches!(image.width, Some(reader_core::CssLength::Percent(w)) if w >= 100.)
+                            && matches!(image.height, Some(reader_core::CssLength::Percent(h)) if h >= 100.))
+                }) || (block.image.is_none()
+                    && block.table.is_none()
+                    && block.mathml.is_none()
+                    && !matches!(block.kind, reader_core::BlockKind::Rule)
+                    && block.atoms.iter().all(|atom| atom.text.trim().is_empty()))
+            }))
 }
 
 pub fn page_count_for_chapter(
@@ -108,16 +118,11 @@ pub fn page_count_for_chapter(
     }
     // A wide, already-composed plate stays intact unless the publisher explicitly
     // requests two slots. It must not be treated as two independent source pages.
-    if authored.is_none() && mode == SpreadMode::Auto && chapter.presentation.placement == P::Auto {
-        let wide = chapter
-            .presentation
-            .viewport
-            .is_some_and(|[w, h]| w / h.max(1.) >= 1.25)
-            || chapter
-                .blocks
-                .iter()
-                .filter_map(|b| b.image.as_ref())
-                .any(|i| i.intrinsic_size.is_some_and(|[w, h]| w / h.max(1.) >= 1.25));
+    if authored.is_none() && chapter.presentation.placement == P::Auto && is_image_chapter(chapter)
+    {
+        let wide = reader_core::page_document_geometry(chapter)
+            .and_then(|geometry| geometry.viewport)
+            .is_some_and(|[w, h]| w / h.max(1.) >= 1.25);
         if wide {
             return 1;
         }
@@ -163,6 +168,16 @@ pub fn chapter_spread(
     let Some(chapter) = book.chapters.get(index) else {
         return ChapterSpread::default();
     };
+    if index == 0
+        && book.cover.is_some()
+        && reader_core::page_document_geometry(chapter).is_some()
+        && chapter.presentation.placement == P::Auto
+    {
+        return ChapterSpread {
+            first: index,
+            ..ChapterSpread::default()
+        };
+    }
     let columns = page_count_for_chapter(extent, settings.spread, settings.text_spread, chapter);
     let rtl = next_to_left(book, index, settings);
     let start_slot = usize::from(rtl);
@@ -175,9 +190,11 @@ pub fn chapter_spread(
             _ => start_slot,
         }
     };
-    let atomic = is_image_chapter(chapter);
+    let atomic = reader_core::page_document_geometry(chapter).is_some();
     let gap = if columns == 2 {
-        settings.spread_gap(atomic).min(extent.x * 0.25)
+        settings
+            .spread_gap(is_image_chapter(chapter))
+            .min(extent.x * 0.25)
     } else {
         0.
     };
@@ -185,7 +202,7 @@ pub fn chapter_spread(
         book.chapters
             .get(index + 1)
             .filter(|next| {
-                is_image_chapter(next)
+                reader_core::page_document_geometry(next).is_some()
                     && page_count_for_chapter(extent, settings.spread, settings.text_spread, next)
                         == 2
                     && matches!(next.presentation.placement, P::Auto | P::Left | P::Right)
@@ -203,6 +220,15 @@ pub fn chapter_spread(
     } else {
         None
     };
+    if atomic && second.is_none() && chapter.presentation.placement == P::Auto {
+        return ChapterSpread {
+            first: index,
+            second: None,
+            columns: 1,
+            first_slot: 0,
+            gap: 0.,
+        };
+    }
     ChapterSpread {
         first: index,
         second,
@@ -297,7 +323,22 @@ pub fn compose(
         if result.anchor.is_none() {
             result.anchor = page.first_locator();
         }
-        let offset = vec2(slot as f32 * (width + gap), 0.);
+        let image_offset =
+            if columns == 2 && gap == 0. && page.glyphs.is_empty() && page.pictures.len() == 1 {
+                let picture = &page.pictures[0];
+                if picture.fixed_canvas.is_some() || picture.pdf_page.is_some() {
+                    if slot == 0 {
+                        width - picture.rect.right()
+                    } else {
+                        -picture.rect.left()
+                    }
+                } else {
+                    0.
+                }
+            } else {
+                0.
+            };
+        let offset = vec2(slot as f32 * (width + gap) + image_offset, 0.);
         result.glyphs.extend(page.glyphs.into_iter().map(|mut g| {
             g.origin += offset;
             g
@@ -409,7 +450,7 @@ mod tests {
         )
         .unwrap();
         let image = reader_core::parse_html(
-            "<html><body><img src='plate.png' alt='挿絵'/></body></html>",
+            "<html><body><img src='plate.png' width='600' height='900' alt='挿絵'/></body></html>",
             1,
             "image.xhtml",
             "",
@@ -661,5 +702,179 @@ mod publisher_tests {
                 1
             );
         }
+    }
+
+    #[test]
+    fn legacy_image_pairs_touch_and_an_unpaired_source_page_is_centered_at_full_width() {
+        let image = |id| {
+            reader_core::parse_html("<html><body><img src='plate.jpeg' style='width:977px;height:1280px'/></body></html>",id,&format!("{id}.xhtml"),"").unwrap()
+        };
+        let mut book = Book::demo();
+        book.chapters = vec![image(0), image(1), image(2)];
+        book.page_progression = PageProgression::Ltr;
+        let settings = Settings {
+            page_gap: Some(120.),
+            ..Settings::default()
+        };
+        let viewport = vec2(1280., 760.);
+        let paired = chapter_spread(&book, 0, viewport, &settings);
+        assert_eq!(
+            (paired.columns, paired.second, paired.gap),
+            (2, Some(1), 0.)
+        );
+        assert_eq!(paired.extent(viewport), vec2(640., 760.));
+        let last = chapter_spread(&book, 2, viewport, &settings);
+        assert_eq!(
+            (last.columns, last.second, last.first_slot, last.gap),
+            (1, None, 0, 0.)
+        );
+        assert_eq!(last.extent(viewport), viewport);
+        book.cover = Some("plate.jpeg".into());
+        let cover = chapter_spread(&book, 0, viewport, &settings);
+        assert_eq!((cover.columns, cover.second), (1, None));
+    }
+
+    #[test]
+    fn background_geometry_survives_unloading_and_keeps_previous_spread_source_order() {
+        use std::io::Write as _;
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary.path().join("legacy-image-cache.epub");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        let manifest = (0..7)
+            .map(|id| {
+                format!("<item id='p{id}' href='{id}.xhtml' media-type='application/xhtml+xml'/>")
+            })
+            .collect::<String>();
+        let spine = (0..7)
+            .map(|id| format!("<itemref idref='p{id}'/>"))
+            .collect::<String>();
+        let mut files = vec![
+            ("mimetype".to_owned(), "application/epub+zip".to_owned()),
+            ("META-INF/container.xml".to_owned(), "<container xmlns='urn:oasis:names:tc:opendocument:xmlns:container'><rootfiles><rootfile full-path='package.opf'/></rootfiles></container>".to_owned()),
+            ("package.opf".to_owned(), format!("<package xmlns='http://www.idpf.org/2007/opf' version='2.0' unique-identifier='id'><metadata xmlns:dc='http://purl.org/dc/elements/1.1/'><dc:identifier id='id'>geometry-cache-fixture</dc:identifier><dc:title>Image pages</dc:title></metadata><manifest>{manifest}</manifest><spine>{spine}</spine></package>")),
+        ];
+        for id in 0..7 {
+            files.push((format!("{id}.xhtml"), "<html xmlns='http://www.w3.org/1999/xhtml'><body><img src='plate.jpeg' style='width:977px;height:1280px'/></body></html>".to_owned()));
+        }
+        for (name, contents) in files {
+            archive.start_file(name, options).unwrap();
+            archive.write_all(contents.as_bytes()).unwrap();
+        }
+        archive.finish().unwrap();
+        let mut book = reader_core::open(&path).unwrap();
+        book.cover = Some("plate.jpeg".into());
+        assert!(
+            !is_image_chapter(&book.chapters[1]),
+            "an unparsed stub is unknown"
+        );
+        let publisher = book
+            .chapters
+            .iter()
+            .map(|chapter| chapter.presentation)
+            .collect::<Vec<_>>();
+
+        // The global counter parses its own Book clone. Its derived metadata
+        // must reach original stubs even when those chapters were never opened.
+        let background = book.clone();
+        for index in 1..7 {
+            assert!(is_image_chapter(&background.load_chapter(index).unwrap()));
+        }
+        assert!(!book.chapters[1].loaded);
+        assert!(is_image_chapter(&book.chapters[1]));
+        for index in [2, 3, 4] {
+            book.ensure_chapter_loaded(index).unwrap();
+        }
+        book.unload_chapters_except(&[2, 3, 4]);
+        assert!(book.chapters[1].blocks.is_empty());
+        assert!(is_image_chapter(&book.chapters[1]));
+        assert_eq!(
+            book.chapters
+                .iter()
+                .map(|chapter| chapter.presentation)
+                .collect::<Vec<_>>(),
+            publisher
+        );
+        let viewport = vec2(1280., 760.);
+        let settings = Settings::default();
+        assert_eq!(previous_chapter_spread(&book, 3, viewport, &settings), 1);
+        assert_eq!(chapter_spread_start(&book, 4, viewport, &settings), 3);
+        assert_eq!(
+            chapter_spread(&book, 3, viewport, &settings).second,
+            Some(4)
+        );
+
+        let serialized = serde_json::to_value(&book.chapters[1]).unwrap();
+        assert!(serialized.get("geometry_cache").is_none());
+        let reopened: reader_core::Chapter = serde_json::from_value(serialized).unwrap();
+        assert_eq!(
+            reopened, book.chapters[1],
+            "runtime caches do not affect source equality"
+        );
+        assert!(
+            !is_image_chapter(&reopened),
+            "a serialized stub recomputes on reopen"
+        );
+    }
+
+    #[test]
+    fn several_image_flow_pages_keep_local_spreads_without_cross_chapter_pairing() {
+        let mut book = Book::demo();
+        book.chapters = vec![
+            reader_core::parse_html("<html><body><img src='one.svg' style='display:block;width:100%;height:100%'/><img src='two.svg' style='display:block;width:100%;height:100%'/></body></html>",0,"flow.xhtml","").unwrap(),
+            reader_core::parse_html("<html><body><img src='next.svg' width='600' height='900'/></body></html>",1,"next.xhtml","").unwrap(),
+        ];
+        assert!(is_image_chapter(&book.chapters[0]));
+        assert!(reader_core::page_document_geometry(&book.chapters[0]).is_none());
+        let viewport = vec2(1280., 760.);
+        let settings = Settings::default();
+        assert_eq!(
+            page_count_for_chapter(viewport, settings.spread, false, &book.chapters[0]),
+            2
+        );
+        let plan = chapter_spread(&book, 0, viewport, &settings);
+        assert_eq!((plan.columns, plan.second, plan.consumed()), (2, None, 1));
+        assert_eq!(plan.gap, 0.);
+    }
+
+    #[test]
+    fn a_landscape_source_image_is_one_plate_even_when_two_page_display_is_requested() {
+        let chapter = reader_core::parse_html(
+            "<html><body><img src='spread.jpeg' width='1600' height='900'/></body></html>",
+            0,
+            "spread.xhtml",
+            "",
+        )
+        .unwrap();
+        for spread in [SpreadMode::Auto, SpreadMode::Double] {
+            assert_eq!(
+                page_count_for_chapter(vec2(1280., 760.), spread, false, &chapter),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn native_fixed_images_align_to_the_join_without_adding_letterbox_gutter() {
+        use crate::layout::{FixedCanvas, Picture};
+        use eframe::egui::pos2;
+        let page = || Page {
+            pictures: vec![Picture {
+                rect: Rect::from_min_size(pos2(80., 0.), vec2(480., 760.)),
+                resource: "plate.png".into(),
+                alt: String::new(),
+                inline_svg: None,
+                pdf_page: None,
+                fixed_canvas: Some(FixedCanvas {
+                    extent: vec2(600., 950.),
+                    image_rect: Rect::from_min_size(eframe::egui::Pos2::ZERO, vec2(600., 950.)),
+                }),
+                text_image: false,
+            }],
+            ..Page::default()
+        };
+        let joined = compose(page(), Some(page()), vec2(1280., 760.), 2, 0, 0.);
+        assert_eq!(joined.pictures[0].rect.right(), 640.);
+        assert_eq!(joined.pictures[1].rect.left(), 640.);
     }
 }

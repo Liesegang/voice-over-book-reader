@@ -364,6 +364,9 @@ pub struct Chapter {
     pub fixed_page: Option<FixedPage>,
     #[serde(default)]
     pub presentation: PagePresentation,
+    /// Reader-derived geometry survives unloading without rewriting OPF data.
+    #[serde(skip)]
+    pub geometry_cache: crate::PageGeometryCache,
     #[serde(default = "loaded_by_default")]
     pub loaded: bool,
 }
@@ -586,6 +589,11 @@ impl Book {
         }
         for (index, chapter) in self.chapters.iter_mut().enumerate() {
             if !keep.contains(&index) {
+                if chapter.loaded {
+                    chapter
+                        .geometry_cache
+                        .store(crate::page_document_geometry(chapter));
+                }
                 chapter.blocks.clear();
                 chapter.anchors.clear();
                 chapter.loaded = false;

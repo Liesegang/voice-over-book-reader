@@ -116,6 +116,7 @@ pub(crate) fn open_cbz<R: Read + Seek>(reader: R, path: &Path, id: String) -> Re
             blocks: vec![image_block(resource.clone(), format!("Page {}", index + 1))],
             anchors: BTreeMap::new(),
             fixed_page: None,
+            geometry_cache: Default::default(),
             loaded: true,
         })
         .collect();

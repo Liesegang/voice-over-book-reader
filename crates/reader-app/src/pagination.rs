@@ -2,10 +2,17 @@
 use crate::{fonts::FontSystem, layout, reading_surface};
 use anyhow::{Result, ensure};
 use eframe::egui::Vec2;
-use reader_core::{Book, Locator, RenditionLayout};
+use reader_core::{Book, Locator};
 use reader_library::Settings;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+/// EPUB fixed-layout spine items are exactly one source page, independently of
+/// viewport size, image decoding or whether two items are shown in a spread.
+/// An unloaded item may have no source anchor yet; its count is still exact.
+pub fn known_chromium_page_starts(chapter: &reader_core::Chapter) -> Option<Vec<Option<Locator>>> {
+    reader_core::page_document_geometry(chapter).map(|_| vec![chapter.start_locator()])
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct PageIndex {
@@ -210,10 +217,11 @@ fn compute_output<const EMIT: bool>(
         !book.chapters.is_empty(),
         "ページ数を計算する章がありません"
     );
-    if book.chapters.iter().all(|chapter| {
-        chapter.fixed_page.is_some()
-            || chapter.presentation.layout == Some(RenditionLayout::PrePaginated)
-    }) {
+    if book
+        .chapters
+        .iter()
+        .all(|chapter| reader_core::page_document_geometry(chapter).is_some())
+    {
         // Fixed-layout metadata already declares one source page per chapter.
         // Counting needs no font cache, image-resource clone or text layout.
         return PageIndex::new_with_starts(
@@ -250,9 +258,7 @@ fn compute_output<const EMIT: bool>(
             let Some(metadata) = working.chapters.get(index) else {
                 break;
             };
-            if metadata.fixed_page.is_some()
-                || metadata.presentation.layout == Some(RenditionLayout::PrePaginated)
-            {
+            if reader_core::page_document_geometry(metadata).is_some() {
                 results.push((index, vec![metadata.start_locator()]));
                 continue;
             }
@@ -265,6 +271,11 @@ fn compute_output<const EMIT: bool>(
             }
             #[cfg(test)]
             let started = std::time::Instant::now();
+            if reader_core::page_document_geometry(&working.chapters[index]).is_some() {
+                results.push((index, vec![working.chapters[index].start_locator()]));
+                working.unload_chapters_except(&[]);
+                continue;
+            }
             let content = reading_surface::content_rect(
                 eframe::egui::Rect::from_min_size(eframe::egui::Pos2::ZERO, extent),
                 &working.chapters[index],
@@ -342,8 +353,73 @@ fn compute_output<const EMIT: bool>(
 mod tests {
     use super::*;
     use eframe::egui::vec2;
-    use reader_core::{PagePresentation, parse_html};
+    use reader_core::{PagePresentation, RenditionLayout, parse_html};
     use reader_library::{ReadingMode, SpreadMode};
+
+    #[test]
+    fn chromium_fixed_metadata_counts_without_loading_artwork_or_source_nodes() {
+        let mut chapter = Book::demo().chapters[0].clone();
+        chapter.loaded = false;
+        chapter.blocks.clear();
+        chapter.anchors.clear();
+        chapter.presentation.layout = Some(RenditionLayout::PrePaginated);
+        assert_eq!(known_chromium_page_starts(&chapter), Some(vec![None]));
+
+        let index = PageIndex::new_with_starts(vec![1; 40], vec![vec![None]; 40]).unwrap();
+        let location = Locator {
+            chapter: 19,
+            node: 999,
+            offset: 12,
+        };
+        assert_eq!(index.total, 40);
+        assert_eq!(
+            index.locate(index.locator_fraction(location).unwrap()),
+            (19, 0)
+        );
+    }
+
+    #[test]
+    fn a_legacy_image_book_has_one_source_page_per_spine_item_without_pixel_decoding() {
+        let mut book = Book::demo();
+        book.chapters=(0..46).map(|id|parse_html("<html><body><div><img src='plate.jpeg' class='plate' width='2480' height='3248' alt='Image alt'/></div></body></html>",id,&format!("{id}.xhtml"),".plate{width:977px;height:1280px}").unwrap()).collect();
+        for chapter in &book.chapters {
+            assert_eq!(
+                known_chromium_page_starts(chapter),
+                Some(vec![chapter.start_locator()])
+            );
+        }
+        let index = compute(
+            &book,
+            vec2(1280., 760.),
+            &Settings {
+                page_gap: Some(120.),
+                ..Settings::default()
+            },
+            &AtomicU64::new(0),
+            0,
+        )
+        .unwrap();
+        assert_eq!(index.total, 46);
+        assert_eq!(index.counts, vec![1; 46]);
+    }
+
+    #[test]
+    fn chromium_fast_count_requires_explicit_fixed_layout_and_keeps_known_anchor() {
+        let mut chapter = parse_html(
+            "<html><body><img src='not-loaded.png' style='width:100%;height:100%'/></body></html>",
+            0,
+            "artwork.xhtml",
+            "",
+        )
+        .unwrap();
+        assert_eq!(known_chromium_page_starts(&chapter), None);
+        chapter.presentation.layout = Some(RenditionLayout::Reflowable);
+        assert_eq!(known_chromium_page_starts(&chapter), None);
+        chapter.presentation.layout = Some(RenditionLayout::PrePaginated);
+        let anchor = chapter.start_locator();
+        assert!(anchor.is_some());
+        assert_eq!(known_chromium_page_starts(&chapter), Some(vec![anchor]));
+    }
 
     #[test]
     #[ignore = "Manual pagination benchmark; VOBR_PAGINATION_BOOK selects a local, read-only EPUB"]

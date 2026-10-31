@@ -249,18 +249,83 @@ impl PageRequests {
     }
 }
 
+#[derive(Default)]
+struct DrainRequests {
+    sequence: u32,
+    pending: Option<u64>,
+}
+impl DrainRequests {
+    fn begin(&mut self) -> Result<u64, RendererError> {
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or_else(|| RendererError::Protocol("Drain request identifiers exhausted".into()))?;
+        let id = DRAIN_REQUEST_PREFIX | u64::from(self.sequence);
+        self.pending = Some(id);
+        Ok(id)
+    }
+    fn complete(&mut self, id: u64) -> bool {
+        if self.pending == Some(id) {
+            self.pending = None;
+            true
+        } else {
+            false
+        }
+    }
+    fn cancel(&mut self) {
+        self.pending = None;
+    }
+    fn reserved(id: u64) -> bool {
+        id & 0xffff_ffff_0000_0000 == DRAIN_REQUEST_PREFIX
+    }
+}
+
+struct DocumentNavigation {
+    url: String,
+    started: bool,
+    loaded: bool,
+}
+impl DocumentNavigation {
+    fn new(url: String) -> Self {
+        Self {
+            url,
+            started: false,
+            loaded: false,
+        }
+    }
+    fn matches(&self, url: &str) -> bool {
+        self.url.split('#').next() == url.split('#').next()
+    }
+    fn start(&mut self, url: &str) -> bool {
+        if !self.matches(url) {
+            return false;
+        }
+        self.started = true;
+        self.loaded = false;
+        true
+    }
+    fn finish(&mut self, url: &str) -> bool {
+        if !self.started || self.loaded || !self.matches(url) {
+            return false;
+        }
+        self.loaded = true;
+        true
+    }
+}
+
 pub struct GpuBookSurface<'a> {
     producer: welding::PlatformCefProducer,
     current: Option<welding::ImportedTexture>,
     popup: Option<welding::PopupSurface>,
     host: welding::HostWgpuContext,
     pending: VecDeque<SurfaceEvent>,
-    poll_in_flight: bool,
+    drain_requests: DrainRequests,
     poll_since: Instant,
     page_requests: PageRequests,
     next_poll: Instant,
     active_until: Instant,
     navigator_installed: bool,
+    document: DocumentNavigation,
     closing: bool,
     closed: bool,
     _runtime: Runtime<'a>,
@@ -294,6 +359,7 @@ impl<'a> GpuBookSurface<'a> {
                 "Linux book GPU surface requires a DMABUF-capable Vulkan device".into(),
             ));
         }
+        let document = DocumentNavigation::new(options.initial_url.clone());
         let config = welding::PlatformCefConfig {
             surface: welding::CefSurfaceConfig {
                 initial_url: options.initial_url,
@@ -317,21 +383,43 @@ impl<'a> GpuBookSurface<'a> {
             popup: None,
             host,
             pending: VecDeque::new(),
-            poll_in_flight: false,
+            drain_requests: DrainRequests::default(),
             poll_since: Instant::now(),
             page_requests: PageRequests::default(),
             next_poll: Instant::now(),
             active_until: Instant::now() + Duration::from_secs(2),
             navigator_installed: false,
+            document,
             closing: false,
             closed: false,
             _runtime: runtime.clone(),
         })
     }
     pub fn navigate(&mut self, url: &str) -> Result<(), RendererError> {
+        if self.closing || self.is_closed() {
+            return Err(RendererError::Protocol(
+                "Cannot navigate a closing book surface".into(),
+            ));
+        }
+        // Reusing the browser must not reuse its old document's inbox or paint.
+        // CEF callbacks not yet delivered are filtered by URL/request identity.
+        self.pending.clear();
+        while let Some(event) = self.producer.poll_web_event() {
+            if matches!(
+                event,
+                CefSurfaceEvent::Navigation(NavigationEvent::BrowserClosed)
+            ) {
+                self.closed = true;
+            }
+        }
+        if self.closed {
+            return Err(RendererError::Protocol("Book surface has closed".into()));
+        }
+        let _ = self.producer.acquire_native_frame();
         self.page_requests.cancel();
+        self.drain_requests.cancel();
         self.navigator_installed = false;
-        self.poll_in_flight = false;
+        self.document = DocumentNavigation::new(url.to_owned());
         self.current = None;
         self.popup = None;
         self.active_until = Instant::now() + Duration::from_secs(2);
@@ -356,6 +444,11 @@ impl<'a> GpuBookSurface<'a> {
     /// Original DOM has loaded. This only injects the isolated reader helper;
     /// Configure supplies source bindings and triggers font/image-ready layout.
     pub fn install_navigator(&mut self) -> Result<(), RendererError> {
+        if !self.document.loaded {
+            return Err(RendererError::Protocol(
+                "Book document has not finished loading".into(),
+            ));
+        }
         self.page_requests.cancel();
         self.producer
             .execute_script(crate::NAVIGATOR_SCRIPT, "vobr://navigator")
@@ -412,15 +505,37 @@ impl<'a> GpuBookSurface<'a> {
             match event {
                 CefSurfaceEvent::Navigation(NavigationEvent::BrowserClosed) => {
                     self.page_requests.cancel();
+                    self.drain_requests.cancel();
+                    self.navigator_installed = false;
                     self.closed = true;
                 }
-                CefSurfaceEvent::Navigation(NavigationEvent::LoadEnd { url, .. }) => {
-                    self.page_requests.cancel();
-                    self.navigator_installed = false;
-                    self.pending.push_back(SurfaceEvent::DocumentLoaded { url });
+                CefSurfaceEvent::Navigation(NavigationEvent::LoadStart { url }) => {
+                    if self.document.start(&url) {
+                        self.page_requests.cancel();
+                        self.drain_requests.cancel();
+                        self.navigator_installed = false;
+                        self.pending.clear();
+                        self.current = None;
+                        self.popup = None;
+                    }
                 }
-                CefSurfaceEvent::Navigation(NavigationEvent::LoadError { error_text, .. }) => {
-                    self.pending.push_back(SurfaceEvent::Error(error_text))
+                CefSurfaceEvent::Navigation(NavigationEvent::LoadEnd { url, .. }) => {
+                    if self.document.finish(&url) {
+                        self.page_requests.cancel();
+                        self.navigator_installed = false;
+                        self.pending.push_back(SurfaceEvent::DocumentLoaded { url });
+                    }
+                }
+                CefSurfaceEvent::Navigation(NavigationEvent::LoadError {
+                    url,
+                    error_code,
+                    error_text,
+                }) => {
+                    // ERR_ABORTED is the normal completion of an interrupted
+                    // navigation when a newer chapter replaces it.
+                    if error_code != -3 && self.document.matches(&url) {
+                        self.pending.push_back(SurfaceEvent::Error(error_text));
+                    }
                 }
                 CefSurfaceEvent::Navigation(NavigationEvent::NewWindowRequested {
                     url,
@@ -434,8 +549,12 @@ impl<'a> GpuBookSurface<'a> {
                 }) => self.pending.push_back(SurfaceEvent::Error(format!(
                     "Book renderer stopped: {error_string}"
                 ))),
-                CefSurfaceEvent::ScriptCompleted { id, result } if id.get() == DRAIN_ID => {
-                    self.poll_in_flight = false;
+                CefSurfaceEvent::ScriptCompleted { id, result }
+                    if DrainRequests::reserved(id.get()) =>
+                {
+                    if !self.drain_requests.complete(id.get()) {
+                        continue;
+                    }
                     match result {
                         Ok(json) => match decode_events(&json) {
                             Ok(events) => self
@@ -477,8 +596,10 @@ impl<'a> GpuBookSurface<'a> {
         if let Some(cursor) = self.producer.poll_cursor_shape() {
             self.pending.push_back(SurfaceEvent::Cursor(cursor));
         }
-        if self.poll_in_flight && self.poll_since.elapsed() > Duration::from_secs(5) {
-            self.poll_in_flight = false;
+        if self.drain_requests.pending.is_some()
+            && self.poll_since.elapsed() > Duration::from_secs(5)
+        {
+            self.drain_requests.cancel();
             self.pending.push_back(SurfaceEvent::Error(
                 "Book navigator response timed out".into(),
             ));
@@ -489,14 +610,20 @@ impl<'a> GpuBookSurface<'a> {
             ));
         }
         if self.navigator_installed
-            && !self.poll_in_flight
+            && !self.closing
+            && !self.closed
+            && self.drain_requests.pending.is_none()
             && self.page_requests.pending.is_none()
             && Instant::now() >= self.next_poll
         {
-            self.producer
-                .request_script_result(WebRequestId::new(DRAIN_ID), crate::DRAIN_SCRIPT)
-                .map_err(platform)?;
-            self.poll_in_flight = true;
+            let id = self.drain_requests.begin()?;
+            if let Err(error) = self
+                .producer
+                .request_script_result(WebRequestId::new(id), crate::DRAIN_SCRIPT)
+            {
+                self.drain_requests.cancel();
+                return Err(platform(error));
+            }
             self.poll_since = Instant::now();
             self.next_poll = Instant::now()
                 + if Instant::now() < self.active_until {
@@ -543,7 +670,7 @@ impl<'a> GpuBookSurface<'a> {
         Ok(barrier)
     }
     pub fn request_script_result(&mut self, id: u64, script: &str) -> Result<(), RendererError> {
-        if id == DRAIN_ID || PageRequests::reserved(id) {
+        if DrainRequests::reserved(id) || PageRequests::reserved(id) {
             return Err(RendererError::Protocol(
                 "Reserved navigator request ID".into(),
             ));
@@ -572,6 +699,8 @@ impl<'a> GpuBookSurface<'a> {
     }
     pub fn close(&mut self) -> Result<(), RendererError> {
         self.page_requests.cancel();
+        self.drain_requests.cancel();
+        self.navigator_installed = false;
         if !self.closing && !self.closed {
             self.producer.close().map_err(platform)?;
             self.closing = true;
@@ -617,7 +746,7 @@ impl Drop for GpuBookSurface<'_> {
         }
     }
 }
-const DRAIN_ID: u64 = 0x564f425200000001;
+const DRAIN_REQUEST_PREFIX: u64 = 0x564f425200000000;
 const PAGE_REQUEST_PREFIX: u64 = 0x564f425300000000;
 
 fn page_reply_script(command: &Command) -> Result<String, RendererError> {
@@ -685,8 +814,45 @@ mod page_reply_tests {
         assert_eq!(requests.complete(second.id), Some(second));
         assert!(requests.complete(second.id).is_none());
         assert!(PageRequests::reserved(first.id));
-        assert!(!PageRequests::reserved(DRAIN_ID));
+        assert!(!PageRequests::reserved(DRAIN_REQUEST_PREFIX | 1));
         assert!(!PageRequests::reserved(7001));
+    }
+
+    #[test]
+    fn retargeted_document_rejects_old_or_duplicate_load_completion() {
+        let mut document = DocumentNavigation::new("vobr://book/b.xhtml".into());
+        assert!(!document.finish("vobr://book/b.xhtml"));
+        assert!(!document.start("vobr://book/a.xhtml"));
+        assert!(!document.finish("vobr://book/a.xhtml"));
+        assert!(document.start("vobr://book/b.xhtml#heading"));
+        assert!(!document.finish("vobr://book/a.xhtml"));
+        assert!(document.finish("vobr://book/b.xhtml"));
+        assert!(!document.finish("vobr://book/b.xhtml"));
+        assert!(document.loaded);
+
+        document = DocumentNavigation::new("vobr://book/a.xhtml".into());
+        assert!(!document.finish("vobr://book/a.xhtml"));
+        assert!(!document.loaded);
+        assert!(document.start("vobr://book/a.xhtml"));
+        assert!(document.finish("vobr://book/a.xhtml#another"));
+    }
+
+    #[test]
+    fn cancelled_document_drain_cannot_settle_a_new_documents_request() {
+        let mut drains = DrainRequests::default();
+        let old = drains.begin().unwrap();
+        drains.cancel();
+        let new = drains.begin().unwrap();
+        assert_ne!(old, new);
+        assert!(!drains.complete(old));
+        assert_eq!(drains.pending, Some(new));
+        assert!(drains.complete(new));
+        assert!(!drains.complete(new));
+        assert!(DrainRequests::reserved(old));
+        assert!(!DrainRequests::reserved(PAGE_REQUEST_PREFIX | 1));
+        assert!(!DrainRequests::reserved(7001));
+        drains.sequence = u32::MAX;
+        assert!(drains.begin().is_err());
     }
 
     #[test]

@@ -126,6 +126,12 @@ pub enum Command {
     Locate {
         revision: Revision,
         location: SourceLocator,
+        #[serde(default)]
+        request_id: u64,
+        #[serde(default)]
+        fallback_page: u32,
+        #[serde(default)]
+        page_step: u32,
     },
     Fragment {
         revision: Revision,
@@ -197,6 +203,18 @@ pub enum NavigatorEvent {
         #[serde(default)]
         marker: Option<[u8; 3]>,
     },
+    /// A source navigation acknowledges its own request, never a Page command.
+    /// Missing legacy/image source IDs recover to a confirmed DOM page.
+    Located {
+        revision: Revision,
+        request_id: u64,
+        location: SourceLocator,
+        chapter: u32,
+        page: u32,
+        start: Option<SourceLocator>,
+        found: bool,
+        reason: Option<String>,
+    },
     Hit {
         revision: Revision,
         location: Option<SourceLocator>,
@@ -238,6 +256,76 @@ pub enum NavigatorEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_navigation_keeps_request_identity_and_legacy_image_page_fallback() {
+        let location = SourceLocator {
+            chapter: 2,
+            node: u32::MAX,
+            offset: 0,
+        };
+        let command = Command::Locate {
+            revision: Revision(9),
+            location,
+            request_id: 73,
+            fallback_page: 19,
+            page_step: 2,
+        };
+        let json = serde_json::to_value(command).unwrap();
+        assert_eq!(json["type"], "locate");
+        assert_eq!(json["request_id"], 73);
+        assert_eq!(json["location"]["node"], u32::MAX);
+        assert_eq!(json["fallback_page"], 19);
+        assert_eq!(json["page_step"], 2);
+        let legacy: Command = serde_json::from_value(serde_json::json!({
+            "type":"locate","revision":9,"location":{"chapter":2,"node":4,"offset":3}
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            Command::Locate {
+                request_id: 0,
+                fallback_page: 0,
+                page_step: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_image_source_is_a_correlated_location_result_not_a_renderer_error() {
+        let payload = serde_json::json!({
+            "type":"located","revision":9,"request_id":73,
+            "location":{"chapter":2,"node":u32::MAX,"offset":0},
+            "chapter":2,"page":0,"start":{"chapter":2,"node":6,"offset":0},
+            "found":false,"reason":"Unmapped source locator"
+        });
+        let event: NavigatorEvent = serde_json::from_value(payload.clone()).unwrap();
+        assert!(matches!(
+            event,
+            NavigatorEvent::Located {
+                request_id: 73,
+                location: SourceLocator { node: u32::MAX, .. },
+                start: Some(SourceLocator { node: 6, .. }),
+                found: false,
+                ..
+            }
+        ));
+        let mut uncorrelated = payload;
+        uncorrelated.as_object_mut().unwrap().remove("request_id");
+        assert!(
+            serde_json::from_value::<NavigatorEvent>(uncorrelated).is_err(),
+            "an uncorrelated result must not masquerade as the latest request"
+        );
+        let fatal: NavigatorEvent = serde_json::from_value(serde_json::json!({
+            "type":"error","revision":9,"message":"Fixed layout requires a positive author viewport"
+        }))
+        .unwrap();
+        assert!(
+            matches!(fatal, NavigatorEvent::Error { .. }),
+            "actual rendering failures retain their error channel"
+        );
+    }
 
     #[test]
     fn original_layout_json_keeps_one_column_and_author_colors() {

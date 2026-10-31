@@ -22,16 +22,19 @@ const testRoot=path.dirname(fileURLToPath(import.meta.url));
 const server=createServer(async(request,response)=>{
     const route=new URL(request.url,'http://127.0.0.1').pathname;
     if(suite==='images'&&['/glyph.svg','/colored.svg','/gradient.svg'].includes(route)){
-        const body=route==='/glyph.svg'?'<rect width="16" height="16" fill="white"/><rect x="4" y="4" width="8" height="8" fill="black"/>':route==='/colored.svg'?'<rect width="16" height="16" fill="#d02020"/>':'<defs><linearGradient id="g"><stop stop-color="black"/><stop offset="1" stop-color="white"/></linearGradient></defs><rect width="16" height="16" fill="url(#g)"/>';
-        response.writeHead(200,{'Content-Type':'image/svg+xml','Cache-Control':'no-store'});response.end(`<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16">${body}</svg>`);return;
+        try{
+            const bytes=await readFile(path.join(testRoot,'fixtures',path.basename(route)));
+            response.writeHead(200,{'Content-Type':'image/svg+xml','Content-Length':bytes.length,'Cache-Control':'no-store'});response.end(bytes);
+        }catch{
+            response.writeHead(404);response.end();
+        }
+        return;
     }
     if(route!=='/source.xhtml'){
         response.writeHead(404);response.end();return;
     }
     try{
-        let bytes=await readFile(path.join(work,'source.xhtml'));
-        if(suite==='fixed')bytes=Buffer.from('<?xml version="1.0"?><html xmlns="http://www.w3.org/1999/xhtml"><head><title>Fixed original fixture</title><meta name="viewport" content="width=320,height=480"/><style>html,body{margin:0;padding:0;width:320px;height:480px;overflow:hidden}svg{display:block;width:320px;height:480px}</style></head><body><svg xmlns="http://www.w3.org/2000/svg" width="320" height="480" viewBox="0 0 320 480"><rect id="art" width="320" height="480" fill="#0f766e"/><a href="#target"><rect x="64" y="100" width="192" height="100" fill="white"/><text x="100" y="160" font-size="36" fill="black">LINK</text></a><text id="target" x="100" y="440" font-size="32" fill="white">PAGE 2</text></svg></body></html>');
-        if(suite==='images')bytes=Buffer.from(bytes.toString('utf8').replace('</h1>','</h1><p>本文<img id="glyph" class="gaiji" src="glyph.svg" style="width:1em;height:1em;background-color:white"/>続き<img id="colored" class="gaiji" src="colored.svg" style="width:1em;height:1em"/><img id="gradient" src="gradient.svg" style="width:1em;height:1em"/>終わり</p>'));
+        const bytes=await readFile(path.join(work,'source.xhtml'));
         response.writeHead(200,{
             'Content-Type':'application/xhtml+xml; charset=utf-8',
             'Content-Length':bytes.length,

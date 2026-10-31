@@ -3,6 +3,13 @@ function countChapters(items) {
     globalThis.__vobrCountErrors=[];
     let next=0;
     const launch=()=>{
+        // A fixed-layout spine item is one source page even when the reader
+        // displays it beside another item. Do not fetch/rasterize its artwork
+        // just to rediscover the publisher's declared page count.
+        while(next<items.length&&items[next].options.flow==='fixed'){
+            const item=items[next++];
+            globalThis.__vobrCountResults.push({chapter:item.chapter,starts:[null]});
+        }
         if(next>=items.length)return;
         const item=items[next++];
         const frame=document.createElement('iframe');
@@ -10,7 +17,7 @@ function countChapters(items) {
         frame.onload=()=>{
             try {
                 const bridge=globalThis.__vobrInstallNavigator(frame.contentWindow);
-                bridge.dispatch({type:'configure',revision:1,chapter:item.chapter,nodes:[],options:item.options});
+                bridge.dispatch({type:'configure',revision:1,chapter:item.chapter,nodes:[],options:{...item.options,pagination_only:true}});
                 const started=performance.now();
                 const poll=()=>{
                     try {

@@ -169,7 +169,11 @@ impl Settings {
     }
 
     pub fn spread_gap(&self, image_pages: bool) -> f32 {
-        self.page_gap.unwrap_or(if image_pages { 0. } else { 24. })
+        if image_pages {
+            0.
+        } else {
+            self.page_gap.unwrap_or(24.)
+        }
     }
 
     /// Reject non-finite values before they reach layout, playback or JSON.
@@ -277,7 +281,7 @@ mod margin_tests {
         );
         assert_eq!(
             (roundtrip.spread_gap(false), roundtrip.spread_gap(true)),
-            (12., 12.)
+            (12., 0.)
         );
         old.margin_vertical = Some(f32::NAN);
         assert!(old.validate().is_err());
