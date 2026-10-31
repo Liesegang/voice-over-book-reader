@@ -944,16 +944,21 @@ impl ReaderApp {
                         self.layout_key.clear();
                         if index == self.chapter {
                             let chapter = &self.book.chapters[index];
-                            self.pending_restore = self
-                                .pending_restore
-                                .filter(|l| l.chapter as usize == index)
-                                .or_else(|| {
-                                    self.pending_fragment
-                                        .take()
-                                        .and_then(|f| chapter.anchors.get(&f).copied())
-                                })
-                                .or_else(|| chapter.start_locator());
-                            self.resume_locator = self.pending_restore;
+                            if self.pending_page_index.is_none()
+                                && self.pending_page_fraction.is_none()
+                                && self.pending_book_seek.is_none()
+                            {
+                                self.pending_restore = self
+                                    .pending_restore
+                                    .filter(|l| l.chapter as usize == index)
+                                    .or_else(|| {
+                                        self.pending_fragment
+                                            .take()
+                                            .and_then(|f| chapter.anchors.get(&f).copied())
+                                    })
+                                    .or_else(|| chapter.start_locator());
+                                self.resume_locator = self.pending_restore;
+                            }
                             self.book
                                 .unload_chapters_except(&[self.chapter, self.chapter + 1]);
                         }
@@ -1096,6 +1101,10 @@ impl ReaderApp {
         self.page = 0;
         self.layout_key.clear();
         self.selected = None;
+        self.pending_book_seek = None;
+        self.pending_page_index = None;
+        self.pending_page_fraction = None;
+        self.pending_fragment = None;
         self.pending_restore = Some(locator);
         self.resume_locator = Some(locator);
     }
@@ -4662,6 +4671,11 @@ impl ReaderApp {
     }
     fn seek_book(&mut self, fraction: f32) {
         let Some(index) = &self.pagination_index else {
+            self.pending_restore = None;
+            self.resume_locator = None;
+            self.pending_fragment = None;
+            self.pending_page_index = None;
+            self.pending_page_fraction = None;
             self.pending_book_seek = Some(fraction);
             return;
         };
@@ -4672,6 +4686,9 @@ impl ReaderApp {
         self.jump_to_chapter(chapter, None);
         self.pending_page_index = Some(page);
         self.pending_page_fraction = None;
+        self.pending_restore = None;
+        self.resume_locator = None;
+        self.pending_fragment = None;
     }
     fn ensure_pagination_index(&mut self) {
         if self.opening || self.book.chapters.is_empty() || self.layout.pages.is_empty() {
@@ -4824,6 +4841,9 @@ impl ReaderApp {
         self.selected = None;
         self.selection_anchor = None;
         self.chapter_loading = None;
+        self.pending_book_seek = None;
+        self.pending_page_index = None;
+        self.pending_page_fraction = None;
         self.pending_fragment = fragment;
         self.pending_restore = self
             .book

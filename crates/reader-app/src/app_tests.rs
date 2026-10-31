@@ -3038,6 +3038,82 @@ fn bookmark_search_and_toc_clicks_record_only_their_jump_origins() {
 }
 
 #[test]
+fn numeric_seek_within_a_chapter_discards_stale_source_navigation() {
+    let mut fixture = TestApp::new();
+    fixture.reading_fixture();
+    let count = fixture.app.layout.pages.len();
+    let index = crate::pagination::PageIndex::new(vec![count]).unwrap();
+    let stale = fixture.app.book.chapters[0].start_locator().unwrap();
+    for target in [2, 3] {
+        fixture.app.pagination_index = Some(index.clone());
+        fixture.app.pending_restore = Some(stale);
+        fixture.app.resume_locator = Some(stale);
+        fixture.app.pending_fragment = Some("old-section".into());
+        fixture.app.seek_book(index.fraction(0, target));
+        assert_eq!(fixture.app.pending_page_index, Some(target));
+        assert!(fixture.app.pending_restore.is_none());
+        assert!(fixture.app.resume_locator.is_none());
+        assert!(fixture.app.pending_fragment.is_none());
+        fixture.frame(vec2(1280., 760.), vec![]);
+        assert_eq!(fixture.app.page, target);
+    }
+}
+
+#[test]
+fn numeric_seek_survives_asynchronous_target_chapter_completion() {
+    let mut fixture = TestApp::new();
+    fixture.image_fixture(2);
+    let chapter = fixture.app.book.chapters[1].clone();
+    fixture.app.book.chapters[1].loaded = false;
+    let index = crate::pagination::PageIndex::new(vec![1, 8]).unwrap();
+    fixture.app.pagination_index = Some(index.clone());
+    fixture.app.seek_book(index.fraction(1, 5));
+    assert_eq!(fixture.app.chapter, 1);
+    fixture.app.chapter_request = 77;
+    fixture.app.chapter_loading = Some(1);
+    fixture
+        .app
+        .tx
+        .send(Work::Chapter {
+            book_generation: fixture.app.open_generation,
+            request: 77,
+            index: 1,
+            result: Ok(chapter),
+        })
+        .unwrap();
+    fixture.app.handle_work();
+    assert!(fixture.app.chapter_loading.is_none());
+    assert_eq!(fixture.app.pending_page_index, Some(5));
+    assert!(fixture.app.pending_restore.is_none());
+    assert!(fixture.app.resume_locator.is_none());
+    assert!(fixture.app.pending_fragment.is_none());
+}
+
+#[test]
+fn later_toc_and_bookmark_navigation_replace_pending_numeric_seeks() {
+    let mut fixture = TestApp::new();
+    fixture.image_fixture(3);
+    fixture.app.pagination_index = Some(crate::pagination::PageIndex::new(vec![6, 6, 6]).unwrap());
+    fixture.app.seek_book(0.5);
+    assert!(fixture.app.pending_page_index.is_some());
+    fixture.app.jump_to_chapter(2, None);
+    assert_eq!(fixture.app.chapter, 2);
+    assert!(fixture.app.pending_page_index.is_none());
+    assert!(fixture.app.pending_page_fraction.is_none());
+    assert_eq!(fixture.app.pending_restore.unwrap().chapter, 2);
+    fixture.app.pagination_index = None;
+    fixture.app.seek_book(0.2);
+    assert_eq!(fixture.app.pending_book_seek, Some(0.2));
+    let bookmark = fixture.app.book.chapters[0].start_locator().unwrap();
+    fixture.app.restore_locator(bookmark);
+    assert!(fixture.app.pending_book_seek.is_none());
+    assert!(fixture.app.pending_page_index.is_none());
+    assert!(fixture.app.pending_page_fraction.is_none());
+    assert_eq!(fixture.app.pending_restore, Some(bookmark));
+    assert_eq!(fixture.app.resume_locator, Some(bookmark));
+}
+
+#[test]
 fn repeated_seeks_before_a_target_is_painted_do_not_record_provisional_locations() {
     let mut fixture = TestApp::new();
     fixture.reading_fixture();

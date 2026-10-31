@@ -963,7 +963,9 @@ impl ReaderApp {
         let previous_key = reader.layout_key.clone();
         reader.configure(self, rect.size(), p);
         if previous_key != reader.layout_key {
-            self.pending_restore = self.current_book_locator().or(self.pending_restore);
+            if self.pending_page_index.is_none() && self.pending_page_fraction.is_none() {
+                self.pending_restore = self.current_book_locator().or(self.pending_restore);
+            }
             self.pagination_index = None;
             self.pagination_pending = true;
             self.pagination_error = None;
@@ -1109,6 +1111,8 @@ impl ReaderApp {
                     };
                     self.layout_key = reader.layout_key.clone();
                     self.page = self.page.min(self.layout.pages.len().saturating_sub(1));
+                    let numeric_seek =
+                        self.pending_page_index.is_some() || self.pending_page_fraction.is_some();
                     if let Some(page) = self.pending_page_index.take() {
                         self.page = page.min(self.layout.pages.len() - 1);
                     }
@@ -1116,7 +1120,14 @@ impl ReaderApp {
                         self.page = (fraction * self.layout.pages.len().saturating_sub(1) as f32)
                             .round() as usize;
                     }
-                    if let Some(location) = self.pending_restore.take() {
+                    if numeric_seek {
+                        self.pending_restore = None;
+                        self.pending_fragment = None;
+                        self.resume_locator = None;
+                        pane.cancel_navigation();
+                        pane.page_flight.force_page_sync = true;
+                        events.retain(|event| !matches!(event, NavigatorEvent::Position { .. }));
+                    } else if let Some(location) = self.pending_restore.take() {
                         events.retain(|event| !matches!(event, NavigatorEvent::Position { .. }));
                         pane.locate(location)?;
                     } else if let Some(fragment) = self.pending_fragment.take() {
