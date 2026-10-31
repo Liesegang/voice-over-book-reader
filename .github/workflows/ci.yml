@@ -86,6 +86,20 @@ jobs:
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
 
+      - name: Pin Microsoft native linkers
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $linker64 = Join-Path $env:VCToolsInstallDir 'bin/Hostx64/x64/link.exe'
+          $linker32 = Join-Path $env:VCToolsInstallDir 'bin/Hostx64/x86/link.exe'
+          if (!(Test-Path -LiteralPath $linker64 -PathType Leaf) -or !(Test-Path -LiteralPath $linker32 -PathType Leaf)) {
+            throw 'Microsoft x64/x86 linkers are missing from the configured C++ toolchain'
+          }
+          # This also covers host build scripts and proc macros. Git Bash's
+          # unrelated /usr/bin/link.exe must never be selected by Cargo.
+          "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$linker64" >> $env:GITHUB_ENV
+          "CARGO_TARGET_I686_PC_WINDOWS_MSVC_LINKER=$linker32" >> $env:GITHUB_ENV
+
       - name: Self-contained Windows CRT
         if: runner.os == 'Windows'
         # Every Cargo command has --target, so host proc macros remain unaffected.
