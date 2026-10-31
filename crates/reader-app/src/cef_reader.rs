@@ -21,11 +21,14 @@ pub(super) struct CefReader {
     expected_panes: usize,
     auxiliary: Option<Pane>,
     counter: Option<Counter>,
-    count_plan: Option<Receiver<Result<Vec<CountItem>, String>>>,
+    count_plan: Option<Receiver<Result<CountPlanMessage, String>>>,
+    count_plan_started: bool,
+    count_plan_finished: bool,
+    count_pending: std::collections::VecDeque<CountItem>,
     counter_url: String,
-    counter_script: Option<String>,
     font_css: String,
     counted: Vec<Option<Vec<Option<Locator>>>>,
+    compatibility_stamp: Option<CompatibilityLayoutStamp>,
     count_epoch: Arc<std::sync::atomic::AtomicU64>,
     cache_path: Option<PathBuf>,
     error: Option<String>,
@@ -38,8 +41,39 @@ pub(super) struct CefReader {
 struct Counter {
     surface: GpuBookSurface<'static>,
     started: bool,
+    ready: bool,
+    enqueuing: bool,
     polling: bool,
     next_poll: Instant,
+}
+enum CountPlanMessage {
+    Item(Box<CountItem>),
+    Finished,
+}
+
+fn discover_count_items(
+    existing: &[bool],
+    epoch: &std::sync::atomic::AtomicU64,
+    generation: u64,
+    mut build: impl FnMut(usize) -> Result<CountItem>,
+    mut emit: impl FnMut(CountPlanMessage) -> Result<()>,
+) -> Result<()> {
+    for (chapter, known) in existing.iter().enumerate() {
+        anyhow::ensure!(
+            epoch.load(std::sync::atomic::Ordering::Relaxed) == generation,
+            "Page calculation superseded"
+        );
+        if *known {
+            continue;
+        }
+        let item = build(chapter)?;
+        anyhow::ensure!(
+            epoch.load(std::sync::atomic::Ordering::Relaxed) == generation,
+            "Page calculation superseded"
+        );
+        emit(CountPlanMessage::Item(Box::new(item)))?;
+    }
+    emit(CountPlanMessage::Finished)
 }
 #[derive(serde::Serialize)]
 struct CountItem {
@@ -65,6 +99,8 @@ struct Pane {
     page: usize,
     requested_page: usize,
     starts: Vec<Option<Locator>>,
+    starts_version: Arc<()>,
+    starts_dirty: bool,
     waiting_paint: Option<u64>,
     page_flight: PageFlight,
     location_flight: LocationFlight,
@@ -81,6 +117,94 @@ struct Pane {
     cursor: egui::CursorIcon,
     auxiliary_location: Option<Locator>,
     last_rect: Option<Rect>,
+}
+
+struct CompatibilityLayoutStamp {
+    chapter: usize,
+    revision: Revision,
+    starts_version: Arc<()>,
+}
+impl CompatibilityLayoutStamp {
+    fn matches(&self, other: &Self) -> bool {
+        self.chapter == other.chapter
+            && self.revision == other.revision
+            && Arc::ptr_eq(&self.starts_version, &other.starts_version)
+    }
+}
+
+fn refresh_compatibility_layout(
+    cached: &mut Option<CompatibilityLayoutStamp>,
+    current: CompatibilityLayoutStamp,
+    invalidated: bool,
+    refresh: impl FnOnce(),
+) {
+    if !invalidated && cached.as_ref().is_some_and(|old| old.matches(&current)) {
+        return;
+    }
+    refresh();
+    *cached = Some(current);
+}
+
+struct IndexedSource<'a> {
+    atom: &'a reader_core::Atom,
+    atom_index: usize,
+    preceding: usize,
+    span: reader_core::SourceSpan,
+}
+
+fn compatibility_layout(
+    chapter: &reader_core::Chapter,
+    starts: &[Option<Locator>],
+    position: Pos2,
+    font_size: f32,
+) -> BookLayout {
+    let _measurement = crate::latency::span("chromium_compatibility_layout", chapter.id as u64);
+    let mut by_node: std::collections::HashMap<u32, Vec<IndexedSource<'_>>> =
+        std::collections::HashMap::new();
+    for (atom_index, atom) in chapter.atoms().into_iter().enumerate() {
+        let mut preceding = 0;
+        for &span in &atom.sources {
+            by_node.entry(span.node).or_default().push(IndexedSource {
+                atom,
+                atom_index,
+                preceding,
+                span,
+            });
+            preceding += span.len();
+        }
+    }
+    BookLayout {
+        pages: starts
+            .iter()
+            .map(|&start| {
+                let mut page = layout::Page {
+                    anchor: start,
+                    ..Default::default()
+                };
+                let hit = start.and_then(|locator| {
+                    let source = by_node.get(&locator.node)?.iter().find(|source| {
+                        source.span.chapter == locator.chapter
+                            && locator.offset >= source.span.start
+                            && locator.offset < source.span.end
+                    })?;
+                    let offset = source.preceding + (locator.offset - source.span.start) as usize;
+                    let text = source.atom.text.get(offset..)?.chars().next()?;
+                    Some(Hit {
+                        rect: Rect::from_min_size(position, vec2(1., font_size)),
+                        locator,
+                        end: source.atom.locator_at(offset + text.len_utf8())?,
+                        unit_id: layout::unit_id(chapter.id, source.atom_index),
+                        offset,
+                        text: text.to_string(),
+                    })
+                });
+                if let Some(hit) = hit {
+                    page.hits.push(hit);
+                }
+                page
+            })
+            .collect(),
+    }
 }
 
 fn next_document_revision(current: Revision, settings_revision: u64) -> Revision {
@@ -365,6 +489,11 @@ impl Pane {
     }
 
     fn request_page(&mut self) -> Result<()> {
+        if self.ready {
+            // A queued numeric target can outlive repagination. Use this
+            // document's confirmed range, never a prior/native page count.
+            self.set_requested_page(confirmed_page(self.requested_page, self.starts.len()));
+        }
         if !self.ready
             || self.awaiting_location
             || self.waiting_paint.is_some()
@@ -421,6 +550,10 @@ impl Pane {
         })?;
         Ok(())
     }
+}
+
+fn confirmed_page(requested: usize, pages: usize) -> usize {
+    requested.min(pages.saturating_sub(1))
 }
 
 fn auxiliary_regions(ui: &mut Ui) -> (Rect, egui::Response, Ui) {
@@ -481,13 +614,16 @@ impl CefReader {
             auxiliary: None,
             counter: None,
             counted: Vec::new(),
+            compatibility_stamp: None,
             count_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cache_path: None,
             error: None,
             highlight: None,
             count_plan: None,
+            count_plan_started: false,
+            count_plan_finished: true,
+            count_pending: std::collections::VecDeque::new(),
             counter_url: String::new(),
-            counter_script: None,
             font_css: String::new(),
             turn_pending: false,
             hit_action: None,
@@ -586,6 +722,10 @@ impl CefReader {
         self.release_pane(auxiliary);
         self.retire_counter();
         self.count_plan = None;
+        self.count_plan_started = false;
+        self.count_plan_finished = true;
+        self.count_pending.clear();
+        self.compatibility_stamp = None;
         if let Some(origin) = self.origin.take() {
             let _ = origin.unregister_global();
         }
@@ -725,6 +865,8 @@ impl CefReader {
             page: 0,
             requested_page: 0,
             starts: Vec::new(),
+            starts_version: Arc::new(()),
+            starts_dirty: true,
             waiting_paint: None,
             page_flight: PageFlight::default(),
             location_flight: LocationFlight::default(),
@@ -785,6 +927,8 @@ impl CefReader {
                 pane.page = 0;
                 pane.requested_page = 0;
                 pane.starts.clear();
+                pane.starts_version = Arc::new(());
+                pane.starts_dirty = true;
                 pane.annotations.clear();
                 pane.highlight = None;
                 pane.captured_buttons = 0;
@@ -892,7 +1036,10 @@ impl CefReader {
             pane.set_requested_page(0);
             Self::poll_pane(&self.render, &mut pane, &mut Vec::new(), false)?;
             if pane.ready {
-                self.counted[next] = Some(pane.starts.clone());
+                if pane.starts_dirty || self.counted[next].is_none() {
+                    self.counted[next] = Some(pane.starts.clone());
+                    pane.starts_dirty = false;
+                }
                 pane.request_page()?;
             }
             Ok(())
@@ -939,6 +1086,8 @@ impl CefReader {
                             if pane.starts.is_empty() {
                                 pane.starts.push(None);
                             }
+                            pane.starts_version = Arc::new(());
+                            pane.starts_dirty = true;
                             pane.ready = true;
                             pane.writing_mode = Some(if writing_mode.starts_with("vertical") {
                                 reader_core::WritingMode::VerticalRl
@@ -1102,6 +1251,10 @@ impl CefReader {
         self.layout_key = key;
         self.retire_counter();
         self.count_plan = None;
+        self.count_plan_started = false;
+        self.count_plan_finished = false;
+        self.count_pending.clear();
+        self.compatibility_stamp = None;
         self.counted = vec![None; app.book.chapters.len()];
         use std::hash::{Hash, Hasher};
         let mut hash = std::collections::hash_map::DefaultHasher::new();
@@ -1124,60 +1277,70 @@ impl CefReader {
             }
         }
         self.cache_path = Some(path);
-        if self.counted.iter().any(Option::is_none) {
-            let book = app.book.clone();
-            let settings = app.settings.clone();
-            let origin = self.origin.as_ref().unwrap().clone();
-            let existing = self.counted.clone();
-            let font_css = self.font_css.clone();
-            let epoch = self.count_epoch.clone();
-            let generation = self.revision;
-            let debounce = self.panes[0].is_some();
-            let (tx, rx) = mpsc::channel();
-            self.count_plan = Some(rx);
-            std::thread::spawn(move || {
-                let result = (|| -> Result<Vec<CountItem>> {
-                    if debounce {
-                        std::thread::sleep(Duration::from_millis(120));
-                    }
-                    let mut items = Vec::new();
-                    for (chapter, cached) in existing.iter().enumerate() {
-                        anyhow::ensure!(
-                            epoch.load(std::sync::atomic::Ordering::Relaxed) == generation,
-                            "Page calculation superseded"
-                        );
-                        if cached.is_some() {
-                            continue;
-                        }
-                        let mut metadata = book.clone();
-                        metadata.chapters[chapter] = book.load_chapter(chapter)?;
-                        let plan = crate::reading_surface::chapter_spread(
-                            &metadata, chapter, extent, &settings,
-                        );
-                        let size = plan.extent(extent);
-                        let mut layout_options =
-                            options(&metadata.chapters[chapter], &settings, p, &font_css);
-                        // Ink adaptation preserves geometry; pagination never
-                        // needs the additional pixel scan or image copies.
-                        layout_options.adapt_monochrome_images = false;
-                        layout_options.measurement_marker = false;
-                        items.push(CountItem {
-                            chapter,
-                            url: origin.url(&metadata.chapters[chapter].href)?,
-                            width: size.x,
-                            height: size.y,
-                            options: layout_options,
-                            known_starts: crate::pagination::known_chromium_page_starts(
-                                &metadata.chapters[chapter],
-                            ),
-                        });
-                    }
-                    Ok(items)
-                })()
-                .map_err(|error| error.to_string());
-                let _ = tx.send(result);
-            });
+        self.count_plan_finished = self.counted.iter().all(Option::is_some);
+    }
+
+    // Called only after the first visible pane has settled. Expensive native
+    // source parsing must not compete with that pane's initial document load.
+    fn start_count_plan(&mut self, app: &ReaderApp, extent: egui::Vec2, p: Palette) {
+        if self.count_plan_started || self.count_plan_finished {
+            return;
         }
+        self.count_plan_started = true;
+        let mut metadata = app.book.clone();
+        let settings = app.settings.clone();
+        let origin = self.origin.as_ref().unwrap().clone();
+        let existing: Vec<_> = self.counted.iter().map(Option::is_some).collect();
+        let font_css = self.font_css.clone();
+        let epoch = self.count_epoch.clone();
+        let generation = self.revision;
+        let ctx = app.worker_context.clone();
+        // Only the worker can wait for capacity. Dropping the receiver on a
+        // book/layout change immediately releases an obsolete blocked sender.
+        let (tx, rx) = mpsc::sync_channel(4);
+        self.count_plan = Some(rx);
+        std::thread::spawn(move || {
+            let result = discover_count_items(
+                &existing,
+                &epoch,
+                generation,
+                |chapter| {
+                    let _parse = crate::latency::span("chromium_count_source", chapter as u64);
+                    let loaded = metadata.load_chapter(chapter)?;
+                    // Keep one working metadata book instead of deep-cloning
+                    // every chapter's strings/atoms for every item in a book.
+                    let stub = std::mem::replace(&mut metadata.chapters[chapter], loaded);
+                    let plan = crate::reading_surface::chapter_spread(
+                        &metadata, chapter, extent, &settings,
+                    );
+                    let size = plan.extent(extent);
+                    let source = &metadata.chapters[chapter];
+                    let mut layout_options = options(source, &settings, p, &font_css);
+                    layout_options.adapt_monochrome_images = false;
+                    layout_options.measurement_marker = false;
+                    let item = CountItem {
+                        chapter,
+                        url: origin.url(&source.href)?,
+                        width: size.x,
+                        height: size.y,
+                        options: layout_options,
+                        known_starts: crate::pagination::known_chromium_page_starts(source),
+                    };
+                    metadata.chapters[chapter] = stub;
+                    Ok(item)
+                },
+                |message| {
+                    tx.send(Ok(message))
+                        .map_err(|_| anyhow::anyhow!("Page calculation receiver closed"))?;
+                    ctx.request_repaint();
+                    Ok(())
+                },
+            );
+            if let Err(error) = result {
+                let _ = tx.send(Err(error.to_string()));
+            }
+            ctx.request_repaint();
+        });
     }
     fn count(
         &mut self,
@@ -1185,53 +1348,60 @@ impl CefReader {
         rect: Rect,
         p: Palette,
     ) -> Result<Option<crate::pagination::PageIndex>> {
-        let _ = (rect, p);
-        if let Some(rx) = self.count_plan.as_ref()
-            && let Ok(items) = rx.try_recv()
-        {
-            let mut items = items.map_err(anyhow::Error::msg)?;
-            self.count_plan = None;
-            items.retain_mut(|item| {
-                if self.counted[item.chapter].is_some() {
-                    return false;
+        self.start_count_plan(app, rect.size(), p);
+        // Bound UI work per frame even when discovery finishes a long image
+        // book faster than the native shell can repaint its progress.
+        for _ in 0..8 {
+            let message = match self.count_plan.as_ref().map(Receiver::try_recv) {
+                Some(Ok(message)) => message.map_err(anyhow::Error::msg)?,
+                Some(Err(mpsc::TryRecvError::Disconnected)) => {
+                    anyhow::bail!("Page calculation stopped before discovery completed");
                 }
-                // Legacy image-only EPUBs reveal their exact one-page
-                // geometry after parsing XHTML/image headers, without pixel
-                // decoding. They need no measurement browser either.
-                if let Some(starts) = item.known_starts.take() {
-                    self.counted[item.chapter] = Some(starts);
-                    return false;
+                _ => break,
+            };
+            match message {
+                CountPlanMessage::Finished => {
+                    self.count_plan_finished = true;
+                    self.count_plan = None;
+                    break;
                 }
-                true
-            });
-            if !items.is_empty() {
-                let mut surface = GpuBookSurface::new(
-                    self.runtime.as_ref().unwrap(),
-                    self.render.device.clone(),
-                    self.render.queue.clone(),
-                    SurfaceOptions {
-                        initial_url: self.counter_url.clone(),
-                        physical_size: [2, 2],
-                        scale_factor: 1.,
-                        background: [250, 248, 242],
-                        profile: None,
-                    },
-                )?;
-                let ctx = app.worker_context.clone();
-                surface.set_repaint_wake(Some(Arc::new(move || ctx.request_repaint())));
-                let serialized = serde_json::to_string(&items)?;
-                // Keep the script until LoadEnd. The data is encoded, never interpreted as source.
-                self.counter = Some(Counter {
-                    surface,
-                    started: false,
-                    polling: false,
-                    next_poll: Instant::now(),
-                });
-                self.counter_script = Some(format!(
-                    "({})({serialized})",
-                    include_str!("cef_counter.js")
-                ));
+                CountPlanMessage::Item(mut item) => {
+                    if self.counted[item.chapter].is_some() {
+                        continue;
+                    }
+                    // Publish exact image-page classification immediately,
+                    // without waiting for every other chapter to be parsed.
+                    if let Some(starts) = item.known_starts.take() {
+                        self.counted[item.chapter] = Some(starts);
+                    } else {
+                        self.count_pending.push_back(*item);
+                    }
+                }
             }
+        }
+        if self.counter.is_none() && !self.count_pending.is_empty() {
+            let mut surface = GpuBookSurface::new(
+                self.runtime.as_ref().unwrap(),
+                self.render.device.clone(),
+                self.render.queue.clone(),
+                SurfaceOptions {
+                    initial_url: self.counter_url.clone(),
+                    physical_size: [2, 2],
+                    scale_factor: 1.,
+                    background: [250, 248, 242],
+                    profile: None,
+                },
+            )?;
+            let ctx = app.worker_context.clone();
+            surface.set_repaint_wake(Some(Arc::new(move || ctx.request_repaint())));
+            self.counter = Some(Counter {
+                surface,
+                started: false,
+                ready: false,
+                enqueuing: false,
+                polling: false,
+                next_poll: Instant::now(),
+            });
         }
         if let Some(counter) = self.counter.as_mut() {
             counter.surface.poll()?;
@@ -1239,9 +1409,17 @@ impl CefReader {
                 match event {
                     SurfaceEvent::DocumentLoaded { .. } if !counter.started => {
                         counter.surface.install_navigator()?;
-                        let script = self.counter_script.take().unwrap();
+                        let script = format!("({})([])", include_str!("cef_counter.js"));
                         counter.surface.request_script_result(7000, &script)?;
                         counter.started = true;
+                    }
+                    SurfaceEvent::ScriptResult { id: 7000, result } => {
+                        result.map_err(anyhow::Error::msg)?;
+                        counter.ready = true;
+                    }
+                    SurfaceEvent::ScriptResult { id: 7002, result } => {
+                        counter.enqueuing = false;
+                        result.map_err(anyhow::Error::msg)?;
                     }
                     SurfaceEvent::ScriptResult { id: 7001, result } => {
                         counter.polling = false;
@@ -1272,16 +1450,35 @@ impl CefReader {
                     _ => {}
                 }
             }
-            if counter.started && !counter.polling && Instant::now() >= counter.next_poll {
+            if counter.ready && !counter.enqueuing && !self.count_pending.is_empty() {
+                let mut batch = Vec::new();
+                while batch.len() < 3 {
+                    let Some(item) = self.count_pending.pop_front() else {
+                        break;
+                    };
+                    if self.counted[item.chapter].is_none() {
+                        batch.push(item);
+                    }
+                }
+                if !batch.is_empty() {
+                    let serialized = serde_json::to_string(&batch)?;
+                    counter.surface.request_script_result(
+                        7002,
+                        &format!("globalThis.__vobrEnqueueCountItems({serialized})"),
+                    )?;
+                    counter.enqueuing = true;
+                }
+            }
+            if counter.ready && !counter.polling && Instant::now() >= counter.next_poll {
                 counter.surface.request_script_result(7001,"({results:globalThis.__vobrCountResults?.splice(0)??[],errors:globalThis.__vobrCountErrors??[]})")?;
                 counter.polling = true;
                 counter.next_poll = Instant::now() + Duration::from_millis(8);
             }
         }
-        if self.counted.iter().all(Option::is_some) {
+        if self.count_plan_finished && self.counted.iter().all(Option::is_some) {
             self.retire_counter();
             self.count_plan = None;
-            self.counter_script = None;
+            self.count_pending.clear();
             let starts: Vec<_> = self.counted.iter().map(|p| p.clone().unwrap()).collect();
             let index = crate::pagination::PageIndex::new_with_starts(
                 starts.iter().map(Vec::len).collect(),
@@ -1431,10 +1628,13 @@ impl ReaderApp {
         }
         if !self.book.chapters[self.chapter].loaded {
             self.request_chapter();
+            // The requested chapter parses on its worker while the one-time
+            // Chromium runtime initializes on the native UI thread.
+            reader.bind_book(self)?;
+            reader.runtime.as_ref().unwrap().pump();
             return Ok(());
         }
         reader.bind_book(self)?;
-        self.prefetch_next_chapter();
         reader.runtime.as_ref().unwrap().pump();
         let previous_key = reader.layout_key.clone();
         reader.configure(self, rect.size(), p);
@@ -1574,6 +1774,16 @@ impl ReaderApp {
             }
             let mut pane_events = Vec::new();
             CefReader::poll_pane(&reader.render, pane, &mut pane_events, true)?;
+            if slot > 0 && target == self.chapter && pane.ready && target_page >= pane.starts.len()
+            {
+                // The secondary document may finish repagination later than
+                // the primary. An absent N+1 page leaves its slot empty; never
+                // send it out of range or repeat the last page in both slots.
+                reader.expected_panes -= 1;
+                let old = reader.panes[slot].take();
+                reader.release_pane(old);
+                continue;
+            }
             if ui.rect_contains_pointer(target_rect) {
                 ui.ctx().set_cursor_icon(pane.cursor);
             }
@@ -1602,26 +1812,30 @@ impl ReaderApp {
                 if let Some(writing_mode) = pane.writing_mode {
                     self.book.chapters[target].writing_mode = writing_mode;
                 }
-                reader.counted[target] = Some(pane.starts.clone());
+                if pane.starts_dirty || reader.counted[target].is_none() {
+                    reader.counted[target] = Some(pane.starts.clone());
+                    pane.starts_dirty = false;
+                }
                 if slot == 0 {
-                    self.layout = BookLayout {
-                        pages: pane
-                            .starts
-                            .iter()
-                            .map(|start| {
-                                let mut page = layout::Page {
-                                    anchor: *start,
-                                    ..Default::default()
-                                };
-                                if let Some(hit) = start
-                                    .and_then(|start| self.chromium_hit(start, target_rect.min))
-                                {
-                                    page.hits.push(hit);
-                                }
-                                page
-                            })
-                            .collect(),
-                    };
+                    let invalidated = self.layout_key != reader.layout_key
+                        || self.layout.pages.len() != pane.starts.len();
+                    refresh_compatibility_layout(
+                        &mut reader.compatibility_stamp,
+                        CompatibilityLayoutStamp {
+                            chapter: target,
+                            revision: pane.revision,
+                            starts_version: pane.starts_version.clone(),
+                        },
+                        invalidated,
+                        || {
+                            self.layout = compatibility_layout(
+                                &self.book.chapters[target],
+                                &pane.starts,
+                                target_rect.min,
+                                self.settings.font_size,
+                            )
+                        },
+                    );
                     self.layout_key = reader.layout_key.clone();
                     self.page = self.page.min(self.layout.pages.len().saturating_sub(1));
                     let numeric_seek =
@@ -1802,9 +2016,10 @@ impl ReaderApp {
         });
         if self.pagination_index.is_none()
             && self.pagination_error.is_none()
-            && reader.panes[0]
-                .as_ref()
-                .is_some_and(|pane| pane.ready && pane.displayed && pane.navigation_idle())
+            && (reader.count_plan_started
+                || reader.panes[0]
+                    .as_ref()
+                    .is_some_and(|pane| pane.ready && pane.displayed && pane.navigation_idle()))
         {
             match reader.count(self, rect, p) {
                 Ok(Some(index)) => {
@@ -1879,12 +2094,14 @@ impl ReaderApp {
                 }
             }
         }
-        self.maybe_prefetch_audio(ui.ctx());
-        self.prefetch_next_chapter();
         if reader.turn_ready() {
+            self.maybe_prefetch_audio(ui.ctx());
+            self.prefetch_next_chapter();
             // One additional browser at most. It is never an input target and
             // its events cannot change the active page, selection or speech.
             reader.prewarm_next(self, rect.size(), ui.ctx().pixels_per_point(), p);
+        } else {
+            self.invalidate_automatic_prefetch();
         }
         ui.ctx()
             .request_repaint_after(if reader.turn_ready() && !self.pagination_pending {
@@ -2500,10 +2717,254 @@ impl Drop for CefReader {
 #[cfg(test)]
 mod auxiliary_tests {
     use super::{
-        LocationFlight, Locator, PageFlight, PositionAck, PrewarmAction, Revision, WarmPaneState,
-        auxiliary_regions, next_document_revision, options, pane_target, prewarm_action,
+        CompatibilityLayoutStamp, CountItem, CountPlanMessage, LocationFlight, Locator, PageFlight,
+        PositionAck, PrewarmAction, Revision, WarmPaneState, auxiliary_regions,
+        compatibility_layout, confirmed_page, discover_count_items, next_document_revision,
+        options, pane_target, prewarm_action, refresh_compatibility_layout,
     };
     use eframe::egui::{self, Id, Pos2, Rect, TextStyle, vec2};
+
+    #[test]
+    fn page_and_word_frames_keep_compatibility_pages_until_document_layout_changes() {
+        use std::sync::Arc;
+        let chapter = reader_core::parse_html(
+            "<html><body><p>一頁目の原文</p><p>次の頁</p></body></html>",
+            8,
+            "chapter.xhtml",
+            "",
+        )
+        .unwrap();
+        let starts: Vec<_> = chapter
+            .blocks
+            .iter()
+            .filter_map(|block| block.first_locator())
+            .map(Some)
+            .collect();
+        assert_eq!(starts.len(), 2);
+        let token = Arc::new(());
+        let mut stamp = None;
+        let mut pages = super::BookLayout::default();
+        let mut builds = 0;
+        let mut refresh = |chapter_id, revision, version: Arc<()>, invalidated| {
+            refresh_compatibility_layout(
+                &mut stamp,
+                CompatibilityLayoutStamp {
+                    chapter: chapter_id,
+                    revision: Revision(revision),
+                    starts_version: version,
+                },
+                invalidated,
+                || {
+                    builds += 1;
+                    pages = compatibility_layout(&chapter, &starts, Pos2::ZERO, 24.);
+                },
+            );
+            (pages.pages.as_ptr(), pages.pages[1].anchor, builds)
+        };
+        let original = refresh(8, 3, token.clone(), false);
+        for _ in 0..600 {
+            assert_eq!(
+                refresh(8, 3, token.clone(), false),
+                original,
+                "Page/Located/highlight frames must not rebuild source pages or hits"
+            );
+        }
+        assert_eq!(
+            refresh(8, 4, token.clone(), false).2,
+            2,
+            "font/DPI revision invalidates"
+        );
+        assert_eq!(
+            refresh(9, 4, token.clone(), false).2,
+            3,
+            "a different chapter invalidates"
+        );
+        let repaginated = Arc::new(());
+        assert_eq!(
+            refresh(9, 4, repaginated.clone(), false).2,
+            4,
+            "new confirmed starts invalidate even when the count/revision is unchanged"
+        );
+        assert_eq!(
+            refresh(9, 4, repaginated, true).2,
+            5,
+            "an explicitly cleared native compatibility layout must be restored"
+        );
+    }
+
+    #[test]
+    fn indexed_compatibility_hits_preserve_atoms_ruby_utf8_offsets_and_source_page_order() {
+        let text = "<p>前😀<ruby>漢字<rt>かんじ</rt></ruby>後。</p>".repeat(932);
+        let chapter = reader_core::parse_html(
+            &format!("<html><body>{text}</body></html>"),
+            8,
+            "chapter.xhtml",
+            "",
+        )
+        .unwrap();
+        let atoms = chapter.atoms();
+        let starts: Vec<_> = atoms
+            .iter()
+            .flat_map(|atom| atom.sources.iter().map(|span| Some(span.start_locator())))
+            .collect();
+        let layout = compatibility_layout(&chapter, &starts, Pos2::ZERO, 24.);
+        assert_eq!(layout.pages.len(), starts.len());
+        let mut page = 0;
+        for (atom_index, atom) in atoms.iter().enumerate() {
+            let mut preceding = 0;
+            for span in &atom.sources {
+                let hit = &layout.pages[page].hits[0];
+                let ch = atom.text[preceding..].chars().next().unwrap();
+                assert_eq!(layout.pages[page].anchor, starts[page]);
+                assert_eq!(hit.locator, span.start_locator());
+                assert_eq!(hit.unit_id, crate::layout::unit_id(chapter.id, atom_index));
+                assert_eq!(hit.offset, preceding);
+                assert_eq!(hit.text, ch.to_string());
+                assert_eq!(hit.end, atom.locator_at(preceding + ch.len_utf8()).unwrap());
+                preceding += span.len();
+                page += 1;
+            }
+        }
+    }
+
+    fn count_item(chapter: usize) -> CountItem {
+        CountItem {
+            chapter,
+            url: format!("vobr://test/{chapter}.xhtml"),
+            width: 600.,
+            height: 800.,
+            options: reader_renderer_cef::LayoutOptions::default(),
+            known_starts: None,
+        }
+    }
+
+    #[test]
+    fn chapter_discovery_delivers_progress_before_later_parsing_finishes_or_fails() {
+        use std::sync::{atomic::AtomicU64, mpsc};
+        use std::time::Duration;
+        let (tx, rx) = mpsc::sync_channel(4);
+        let (resume, wait) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let epoch = AtomicU64::new(7);
+            discover_count_items(
+                &[true, false, false],
+                &epoch,
+                7,
+                |chapter| {
+                    if chapter == 2 {
+                        wait.recv().unwrap();
+                        anyhow::bail!("later chapter failed");
+                    }
+                    Ok(count_item(chapter))
+                },
+                |message| {
+                    tx.send(message)?;
+                    Ok(())
+                },
+            )
+        });
+        let CountPlanMessage::Item(first) = rx.recv_timeout(Duration::from_secs(5)).unwrap() else {
+            panic!("discovery cannot finish before its remaining chapters")
+        };
+        assert_eq!(
+            first.chapter, 1,
+            "cached chapter zero needs no duplicate parse"
+        );
+        assert!(rx.try_recv().is_err(), "later parsing is still blocked");
+        resume.send(()).unwrap();
+        assert!(
+            worker
+                .join()
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("later chapter")
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected)),
+            "a partial plan must never publish Finished after an error"
+        );
+    }
+
+    #[test]
+    fn replacing_a_book_unblocks_bounded_discovery_without_joining_on_the_ui() {
+        use std::sync::{atomic::AtomicU64, mpsc};
+        use std::time::Duration;
+        let (tx, rx) = mpsc::sync_channel(4);
+        let (done, completed) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = discover_count_items(
+                &[false; 100],
+                &AtomicU64::new(1),
+                1,
+                |chapter| Ok(count_item(chapter)),
+                |message| {
+                    tx.send(message)?;
+                    Ok(())
+                },
+            );
+            done.send(result.is_err()).unwrap();
+        });
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(5)),
+            Ok(CountPlanMessage::Item(_))
+        ));
+        drop(rx);
+        assert!(
+            completed.recv_timeout(Duration::from_secs(5)).unwrap(),
+            "dropping a cancelled layout's receiver releases its producer"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn cancelled_discovery_never_emits_a_just_parsed_stale_chapter_or_finished() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let epoch = AtomicU64::new(3);
+        let mut emitted = Vec::new();
+        let result = discover_count_items(
+            &[false],
+            &epoch,
+            3,
+            |chapter| {
+                epoch.store(4, Ordering::Relaxed);
+                Ok(count_item(chapter))
+            },
+            |message| {
+                emitted.push(message);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert!(emitted.is_empty());
+        discover_count_items(
+            &[true, true],
+            &epoch,
+            4,
+            |_| panic!("known source pages need no chapter loading"),
+            |message| {
+                emitted.push(message);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(emitted.as_slice(), [CountPlanMessage::Finished]));
+    }
+
+    #[test]
+    fn queued_pages_use_the_new_confirmed_range_after_pagination_shrinks() {
+        let mut flight = PageFlight::default();
+        flight.begin(Revision(2), 8);
+        let target = confirmed_page(8, 3);
+        assert_eq!(target, 2);
+        assert!(flight.supersede(Revision(3), target));
+        assert_eq!(
+            flight.position(Revision(2), 8, target, false),
+            PositionAck::Stale
+        );
+        assert_eq!(confirmed_page(usize::MAX, 1), 0);
+        assert_eq!(confirmed_page(2, 4), 2, "valid page targets remain exact");
+    }
 
     #[test]
     fn pending_warm_reversal_waits_for_the_existing_browser_and_end_retains_it() {

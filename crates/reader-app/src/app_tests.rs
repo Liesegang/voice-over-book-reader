@@ -645,6 +645,97 @@ fn latest_book_open_wins_even_when_an_older_worker_finishes_last() {
 }
 
 #[test]
+fn reader_metadata_restore_does_not_parse_chapter_zero_or_register_before_body() {
+    let mut fixture = TestApp::new();
+    let path = linked_epub_fixture(fixture.directory.path());
+    let metadata = reader_core::open_metadata(&path).unwrap();
+    let id = metadata.id.clone();
+    let expected = reader_core::open_metadata(&path)
+        .unwrap()
+        .load_chapter(1)
+        .unwrap()
+        .start_locator()
+        .unwrap();
+    fixture
+        .app
+        .store
+        .save_position(&ReadingPosition {
+            book_id: id.clone(),
+            locator: expected,
+            progress: 0.5,
+            updated_at: 1,
+        })
+        .unwrap();
+    fixture.app.open_generation = 5;
+    fixture
+        .app
+        .tx
+        .send(Work::Opened {
+            generation: 5,
+            result: Ok((metadata, path)),
+        })
+        .unwrap();
+    fixture.app.handle_work();
+    assert_eq!(fixture.app.chapter, 1);
+    assert_eq!(fixture.app.pending_restore, Some(expected));
+    assert!(
+        fixture
+            .app
+            .book
+            .chapters
+            .iter()
+            .all(|chapter| !chapter.loaded)
+    );
+    assert_eq!(fixture.app.book.archive_stats().unwrap().chapters_parsed, 0);
+    assert!(fixture.app.store.books().is_empty());
+    assert!(fixture.app.pending_registration.is_some());
+    fixture.app.request_chapter();
+    let chapter = fixture.app.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        &chapter,
+        Work::Chapter {
+            index: 1,
+            result: Ok(_),
+            ..
+        }
+    ));
+    fixture.app.tx.send(chapter).unwrap();
+    fixture.app.handle_work();
+    assert!(!fixture.app.book.chapters[0].loaded);
+    assert!(fixture.app.book.chapters[1].loaded);
+    assert_eq!(fixture.app.book.archive_stats().unwrap().chapters_parsed, 1);
+    assert_eq!(fixture.app.pending_restore, Some(expected));
+    fixture.app.register_visible_book();
+    fixture.app.handle_work();
+    assert!(fixture.app.pending_registration.is_none());
+    assert_eq!(fixture.app.store.books()[0].id, id);
+    assert_eq!(fixture.app.shelf[0].id, id);
+    assert_eq!(
+        fixture.app.store.position(&id).unwrap().unwrap().locator,
+        expected
+    );
+}
+
+#[test]
+fn standalone_reader_startup_does_not_launch_a_calibre_scan() {
+    let directory = tempfile::tempdir().unwrap();
+    let context = egui::Context::default();
+    let creation = eframe::CreationContext::_new_kittest(context);
+    let app = ReaderApp::new(
+        &creation,
+        &[
+            "--reader".into(),
+            "--data-dir".into(),
+            directory.path().to_string_lossy().into_owned(),
+        ],
+    )
+    .unwrap();
+    let work = app.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(matches!(work, Work::Dictionaries(_)));
+    assert!(matches!(app.rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+}
+
+#[test]
 fn replacing_a_book_discards_old_geometry_selection_and_delayed_taps() {
     let mut fixture = TestApp::new();
     fixture.render_reader(vec2(400.0, 360.0));
@@ -3778,4 +3869,119 @@ fn native_aivis_runtime_path_and_consent_controls_stay_clickable_inside_settings
         assert!(fixture.app.speech.is_none());
         assert!(!fixture.directory.path().join("unprepared-runtime").exists());
     }
+}
+
+#[test]
+fn automatic_prefetch_waits_for_the_final_stable_page_without_sleeping() {
+    let mut fixture = TestApp::new();
+    let now = Instant::now();
+    assert_eq!(
+        fixture.app.automatic_prefetch_wait("page-a", now),
+        Some(AUTOMATIC_PREFETCH_IDLE)
+    );
+    assert_eq!(
+        fixture
+            .app
+            .automatic_prefetch_wait("page-a", now + Duration::from_millis(349)),
+        Some(Duration::from_millis(1))
+    );
+    assert_eq!(
+        fixture
+            .app
+            .automatic_prefetch_wait("page-a", now + AUTOMATIC_PREFETCH_IDLE),
+        None
+    );
+    for page in 0..5 {
+        let at = now + Duration::from_millis(400 + page * 100);
+        let key = format!("rapid-page-{page}");
+        assert_eq!(
+            fixture.app.automatic_prefetch_wait(&key, at),
+            Some(AUTOMATIC_PREFETCH_IDLE)
+        );
+        assert_eq!(
+            fixture
+                .app
+                .automatic_prefetch_wait(&key, at + Duration::from_millis(99)),
+            Some(Duration::from_millis(251))
+        );
+    }
+    assert_eq!(
+        fixture
+            .app
+            .automatic_prefetch_wait("rapid-page-4", now + Duration::from_millis(1150)),
+        None
+    );
+    assert!(fixture.app.speech.is_none());
+}
+
+#[test]
+fn rapid_pages_never_start_a_prefetch_provider_and_navigation_invalidates_stale_warming() {
+    let mut fixture = TestApp::new();
+    fixture.reading_fixture();
+    fixture.app.settings.tts.pre_cache = true;
+    fixture.app.speech_provider = "aivis".into();
+    fixture.app.load_profile_fields();
+    let mut keys = std::collections::HashSet::new();
+    for page in 0..5 {
+        fixture.app.page = page;
+        fixture.app.maybe_prefetch_audio(&fixture.context);
+        keys.insert(
+            fixture
+                .app
+                .automatic_prefetch_candidate
+                .as_ref()
+                .unwrap()
+                .0
+                .clone(),
+        );
+        assert!(
+            fixture.app.speech.is_none(),
+            "a transient page must not even create a provider"
+        );
+        assert!(fixture.app.prefetched_audio.is_none());
+    }
+    assert_eq!(keys.len(), 5);
+    let key = fixture
+        .app
+        .automatic_prefetch_candidate
+        .as_ref()
+        .unwrap()
+        .0
+        .clone();
+    fixture.app.prefetched_audio = Some(key);
+    fixture.app.pending_wheel_turns.push_back(true);
+    fixture.app.maybe_prefetch_audio(&fixture.context);
+    assert!(fixture.app.automatic_prefetch_candidate.is_none());
+    assert!(
+        fixture.app.prefetched_audio.is_none(),
+        "a cancelled page must be warmable again when revisited"
+    );
+    assert_eq!(
+        fixture.app.pending_wheel_turns.len(),
+        1,
+        "prefetch must not consume page turns"
+    );
+    assert!(fixture.app.speech.is_none());
+}
+
+#[test]
+fn changed_prefetch_configuration_invalidates_old_page_and_restarts_the_idle_interval() {
+    let mut fixture = TestApp::new();
+    let now = Instant::now();
+    fixture
+        .app
+        .automatic_prefetch_wait("old-page-and-provider", now);
+    fixture.app.prefetched_audio = Some("old-page-and-provider".into());
+    assert_eq!(
+        fixture
+            .app
+            .automatic_prefetch_wait("new-page-and-provider", now + Duration::from_secs(1)),
+        Some(AUTOMATIC_PREFETCH_IDLE)
+    );
+    assert!(fixture.app.prefetched_audio.is_none());
+    fixture.app.prefetched_audio = Some("new-page-and-provider".into());
+    fixture.app.save_settings();
+    assert!(fixture.app.automatic_prefetch_candidate.is_none());
+    assert!(fixture.app.prefetched_audio.is_none());
+    assert!(fixture.app.speech.is_none());
 }

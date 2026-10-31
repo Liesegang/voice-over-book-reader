@@ -179,11 +179,14 @@ impl LibraryStore {
         let path = fs::canonicalize(path.as_ref()).context("Open imported EPUB")?;
         let id = document.id.clone();
         let previous = self.books.iter().find(|book| book.id == id).cloned();
-        let cover_path = if let Some((resource_name, bytes)) = document
-            .cover
-            .as_deref()
-            .and_then(|name| document.resource(name).map(|bytes| (name, bytes)))
-        {
+        let cover_path = if let Some((resource_name, bytes)) =
+            document.cover.as_deref().and_then(|name| {
+                document
+                    .resource_bytes(name)
+                    .ok()
+                    .flatten()
+                    .map(|bytes| (name, bytes))
+            }) {
             let covers = self.data_dir.join("covers");
             fs::create_dir_all(&covers)?;
             let ext = Path::new(resource_name)
@@ -192,7 +195,7 @@ impl LibraryStore {
                 .unwrap_or("img");
             let cover = covers.join(format!("{id}.{ext}"));
             if !cover.exists() {
-                fs::write(&cover, bytes)?;
+                fs::write(&cover, bytes.as_slice())?;
             }
             Some(cover)
         } else {
@@ -221,12 +224,29 @@ impl LibraryStore {
 
     pub fn save_book(&mut self, book: &BookEntry) -> Result<()> {
         self.connection.execute("INSERT INTO books(id,json) VALUES(?1,?2) ON CONFLICT(id) DO UPDATE SET json=excluded.json", params![book.id, serde_json::to_string(book)?])?;
+        self.cache_book(book);
+        Ok(())
+    }
+
+    /// Refresh one entry committed by another app connection without writing it
+    /// back or rescanning source libraries.
+    pub fn reload_book(&mut self, id: &str) -> Result<()> {
+        let json: Option<String> = self
+            .connection
+            .query_row("SELECT json FROM books WHERE id=?1", [id], |row| row.get(0))
+            .optional()?;
+        if let Some(json) = json {
+            self.cache_book(&serde_json::from_str(&json)?);
+        }
+        Ok(())
+    }
+
+    fn cache_book(&mut self, book: &BookEntry) {
         if let Some(existing) = self.books.iter_mut().find(|entry| entry.id == book.id) {
             *existing = book.clone();
         } else {
             self.books.insert(0, book.clone());
         }
-        Ok(())
     }
 
     /// Removes an application library entry only. Source files are untouched.

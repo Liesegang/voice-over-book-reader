@@ -1,6 +1,6 @@
 //! Native Japanese frontend for the JP-Extra model interface.
 //! Uses BSD-licensed JPreprocess/Open JTalk labels; no SBV2 Python code is used.
-use anyhow::{Context, Result, bail, ensure};
+use anyhow::{Context, Result, ensure};
 use jpreprocess::{
     DefaultTokenizer, JPreprocess, SystemDictionaryConfig, kind::JPreprocessDictionaryKind,
     normalize_text_for_naist_jdic,
@@ -143,6 +143,9 @@ impl JapaneseFrontend {
         let mut label_cursor = 0usize;
         let mut character_cursor = 0usize;
         let mut bert_char_cursor = 0usize;
+        // NJD can split a prolonged sound mark into a separate node. Its
+        // pronunciation still depends on the preceding node in this phrase.
+        let mut last_vowel: Option<String> = None;
         for node in &njd.nodes {
             let chars = node.get_string().chars().collect::<Vec<_>>();
             let from = character_cursor;
@@ -164,10 +167,12 @@ impl JapaneseFrontend {
                 char_slots.push(bert_char_cursor);
             }
             if char_slots.is_empty() {
+                last_vowel = None;
                 continue;
             }
             let pron = node.get_pron();
             if pron.is_question() || pron.is_touten() {
+                last_vowel = None;
                 for (index, c) in node
                     .get_string()
                     .chars()
@@ -186,7 +191,6 @@ impl JapaneseFrontend {
                 continue;
             }
             let mut word_phones = Vec::new();
-            let mut last_vowel: Option<String> = None;
             for mora in pron.moras() {
                 let (consonant, vowel) = mora.phonemes();
                 if let Some(consonant) = consonant {
@@ -195,10 +199,22 @@ impl JapaneseFrontend {
                         if let Some(v) = &last_vowel {
                             word_phones.push(v.clone());
                         } else {
-                            bail!("Long vowel has no preceding vowel");
+                            // Open JTalk emits silence for a literal leading
+                            // mark. Keep it as model punctuation, rather than
+                            // inventing a vowel or aborting the whole chapter.
+                            phones.push(Phone {
+                                id: phone_id("-")?,
+                                tone: 0,
+                                bert_char: char_slots[0],
+                                source: source.clone(),
+                            });
                         }
                     } else {
-                        word_phones.push(canonical(&consonant));
+                        let phone = canonical(&consonant);
+                        if vowel.is_none() && matches!(phone.as_str(), "N" | "q") {
+                            last_vowel = Some(phone.clone());
+                        }
+                        word_phones.push(phone);
                     }
                 }
                 if let Some(vowel) = vowel {
@@ -402,5 +418,31 @@ mod tests {
                 .iter()
                 .all(|p| p.source == Some(0..15))
         );
+    }
+    #[test]
+    fn literal_dashes_and_separate_long_vowels_do_not_abort_prose() {
+        let frontend = JapaneseFrontend::new().unwrap();
+        for text in [
+            "――それは本当か。",
+            "ーそうです。",
+            "あ ー、そうか。",
+            "んー、考えます。",
+            "えっー、待って。",
+        ] {
+            let prepared = frontend
+                .prepare(text)
+                .unwrap_or_else(|error| panic!("{text}: {error:#}"));
+            assert!(prepared.phones.len() > 3);
+            assert!(
+                prepared
+                    .phones
+                    .iter()
+                    .filter_map(|phone| phone.source.as_ref())
+                    .all(|source| source.start < source.end
+                        && source.end <= text.len()
+                        && text.is_char_boundary(source.start)
+                        && text.is_char_boundary(source.end))
+            );
+        }
     }
 }

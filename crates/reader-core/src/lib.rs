@@ -10,7 +10,7 @@ mod words;
 
 pub use document::*;
 pub use epub::{ArchiveLoadStats, EpubSource};
-pub use import::{open, parse_html};
+pub use import::{open, open_metadata, parse_html};
 pub use page_document::{
     PageDocumentGeometry, PageGeometryCache, PageGeometrySnapshot, page_document_geometry,
     page_geometry_snapshot, restore_page_geometry,

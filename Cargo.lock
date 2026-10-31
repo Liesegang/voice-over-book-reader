@@ -6032,7 +6032,7 @@ dependencies = [
 
 [[package]]
 name = "reader-core"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6058,7 +6058,7 @@ dependencies = [
 
 [[package]]
 name = "reader-dictionary-popup"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "mdictlib",
@@ -6075,7 +6075,7 @@ dependencies = [
 
 [[package]]
 name = "reader-library"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6099,7 +6099,7 @@ dependencies = [
 
 [[package]]
 name = "reader-renderer-cef"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "cef",
  "dpi",
@@ -6113,7 +6113,7 @@ dependencies = [
 
 [[package]]
 name = "reader-speech"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -6141,7 +6141,7 @@ dependencies = [
 
 [[package]]
 name = "reader-voiceroid-bridge"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "encoding_rs",
@@ -8357,7 +8357,7 @@ checksum = "051eb1abcf10076295e815102942cc58f9d5e3b4560e46e53c21e8ff6f3af7b1"
 
 [[package]]
 name = "voice-over-book-reader"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "anyhow",
  "eframe",

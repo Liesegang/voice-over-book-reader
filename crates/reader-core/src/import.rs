@@ -282,6 +282,25 @@ pub fn open(path: impl AsRef<Path>) -> Result<Book> {
     })
 }
 
+/// Open an EPUB's navigation and spine without expanding its cover or chapters.
+/// The reader can restore its source locator before loading the visible chapter.
+/// Other formats retain their normal import behavior.
+pub fn open_metadata(path: impl AsRef<Path>) -> Result<Book> {
+    let path = path.as_ref();
+    if path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("epub"))
+    {
+        let metadata =
+            fs::metadata(path).with_context(|| format!("Cannot open {}", path.display()))?;
+        if metadata.len() > MAX_BOOK_BYTES {
+            bail!("Book is larger than the 512 MiB import limit");
+        }
+        return open_epub_metadata(fs::File::open(path)?, String::new());
+    }
+    open(path)
+}
+
 pub(crate) fn escape(text: &str) -> String {
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
@@ -508,6 +527,18 @@ fn content_viewport(tree: &Node) -> Option<[f32; 2]> {
 }
 
 pub(crate) fn open_epub<R: Read + Seek + Send + 'static>(reader: R, id: String) -> Result<Book> {
+    let mut book = open_epub_metadata(reader, id)?;
+    // Retain the established eager first-chapter/borrowed-cover API for imports.
+    if let Some(cover) = &book.cover
+        && let Ok(Some(bytes)) = book.resource_bytes(cover)
+    {
+        book.resources.insert(cover.clone(), (*bytes).clone());
+    }
+    book.ensure_chapter_loaded(0)?;
+    Ok(book)
+}
+
+fn open_epub_metadata<R: Read + Seek + Send + 'static>(reader: R, id: String) -> Result<Book> {
     let source = std::sync::Arc::new(crate::EpubSource::new(reader)?);
     let id = if id.is_empty() {
         source.identity().to_owned()
@@ -724,15 +755,7 @@ pub(crate) fn open_epub<R: Read + Seek + Send + 'static>(reader: R, id: String) 
         });
     }
     source.set_chapters(specs)?;
-    // Keep the established borrowed resource API useful for library covers.
-    // Everything else stays compressed until it is actually requested.
-    let mut resources = BTreeMap::new();
-    if let Some(cover) = &cover
-        && let Ok(Some(bytes)) = source.resource(cover)
-    {
-        resources.insert(cover.clone(), (*bytes).clone());
-    }
-    let mut book = Book {
+    let book = Book {
         id,
         title,
         authors,
@@ -740,12 +763,11 @@ pub(crate) fn open_epub<R: Read + Seek + Send + 'static>(reader: R, id: String) 
         chapters,
         toc,
         cover,
-        resources,
+        resources: BTreeMap::new(),
         page_progression,
         epub: Some(source),
         resource_token: std::sync::Arc::new(()),
     };
-    book.ensure_chapter_loaded(0)?;
     Ok(book)
 }
 
@@ -2306,6 +2328,44 @@ pub(crate) fn demo_book() -> Book {
 
 #[cfg(test)]
 mod charset_regression {
+    #[test]
+    fn metadata_open_defers_cover_and_loads_only_the_requested_chapter() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("resume.epub");
+        let mut archive = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        for (name, content) in [
+            ("META-INF/container.xml", "<container><rootfiles><rootfile full-path='book.opf'/></rootfiles></container>".to_owned()),
+            ("book.opf", "<package><metadata><title>Resume fixture</title><meta name='cover' content='cover'/></metadata><manifest><item id='cover' href='cover.png' media-type='image/png'/><item id='one' href='one.xhtml' media-type='application/xhtml+xml'/><item id='two' href='two.xhtml' media-type='application/xhtml+xml'/><item id='three' href='three.xhtml' media-type='application/xhtml+xml'/></manifest><spine><itemref idref='one'/><itemref idref='two'/><itemref idref='three'/></spine></package>".to_owned()),
+            ("one.xhtml", "<html><body><p>最初の章。</p></body></html>".to_owned()),
+            ("two.xhtml", "<html><body><p>途中の章。</p></body></html>".to_owned()),
+            ("three.xhtml", "<html><body><p>再開する章。</p></body></html>".to_owned()),
+            ("cover.png", "unused cover payload".repeat(16_384)),
+        ] {
+            archive.start_file(name, zip::write::SimpleFileOptions::default()).unwrap();
+            archive.write_all(content.as_bytes()).unwrap();
+        }
+        archive.finish().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut book = super::open_metadata(&path).unwrap();
+        assert!(book.chapters.iter().all(|chapter| !chapter.loaded));
+        assert_eq!(book.cover.as_deref(), Some("cover.png"));
+        assert!(book.resources.is_empty());
+        let metadata = book.archive_stats().unwrap();
+        assert_eq!(metadata.resource_reads, 2);
+        assert_eq!(metadata.chapters_parsed, 0);
+        book.ensure_chapter_loaded(2).unwrap();
+        assert!(book.chapters[2].loaded);
+        assert!(!book.chapters[0].loaded && !book.chapters[1].loaded);
+        assert_eq!(book.archive_stats().unwrap().resource_reads, 3);
+        assert_eq!(book.archive_stats().unwrap().chapters_parsed, 1);
+        let eager = super::open(&path).unwrap();
+        assert_eq!(eager.id, book.id);
+        assert!(eager.chapters[0].loaded);
+        assert!(eager.resource("cover.png").is_some());
+        assert_eq!(std::fs::read(path).unwrap(), original);
+    }
+
     #[test]
     fn manifest_media_types_preserve_extensionless_and_renamed_resources_without_reads() {
         use std::io::{Cursor, Write};

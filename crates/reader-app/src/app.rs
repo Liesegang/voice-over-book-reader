@@ -94,6 +94,7 @@ enum Work {
         generation: u64,
         result: Result<(Book, PathBuf), String>,
     },
+    Registered(Result<BookEntry, String>),
     Shelf(Result<Vec<BookEntry>, String>),
     Dictionaries(Result<Vec<DictionaryInfo>, String>),
     Lookup {
@@ -109,6 +110,7 @@ struct DictionaryPopup {
 
 const READING_FOOTER_HEIGHT: f32 = crate::reading_surface::READER_METADATA_HEIGHT;
 const MAX_JUMP_MARKS: usize = 5;
+const AUTOMATIC_PREFETCH_IDLE: Duration = Duration::from_millis(350);
 
 fn seek_slider_rect(row: Rect) -> Rect {
     Rect::from_min_max(
@@ -220,6 +222,7 @@ pub struct ReaderApp {
     perf_driver: Option<crate::cef_perf::PerfDriver>,
     speech_smoke: Option<crate::speech_smoke::Driver>,
     first_book_frame: Option<crate::latency::Pending>,
+    pending_registration: Option<(Book, PathBuf)>,
     page_count_ready: Option<crate::latency::Pending>,
     pagination_index: Option<crate::pagination::PageIndex>,
     pagination_key: String,
@@ -276,6 +279,7 @@ pub struct ReaderApp {
     pub(crate) speech_error: Option<String>,
     voice_preview: bool,
     prefetched_audio: Option<String>,
+    automatic_prefetch_candidate: Option<(String, Instant)>,
     dictionary_pinned: bool,
     dictionary_epoch: u64,
     pub(crate) store: LibraryStore,
@@ -416,6 +420,7 @@ impl ReaderApp {
                 None
             },
             first_book_frame: None,
+            pending_registration: None,
             page_count_ready: None,
             worker_context: cc.egui_ctx.clone(),
             pagination_index: None,
@@ -473,6 +478,7 @@ impl ReaderApp {
             speech_error: None,
             voice_preview: false,
             prefetched_audio: None,
+            automatic_prefetch_candidate: None,
             dictionary_pinned: false,
             dictionary_epoch: 0,
             shelf: store.books().to_vec(),
@@ -634,7 +640,9 @@ impl ReaderApp {
         if let Some(file) = book_argument(args) {
             app.open_path(file);
         }
-        app.refresh_shelf();
+        if !app.reader_window {
+            app.refresh_shelf();
+        }
         app.refresh_dictionaries();
         if !cfg!(test) && !app.reader_window {
             crate::library_ipc::listen(app.store.data_dir(), cc.egui_ctx.clone());
@@ -645,6 +653,7 @@ impl ReaderApp {
         self.notice = Some((message.into(), Instant::now()));
     }
     pub(crate) fn save_settings(&mut self) {
+        self.invalidate_automatic_prefetch();
         if self.last_runtime_speed != self.settings.tts.speed {
             if let Some(speech) = &self.speech {
                 let _ = speech.set_speed(self.settings.tts.speed);
@@ -680,6 +689,18 @@ impl ReaderApp {
         }
     }
     fn open_document(&mut self, path: PathBuf) {
+        // Transfer only the selected shelf record to the new reader process.
+        // It can retain a Calibre UUID/local reading ID without scanning the
+        // entire external library again before its first page is visible.
+        if let Some(entry) = self
+            .shelf
+            .iter()
+            .find(|entry| same_path(&entry.epub_path, &path))
+            .cloned()
+            && let Err(error) = self.store.save_book(&entry)
+        {
+            self.notify(format!("本棚への登録: {error}"));
+        }
         if let Err(error) = self.launch_window(Some(&path)) {
             self.notify(format!("ウィンドウを開けません: {error:#}"));
         }
@@ -742,6 +763,8 @@ impl ReaderApp {
             "open_to_first_frame_cpu_ready",
             generation,
         ));
+        self.pending_registration = None;
+        self.invalidate_automatic_prefetch();
         crate::latency::event("book_open_requested", generation);
         self.busy = true;
         self.opening = true;
@@ -755,7 +778,7 @@ impl ReaderApp {
         let ctx = self.worker_context.clone();
         std::thread::spawn(move || {
             let _open = crate::latency::span("book_open_worker", generation);
-            let result = reader_core::open(&path)
+            let result = reader_core::open_metadata(&path)
                 .map(|book| (book, path))
                 .map_err(|e| format!("{e:#}"));
             let _ = tx.send(Work::Opened { generation, result });
@@ -768,10 +791,31 @@ impl ReaderApp {
         self.annotations = Arc::new(Vec::new());
         self.annotations_updated = None;
     }
+    fn register_visible_book(&mut self) {
+        let Some((book, path)) = self.pending_registration.take() else {
+            return;
+        };
+        let data = self.store.data_dir().to_path_buf();
+        let tx = self.tx.clone();
+        let ctx = self.worker_context.clone();
+        let register = move || {
+            let _register = crate::latency::span("book_registration_worker", 0);
+            let result = LibraryStore::open(data)
+                .and_then(|mut store| store.register_document(path, &book))
+                .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(Work::Registered(result));
+            ctx.request_repaint();
+        };
+        // Keep temporary test archives scoped to their test; production I/O is
+        // always off the UI thread, after the requested body has been drawn.
+        if cfg!(test) {
+            register();
+        } else {
+            std::thread::spawn(register);
+        }
+    }
     pub(crate) fn refresh_shelf(&mut self) {
-        if !self.reader_window
-            && let Ok(store) = LibraryStore::open(self.store.data_dir())
-        {
+        if let Ok(store) = LibraryStore::open(self.store.data_dir()) {
             self.store = store;
         }
         self.shelf = self.store.books().to_vec();
@@ -1035,20 +1079,29 @@ impl ReaderApp {
                     {
                         self.notice = None;
                     }
-                    if let Err(e) = self.store.register_document(&path, &self.book) {
-                        self.notify(format!("本棚への登録: {e}"));
-                    }
-                    if let Some(mut entry) = linked {
-                        entry.id = self.book.id.clone();
-                        let _ = self.store.save_book(&entry);
-                    }
-                    self.settings.last_book = Some(path);
-                    self.save_settings();
-                    self.refresh_shelf();
+                    // Restore the requested source before loading any EPUB
+                    // chapter. Existing entries need no cover extraction or
+                    // repeated import writes just to resume reading.
                     if let Ok(Some(position)) = self.store.position(&self.book.id) {
                         self.restore_locator(position.locator);
                     }
+                    if linked.is_none() {
+                        self.pending_registration = Some((self.book.clone(), path.clone()));
+                    }
+                    self.settings.last_book = Some(path);
+                    self.save_settings();
                 }
+                Work::Registered(Ok(entry)) => {
+                    // A worker already committed this entry. Refresh just its
+                    // in-memory record without another SQLite write or scan.
+                    let _ = self.store.reload_book(&entry.id);
+                    if let Some(existing) = self.shelf.iter_mut().find(|book| book.id == entry.id) {
+                        *existing = entry;
+                    } else {
+                        self.shelf.insert(0, entry);
+                    }
+                }
+                Work::Registered(Err(error)) => self.notify(format!("本棚への登録: {error}")),
                 Work::Opened {
                     generation: _,
                     result: Err(e),
@@ -3383,7 +3436,7 @@ impl ReaderApp {
                 }
                 SpeechEventKind::Progress(message) => self.speech_progress = message,
                 SpeechEventKind::Error(error) => {
-                    self.speaking = false;
+                    self.stop_speech();
                     self.speech_error = Some(error.clone());
                     self.notify(error);
                 }
@@ -3931,9 +3984,16 @@ impl eframe::App for ReaderApp {
         if self.screen == Screen::Reader
             && !self.opening
             && !self.layout.pages.is_empty()
-            && let Some(timer) = self.first_book_frame.take()
+            && (self.book.epub.is_none()
+                || self
+                    .cef_reader
+                    .as_ref()
+                    .is_none_or(|reader| reader.turn_ready()))
         {
-            timer.finish();
+            if let Some(timer) = self.first_book_frame.take() {
+                timer.finish();
+            }
+            self.register_visible_book();
         }
         if self.frame_count == 1 {
             crate::latency::event("first_native_frame_cpu_ready", 0);
@@ -4218,15 +4278,25 @@ impl ReaderApp {
         }
     }
     fn maybe_prefetch_audio(&mut self, ctx: &egui::Context) {
-        if !ctx.input(|i| i.viewport().focused.unwrap_or(true)) {
-            return;
-        }
-        if !self.settings.tts.pre_cache
+        if self.screen != Screen::Reader
+            || !ctx.input(|i| i.viewport().focused.unwrap_or(true))
+            || !self.settings.tts.pre_cache
             || self.speaking
             || self.voice_preview
             || self.opening
             || self.layout.pages.is_empty()
+            || self.layout_key.is_empty()
+            || self.chapter_loading.is_some()
+            || !self.pending_wheel_turns.is_empty()
+            || self.pending_page_turn.is_some()
+            || self.pending_restore.is_some()
+            || self.pending_fragment.is_some()
+            || self.pending_page_index.is_some()
+            || self.pending_page_fraction.is_some()
+            || self.pending_book_seek.is_some()
+            || self.seek_drag.is_some()
         {
+            self.invalidate_automatic_prefetch();
             return;
         }
         let config = self.provider_config();
@@ -4238,6 +4308,7 @@ impl ReaderApp {
                 | ProviderConfig::AivisNative { .. }
         ) || !config.capability().available
         {
+            self.invalidate_automatic_prefetch();
             return;
         }
         let key = format!(
@@ -4252,8 +4323,37 @@ impl ReaderApp {
         if self.prefetched_audio.as_ref() == Some(&key) {
             return;
         }
+        if let Some(wait) = self.automatic_prefetch_wait(&key, Instant::now()) {
+            ctx.request_repaint_after(wait);
+            return;
+        }
         self.prefetched_audio = Some(key);
         self.prefetch_visible();
+    }
+    fn automatic_prefetch_wait(&mut self, key: &str, now: Instant) -> Option<Duration> {
+        if self
+            .automatic_prefetch_candidate
+            .as_ref()
+            .is_some_and(|(candidate, _)| candidate != key)
+        {
+            self.invalidate_automatic_prefetch();
+        }
+        let (_, since) = self
+            .automatic_prefetch_candidate
+            .get_or_insert_with(|| (key.to_owned(), now));
+        AUTOMATIC_PREFETCH_IDLE
+            .checked_sub(now.saturating_duration_since(*since))
+            .filter(|wait| !wait.is_zero())
+    }
+    fn invalidate_automatic_prefetch(&mut self) {
+        if let Some((key, _)) = self.automatic_prefetch_candidate.take()
+            && self.prefetched_audio.as_ref() == Some(&key)
+        {
+            self.prefetched_audio = None;
+            if let Some(speech) = &self.speech {
+                speech.cancel_prefetch();
+            }
+        }
     }
     fn ensure_speech(&mut self) -> bool {
         if self.speech_provider == "command"
@@ -4670,6 +4770,11 @@ impl ReaderApp {
                     let id = layout::unit_id(chapter.id, index);
                     units.push(SpeechUnit { id, text });
                     sources.push((id, atom.clone()));
+                }
+                // Covers and other image-only spine items have no narration.
+                // They do not terminate the following chapters' speech feed.
+                if units.is_empty() {
+                    continue;
                 }
                 if tx
                     .send(Work::SpeechSources {

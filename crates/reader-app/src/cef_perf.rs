@@ -147,7 +147,11 @@ pub(crate) struct PerfDriver {
     rejected_captures: usize,
     marker_samples: Vec<Value>,
     count_only: bool,
+    during_count: bool,
     chapter_turns: bool,
+    index_observed_ms: Option<f64>,
+    burst_index_pending_at_dispatch: Option<bool>,
+    burst_index_pending_at_completion: Option<bool>,
     burst_started_ms: Option<f64>,
     burst_completed_ms: Option<f64>,
     burst_chapter: usize,
@@ -197,9 +201,15 @@ impl PerfDriver {
             rejected_captures: 0,
             marker_samples: Vec::new(),
             count_only: args.iter().any(|argument| argument == "--perf-count-only"),
+            during_count: args
+                .iter()
+                .any(|argument| argument == "--perf-during-count"),
             chapter_turns: args
                 .iter()
                 .any(|argument| argument == "--perf-chapter-turns"),
+            index_observed_ms: None,
+            burst_index_pending_at_dispatch: None,
+            burst_index_pending_at_completion: None,
             burst_started_ms: None,
             burst_completed_ms: None,
             burst_chapter: 0,
@@ -231,6 +241,12 @@ impl PerfDriver {
         if self.phase == Phase::Finished {
             return None;
         }
+        if self.during_count && (self.count_only || self.chapter_turns) {
+            self.finish(Some(
+                "During-count mode cannot be combined with count-only or chapter-turn mode",
+            ));
+            return next_action(ctx, PerfAction::Close);
+        }
         if Instant::now() >= self.deadline {
             self.finish(Some(
                 "Timed out waiting for confirmed book pixels or total pages",
@@ -240,6 +256,10 @@ impl PerfDriver {
         if ready && let Some(total) = total_pages.filter(|total| *total > 0) {
             self.total_pages = Some(total);
             self.total_ready_ms.get_or_insert_with(|| self.clock.ms());
+        }
+        if self.during_count && total_pages.is_some_and(|total| total > 0) {
+            self.index_observed_ms
+                .get_or_insert_with(|| self.clock.ms());
         }
         let capture = self
             .captured
@@ -280,6 +300,18 @@ impl PerfDriver {
                         self.first_frame_ms = Some(capture.callback_ms);
                         self.initial_hash = Some(capture.right_book_hash);
                         self.initial_toolbar_hash = Some(capture.toolbar_hash);
+                        if self.during_count {
+                            if current_page != 0 {
+                                self.finish(Some("During-count wheel fixture must start at chapter page zero in single-page mode"));
+                                return next_action(ctx, PerfAction::Close);
+                            }
+                            return self.begin_burst(
+                                ctx,
+                                current_chapter,
+                                capture.expected_rgb,
+                                total_pages.is_none(),
+                            );
+                        }
                         self.phase = Phase::WaitCount;
                     }
                     Phase::Baseline => {
@@ -340,7 +372,7 @@ impl PerfDriver {
                 }
             }
             Phase::WaitCount if self.total_ready_ms.is_some() && ready => {
-                if self.count_only {
+                if self.count_only || self.during_count {
                     self.finish(None);
                     return next_action(ctx, PerfAction::Close);
                 }
@@ -398,15 +430,12 @@ impl PerfDriver {
                             ));
                             return next_action(ctx, PerfAction::Close);
                         }
-                        self.phase = Phase::Burst;
-                        self.burst_started_ms = Some(self.clock.ms());
-                        self.burst_chapter = current_chapter;
-                        self.burst_blue = marker[2];
-                        // eframe processes screenshot viewport commands after
-                        // painting; arm before enqueue to capture the first
-                        // native page, rather than starting on its successor.
-                        self.capture_burst(ctx, current_chapter);
-                        return next_action(ctx, PerfAction::WheelBurst(5));
+                        return self.begin_burst(
+                            ctx,
+                            current_chapter,
+                            marker,
+                            total_pages.is_none(),
+                        );
                     }
                 }
             }
@@ -423,15 +452,40 @@ impl PerfDriver {
                         current_chapter == self.burst_chapter && current_page == 5
                     }
                 {
-                    self.finish(None);
-                    return next_action(ctx, PerfAction::Close);
+                    self.burst_index_pending_at_completion = Some(total_pages.is_none());
+                    if self.during_count {
+                        self.phase = Phase::WaitCount;
+                    } else {
+                        self.finish(None);
+                        return next_action(ctx, PerfAction::Close);
+                    }
                 }
-                self.capture_burst(ctx, current_chapter);
+                if self.phase == Phase::Burst {
+                    self.capture_burst(ctx, current_chapter);
+                }
             }
             _ => {}
         }
         ctx.request_repaint_after(Duration::from_millis(4));
         None
+    }
+
+    fn begin_burst(
+        &mut self,
+        ctx: &egui::Context,
+        chapter: usize,
+        marker: [u8; 3],
+        index_pending: bool,
+    ) -> Option<PerfAction> {
+        self.phase = Phase::Burst;
+        self.burst_started_ms = Some(self.clock.ms());
+        self.burst_chapter = chapter;
+        self.burst_blue = marker[2];
+        self.burst_index_pending_at_dispatch = Some(index_pending);
+        // Arm the readback before enqueue, preserving the standard driver's
+        // frame order and its proof that every wheel notch was displayed.
+        self.capture_burst(ctx, chapter);
+        next_action(ctx, PerfAction::WheelBurst(5))
     }
 
     fn capture(
@@ -583,6 +637,7 @@ impl PerfDriver {
             .filter_map(|turn| turn["chapter"].as_u64())
             .collect();
         let expected_order = self.count_only
+            || self.during_count
             || (self.turns.len() == 30
                 && if self.chapter_turns {
                     first_five_chapters == [1, 2, 3, 4, 5]
@@ -590,6 +645,7 @@ impl PerfDriver {
                     first_five == [1, 2, 3, 4, 5]
                 });
         let overlay_stable = self.count_only
+            || self.during_count
             || (self.overlay_checks.len() == 2
                 && self.overlay_checks.iter().all(|check| {
                     check["right_book_pixels_unchanged"] == true
@@ -599,16 +655,52 @@ impl PerfDriver {
         let burst_valid = self.count_only || self.burst_observed == [1, 2, 3, 4, 5];
         let count_valid =
             self.total_ready_ms.is_some() && self.total_pages.is_some_and(|pages| pages > 0);
+        let during_count_covered = self.burst_index_pending_at_dispatch == Some(true);
+        let error = error.or_else(|| {
+            (self.during_count && !during_count_covered).then_some(
+                "Whole-book index completed before burst dispatch; during-count performance was not covered",
+            )
+        });
+        let overlap_ms = self
+            .burst_started_ms
+            .zip(self.burst_completed_ms)
+            .map(|(start, end)| (self.index_observed_ms.unwrap_or(end).min(end) - start).max(0.));
+        let rapid_wheel_burst = json!({
+            "input_notches":if self.count_only {0} else {5},
+            "enqueued_in_one_input_frame":self.burst_started_ms.is_some(),
+            "dispatch_ms":self.burst_started_ms,
+            "confirmed_page_sequence":self.burst_observed,
+            "all_five_pages_read_back_in_order":burst_valid && !self.count_only,
+            "dispatch_to_fifth_readback_ms":self.burst_started_ms.zip(self.burst_completed_ms).map(|(start,end)|end-start),
+            "index_pending_at_dispatch":self.burst_index_pending_at_dispatch,
+            "index_pending_at_completion_check":self.burst_index_pending_at_completion,
+            "during_count_coverage":self.during_count && during_count_covered,
+            "index_first_observed_ms":self.index_observed_ms,
+            "observed_overlap_ms":if self.during_count {overlap_ms} else {None},
+            "overlap_definition":"GPU burst interval before the first native tick observing a complete index; pending-at-completion is checked after the fifth GPU readback and host readiness, not inside Chromium",
+            "transitions":self.burst_transitions,
+            "frame_readbacks":self.burst_frames,
+            "ordering":"Screenshot requests follow rendered-frame order; asynchronous callbacks are reordered by request ordinal before page validation",
+        });
         let report = json!({
             "measurement":"Native app GPU screenshot callback; includes GPU readback and callback delivery, excludes display-photon latency",
             "screenshot_cadence":"eframe applies screenshot commands after painting, so requests read a subsequent rendered frame; initial burst request is armed before wheel enqueue. Synthetic actions explicitly wake repaint as real input would",
             "marker_validation":"3x3 marker-center pixels, at least five matches, maximum channel error 8; ordered page fixture uses pages 0 through 5",
-            "turn_input":"30 sequential native actions followed by a separate five-notch wheel burst enqueued once; screenshot callbacks do not gate burst input dispatch",
+            "turn_input":if self.during_count {
+                "Five-notch wheel burst enqueued immediately after first confirmed page-zero GPU readback; no preliminary turns or overlay checks; then wait for the exact complete index"
+            } else {
+                "30 sequential native actions followed by a separate five-notch wheel burst enqueued once; screenshot callbacks do not gate burst input dispatch"
+            },
             "turn_endpoint":"First confirmed target-page GPU screenshot readback, sampled before host readiness barriers; subsequent turn dispatch still awaits host readiness",
-            "overlay_validation":"Independent quality result after six settling frames: hidden baseline is refreshed after pagination; compare uncovered book plus a blank toolbar strip. Overlay hashes never gate turn/burst timing success; visible toolbar may cover marker",
+            "overlay_validation":if self.during_count {
+                "Skipped: during-count mode dispatches its burst immediately after initial book pixels"
+            } else {
+                "Independent quality result after six settling frames: hidden baseline is refreshed after pagination; compare uncovered book plus a blank toolbar strip. Overlay hashes never gate turn/burst timing success; visible toolbar may cover marker"
+            },
             "clock":self.clock.description(),
             "requested_backend":self.requested_backend,
             "count_only":self.count_only,
+            "during_count":self.during_count,
             "chapter_boundary_fixture":self.chapter_turns,
             "chapter_pixel_validation":"Opt-in chapter fixtures put a solid original color at viewport center; decode independently of host chapter number",
             "success":error.is_none() && expected_order && burst_valid && count_valid,
@@ -626,22 +718,13 @@ impl PerfDriver {
             "first_five_pages":first_five,
             "first_five_chapters":first_five_chapters,
             "all_requested_pages_read_back":expected_order,
-            "overlay_book_pixels_stable":overlay_stable,
+            "overlay_book_pixels_stable":if self.during_count {None} else {Some(overlay_stable)},
+            "overlay_checks_skipped":self.during_count,
             "overlay_checks":self.overlay_checks,
             "turns":self.turns,
             "marker_samples":self.marker_samples,
             "rejected_captures":self.rejected_captures,
-            "rapid_wheel_burst":{
-                "input_notches":if self.count_only {0} else {5},
-                "enqueued_in_one_input_frame":self.burst_started_ms.is_some(),
-                "dispatch_ms":self.burst_started_ms,
-                "confirmed_page_sequence":self.burst_observed,
-                "all_five_pages_read_back_in_order":burst_valid && !self.count_only,
-                "dispatch_to_fifth_readback_ms":self.burst_started_ms.zip(self.burst_completed_ms).map(|(start,end)|end-start),
-                "transitions":self.burst_transitions,
-                "frame_readbacks":self.burst_frames,
-                "ordering":"Screenshot requests follow rendered-frame order; asynchronous callbacks are reordered by request ordinal before page validation",
-            },
+            "rapid_wheel_burst":rapid_wheel_burst,
         });
         let result = (|| -> std::io::Result<()> {
             if let Some(parent) = self.output.parent()
@@ -803,6 +886,155 @@ fn percentile(values: &[f64], fraction: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn first_book_capture(driver: &mut PerfDriver) {
+        *driver.captured.lock().unwrap() = Some(Capture {
+            chapter: 8,
+            page: 0,
+            callback_ms: driver.clock.ms(),
+            marker_matches: true,
+            chapter_matches: true,
+            expected_rgb: page_marker(0, 128),
+            sampled_rgb: page_marker(0, 128),
+            matching_pixels: 9,
+            image_size: [80, 80],
+            right_book_hash: "fixture".to_owned(),
+            toolbar_hash: "fixture".to_owned(),
+        });
+    }
+
+    fn complete_test_burst(driver: &mut PerfDriver) {
+        let start = driver.burst_started_ms.unwrap();
+        *driver.burst_captures.lock().unwrap() = (1..=5)
+            .map(|page| BurstCapture {
+                ordinal: page as u64 - 1,
+                frame: page as u64,
+                chapter: 8,
+                requested_ms: start,
+                callback_ms: start + page as f64,
+                observed_page: Some(page),
+                sampled_rgb: page_marker(page, 128),
+                size: [80, 80],
+            })
+            .collect();
+    }
+
+    #[test]
+    fn during_count_burst_starts_at_first_pixels_while_standard_mode_waits_for_the_index() {
+        let scratch = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        for during_count in [false, true] {
+            let mut args = vec![
+                "--perf-output".to_owned(),
+                scratch.path().join("report.json").display().to_string(),
+            ];
+            if during_count {
+                args.push("--perf-during-count".to_owned());
+            }
+            let mut driver = PerfDriver::from_args(&args).unwrap();
+            first_book_capture(&mut driver);
+            let action = driver.tick(&ctx, [80, 80], Some(page_marker(0, 128)), 8, 0, None, true);
+            assert_eq!(action, during_count.then_some(PerfAction::WheelBurst(5)));
+            assert!(driver.total_ready_ms.is_none());
+            assert_eq!(
+                driver.burst_index_pending_at_dispatch,
+                during_count.then_some(true)
+            );
+            assert!(driver.turns.is_empty());
+            assert!(driver.overlay_checks.is_empty());
+            assert!(matches!(
+                (during_count, driver.phase),
+                (false, Phase::WaitCount) | (true, Phase::Burst)
+            ));
+            assert!(!scratch.path().join("report.json").exists());
+        }
+    }
+
+    #[test]
+    fn concurrent_burst_report_waits_for_exact_count_and_rejects_missing_overlap() {
+        let scratch = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        for pending_at_dispatch in [true, false] {
+            let output = scratch
+                .path()
+                .join(format!("report-{pending_at_dispatch}.json"));
+            let args = vec![
+                "--perf-output".to_owned(),
+                output.display().to_string(),
+                "--perf-during-count".to_owned(),
+            ];
+            let mut driver = PerfDriver::from_args(&args).unwrap();
+            first_book_capture(&mut driver);
+            assert_eq!(
+                driver.tick(
+                    &ctx,
+                    [80, 80],
+                    Some(page_marker(0, 128)),
+                    8,
+                    0,
+                    (!pending_at_dispatch).then_some(1000),
+                    true
+                ),
+                Some(PerfAction::WheelBurst(5))
+            );
+            complete_test_burst(&mut driver);
+            assert_eq!(
+                driver.tick(
+                    &ctx,
+                    [80, 80],
+                    Some(page_marker(5, 128)),
+                    8,
+                    5,
+                    (!pending_at_dispatch).then_some(1000),
+                    true
+                ),
+                None
+            );
+            assert!(matches!(driver.phase, Phase::WaitCount));
+            assert!(
+                !output.exists(),
+                "a completed wheel burst does not fabricate a full index"
+            );
+            assert_eq!(
+                driver.tick(
+                    &ctx,
+                    [80, 80],
+                    Some(page_marker(5, 128)),
+                    8,
+                    5,
+                    Some(1000),
+                    true
+                ),
+                Some(PerfAction::Close)
+            );
+            let report: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+            assert_eq!(report["success"], pending_at_dispatch);
+            assert_eq!(report["timing_valid"], pending_at_dispatch);
+            assert_eq!(report["complete_index_observed"], true);
+            assert_eq!(report["total_pages"], 1000);
+            assert_eq!(report["turn_count"], 0);
+            assert_eq!(
+                report["rapid_wheel_burst"]["confirmed_page_sequence"],
+                json!([1, 2, 3, 4, 5])
+            );
+            assert_eq!(
+                report["rapid_wheel_burst"]["index_pending_at_dispatch"],
+                pending_at_dispatch
+            );
+            assert_eq!(
+                report["rapid_wheel_burst"]["index_pending_at_completion_check"],
+                pending_at_dispatch
+            );
+            assert_eq!(
+                report["rapid_wheel_burst"]["during_count_coverage"],
+                pending_at_dispatch
+            );
+            assert_eq!(report["overlay_checks"], json!([]));
+            assert_eq!(report["overlay_book_pixels_stable"], Value::Null);
+            assert_eq!(report["error"].is_null(), pending_at_dispatch);
+        }
+    }
+
     #[test]
     fn chapter_boundary_proof_uses_chapter_pixels_when_every_page_number_is_zero() {
         for chapter in 0..=5 {

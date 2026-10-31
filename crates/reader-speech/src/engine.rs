@@ -187,6 +187,10 @@ impl SpeechController {
         };
         self.prefetch_at(units, start, 0)
     }
+    /// Revoke background warming without interrupting active speech.
+    pub fn cancel_prefetch(&self) {
+        self.prefetch_epoch.fetch_add(1, Ordering::AcqRel);
+    }
     /// Prepare at most three canonical chunks around a source position. Supply
     /// the same complete chapter units as `speak_at`, so page boundaries never
     /// change chunk text, pronunciation mapping, or the generated-audio key.
@@ -416,6 +420,24 @@ fn run(
     let mut paused = false;
     let mut producer_done = true;
     let mut pending_jobs = 0usize;
+    let mut failed_generation = None;
+    macro_rules! fail_playback {
+        ($message:expr) => {{
+            failed_generation = Some(generation);
+            queue.clear();
+            active = None;
+            producer_done = true;
+            pending_jobs = 0;
+            if let Some(output) = &player {
+                output.stop();
+            }
+            emit(
+                &events,
+                generation,
+                SpeechEventKind::Error($message.to_string()),
+            );
+        }};
+    }
     loop {
         match commands.recv_timeout(Duration::from_millis(10)) {
             Ok(Command::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -426,6 +448,7 @@ fn run(
                 byte_offset,
             }) => {
                 generation = next;
+                failed_generation = None;
                 active = None;
                 queue.clear();
                 paused = false;
@@ -473,7 +496,9 @@ fn run(
                     config: config.clone(),
                 });
             }
-            Ok(Command::Append(id, units)) if id == epoch.load(Ordering::Acquire) => {
+            Ok(Command::Append(id, units))
+                if id == epoch.load(Ordering::Acquire) && failed_generation != Some(id) =>
+            {
                 if generation == 0 {
                     generation = id;
                 }
@@ -555,15 +580,17 @@ fn run(
                                 player.pause();
                             }
                         }
-                        Err(error) => emit(
-                            &events,
-                            generation,
-                            SpeechEventKind::Error(error.to_string()),
-                        ),
+                        Err(error) => fail_playback!(error),
                     }
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        if failed_generation == Some(generation) {
+            // A failed chapter must never become a jump into a queued chapter.
+            // Speak starts a fresh generation; old queued results are discarded.
+            while produced.try_recv().is_ok() {}
+            continue;
         }
         // A bounded queue keeps chapter length from becoming unbounded PCM RAM.
         if queue.len() < 2 {
@@ -582,18 +609,20 @@ fn run(
                         producer_done = pending_jobs == 0;
                     }
                     Ok(Produced::Error(id, message)) if id == generation => {
-                        emit(&events, generation, SpeechEventKind::Error(message));
+                        fail_playback!(message);
+                        break;
                     }
                     Ok(_) => {}
                     Err(_) => break,
                 }
             }
         }
+        if failed_generation == Some(generation) {
+            continue;
+        }
         if let (Some(playing), Some(output)) = (active.as_mut(), player.as_ref()) {
             if let Some(error) = output.error() {
-                emit(&events, generation, SpeechEventKind::Error(error));
-                active = None;
-                output.stop();
+                fail_playback!(error);
                 continue;
             }
             // Queue ahead before the DAC consumes the current sentence. A new
@@ -606,11 +635,8 @@ fn run(
                     .load()
                     .and_then(|audio| playing.append(audio, config.speed, output))
             {
-                emit(
-                    &events,
-                    generation,
-                    SpeechEventKind::Error(error.to_string()),
-                );
+                fail_playback!(error);
+                continue;
             }
             if !paused {
                 playing.discard_history(output);
@@ -648,11 +674,7 @@ fn run(
                 let audio = match audio.load() {
                     Ok(audio) => audio,
                     Err(error) => {
-                        emit(
-                            &events,
-                            generation,
-                            SpeechEventKind::Error(format!("先読み音声を読み込めません: {error}")),
-                        );
+                        fail_playback!(format!("先読み音声を読み込めません: {error}"));
                         continue;
                     }
                 };
@@ -660,13 +682,7 @@ fn run(
                     match Player::new(epoch.clone()) {
                         Ok(output) => player = Some(output),
                         Err(error) => {
-                            emit(
-                                &events,
-                                generation,
-                                SpeechEventKind::Error(error.to_string()),
-                            );
-                            producer_done = true;
-                            queue.clear();
+                            fail_playback!(error);
                             continue;
                         }
                     }
@@ -688,11 +704,7 @@ fn run(
                             },
                         );
                     }
-                    Err(error) => emit(
-                        &events,
-                        generation,
-                        SpeechEventKind::Error(error.to_string()),
-                    ),
+                    Err(error) => fail_playback!(error),
                 }
             } else if producer_done && generation != 0 {
                 // Completion is emitted once, not on each clock tick.
@@ -794,7 +806,11 @@ fn synthesize_jobs_with_factory(
 ) {
     let mut provider: Option<Box<dyn crate::TtsProvider>> = None;
     let mut provider_key = String::new();
+    let mut failed_generation = None;
     for job in jobs {
+        if failed_generation == Some(job.generation) {
+            continue;
+        }
         let mut cancel = Cancellation::new(epoch.clone(), job.generation);
         if let Some(ticket) = job.prefetch_ticket {
             cancel = cancel.with_supersession(prefetch_epoch.clone(), ticket);
@@ -804,7 +820,12 @@ fn synthesize_jobs_with_factory(
         }
         let job_started = Instant::now();
         tracing::info!(target: "vobr_perf", phase = "speech_worker_begin", generation = job.generation, playback = job.playback, units = job.units.len(), queued_ms = job.queued_at.elapsed().as_secs_f64() * 1000.0);
-        let key = serde_json::to_string(&job.config.provider).unwrap_or_default();
+        let serialized_provider = serde_json::to_string(&job.config.provider).unwrap_or_default();
+        let key = if matches!(job.config.provider, ProviderConfig::AivisNative { .. }) {
+            format!("aivis-japanese-frontend-v2:{serialized_provider}")
+        } else {
+            serialized_provider
+        };
         if provider.is_none() || key != provider_key {
             let initialization_started = Instant::now();
             let initialized = factory(&job.config.provider);
@@ -818,9 +839,12 @@ fn synthesize_jobs_with_factory(
                     if cancel.is_cancelled() {
                         continue;
                     }
-                    let _ = output.send(Produced::Error(job.generation, error.to_string()));
                     if job.playback {
+                        failed_generation = Some(job.generation);
+                        let _ = output.send(Produced::Error(job.generation, error.to_string()));
                         let _ = output.send(Produced::Done(job.generation));
+                    } else {
+                        tracing::debug!(target: "vobr_perf", error = %error, "Speech prefetch initialization failed");
                     }
                     continue;
                 }
@@ -829,6 +853,7 @@ fn synthesize_jobs_with_factory(
         let mut first_ready = true;
         let mut reached_target = job.target.is_none();
         let mut prefetched = 0;
+        let mut succeeded = true;
         for mut chunk in chunks(job.units) {
             let target = if !reached_target {
                 let (id, byte) = job.target.unwrap();
@@ -946,6 +971,8 @@ fn synthesize_jobs_with_factory(
                                 }
                             }
                             Err(error) => {
+                                succeeded = false;
+                                failed_generation = Some(job.generation);
                                 let _ =
                                     output.send(Produced::Error(job.generation, error.to_string()));
                                 break;
@@ -954,7 +981,13 @@ fn synthesize_jobs_with_factory(
                     }
                 }
                 Err(error) => {
-                    let _ = output.send(Produced::Error(job.generation, format!("{error:#}")));
+                    succeeded = false;
+                    if job.playback {
+                        failed_generation = Some(job.generation);
+                        let _ = output.send(Produced::Error(job.generation, format!("{error:#}")));
+                    } else {
+                        tracing::debug!(target: "vobr_perf", error = %error, "Speech prefetch failed");
+                    }
                     break;
                 }
             }
@@ -962,7 +995,7 @@ fn synthesize_jobs_with_factory(
         if !cancel.is_cancelled() {
             if job.playback {
                 let _ = output.send(Produced::Done(job.generation));
-            } else {
+            } else if succeeded {
                 let _ = output.send(Produced::Progress(
                     job.generation,
                     "音声の先読みが完了しました".into(),
@@ -971,6 +1004,10 @@ fn synthesize_jobs_with_factory(
         }
     }
 }
+
+#[cfg(test)]
+#[path = "engine_failure_tests.rs"]
+mod failure_tests;
 
 fn cached_audio(
     provider: &mut dyn crate::TtsProvider,

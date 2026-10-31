@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 
 const source=fs.readFileSync(new URL('./cef_counter.js',import.meta.url),'utf8');
-function fixture(items){
+function fixture(items,{autoDrain=true}={}){
     const pending=[],created=[],commands=[];
     let active=0,peak=0;
     const context={
@@ -30,8 +30,12 @@ function fixture(items){
     vm.runInContext(source,context);
     context.countChapters(items);
     const initial=created.length;
-    while(pending.length)pending.shift().onload();
-    return {created,commands,initial,peak,active,results:JSON.parse(JSON.stringify(context.__vobrCountResults)),errors:Array.from(context.__vobrCountErrors)};
+    const drain=()=>{while(pending.length)pending.shift().onload();};
+    if(autoDrain)drain();
+    return {created,commands,initial,get peak(){return peak;},get active(){return active;},
+        enqueue(items){context.__vobrEnqueueCountItems(items);},drain,
+        get results(){return JSON.parse(JSON.stringify(context.__vobrCountResults));},
+        get errors(){return Array.from(context.__vobrCountErrors);}};
 }
 
 const fixed=Array.from({length:5000},(_,chapter)=>({chapter,options:{flow:'fixed'}}));
@@ -55,4 +59,26 @@ for(const command of counted.commands){
 }
 assert.ok(mixed.every(item=>item.options.pagination_only===undefined),'counter flags do not mutate display options');
 assert.deepEqual(counted.errors,[]);
-console.log('chapter counter: fixed metadata fast path, mixed exact counts and bounded measurement passed');
+
+// Native discovery can provide chapters after the initial queue is empty.
+// Earlier results must survive every refill, and new arrivals cannot bypass
+// the three-worker bound or start the same chapter a second time.
+const streaming=fixture([],{autoDrain:false});
+assert.equal(streaming.created.length,0);
+streaming.enqueue(mixed.slice(0,2));
+assert.equal(streaming.results.length,1,'known image metadata is immediately visible');
+assert.equal(streaming.active,1);
+streaming.enqueue(mixed.slice(1,8));
+assert.equal(streaming.active,3);
+streaming.drain();
+assert.equal(streaming.active,0);
+const earlier=streaming.results.length;
+streaming.enqueue(mixed.slice(8));
+streaming.drain();
+assert.equal(streaming.results.length,mixed.length);
+assert.ok(earlier>0&&earlier<mixed.length,'partial progress precedes later discovery');
+assert.equal(streaming.created.length,10,'duplicate plan arrivals never repeat DOM work');
+assert.equal(streaming.peak,3);
+assert.deepEqual(streaming.results.map(item=>item.chapter).sort((a,b)=>a-b),mixed.map(item=>item.chapter));
+assert.deepEqual(streaming.errors,[]);
+console.log('chapter counter: fixed metadata, streaming discovery and bounded measurement passed');
