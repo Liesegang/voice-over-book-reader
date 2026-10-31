@@ -84,6 +84,7 @@ impl Clock {
 enum Phase {
     Initial,
     WaitCount,
+    Baseline,
     OverlayOn,
     OverlayOff,
     Turns,
@@ -275,6 +276,16 @@ impl PerfDriver {
                         self.initial_toolbar_hash = Some(capture.toolbar_hash);
                         self.phase = Phase::WaitCount;
                     }
+                    Phase::Baseline => {
+                        // Pagination can replace its status label between the
+                        // first book frame and this point. Compare chrome with
+                        // a fresh hidden baseline after that state is stable.
+                        self.initial_hash = Some(capture.right_book_hash);
+                        self.initial_toolbar_hash = Some(capture.toolbar_hash);
+                        self.phase = Phase::OverlayOn;
+                        self.after_frame = ctx.cumulative_frame_nr() + 1;
+                        return Some(PerfAction::ToggleChrome);
+                    }
                     Phase::OverlayOn | Phase::OverlayOff => {
                         self.overlay_checks.push(json!({
                             "chrome_visible":self.phase==Phase::OverlayOn,
@@ -330,11 +341,10 @@ impl PerfDriver {
                     self.finish(Some("Turn fixture must start at chapter page zero"));
                     return Some(PerfAction::Close);
                 }
-                self.phase = Phase::OverlayOn;
+                self.phase = Phase::Baseline;
                 self.after_frame = ctx.cumulative_frame_nr() + 1;
-                return Some(PerfAction::ToggleChrome);
             }
-            Phase::OverlayOn | Phase::OverlayOff => {
+            Phase::Baseline | Phase::OverlayOn | Phase::OverlayOff => {
                 if ready && ctx.cumulative_frame_nr() > self.after_frame {
                     self.capture(
                         ctx,
@@ -552,7 +562,7 @@ impl PerfDriver {
             "marker_validation":"3x3 marker-center pixels, at least five matches, maximum channel error 8; ordered page fixture uses pages 0 through 5",
             "turn_input":"30 sequential native actions followed by a separate five-notch wheel burst enqueued once; screenshot callbacks do not gate burst input dispatch",
             "turn_endpoint":"First confirmed target-page GPU screenshot readback, sampled before host readiness barriers; subsequent turn dispatch still awaits host readiness",
-            "overlay_validation":"Uncovered right-book pixels stay identical while the native toolbar pixel hash changes and returns; the toolbar may occlude the marker while visible",
+            "overlay_validation":"Hidden baseline is refreshed after pagination completes; uncovered right-book pixels stay identical while toolbar pixels change and return; the toolbar may occlude the marker while visible",
             "clock":self.clock.description(),
             "requested_backend":self.requested_backend,
             "count_only":self.count_only,

@@ -70,6 +70,48 @@ struct Pane {
     highlight: Option<(Locator, Locator)>,
     captured_buttons: u8,
     cursor: egui::CursorIcon,
+    auxiliary_location: Option<Locator>,
+}
+
+fn auxiliary_regions(ui: &mut Ui) -> (Rect, egui::Response, Ui) {
+    // Reserve the window content once. A horizontal row otherwise contributes
+    // its own minimum height to Window/Resize, which expands on every pass if
+    // that row is even slightly taller than the reserved footer.
+    let available = ui.available_size_before_wrap().max(vec2(1., 1.));
+    let (bounds, _) = ui.allocate_exact_size(available, Sense::hover());
+    let text_height = ui
+        .text_style_height(&egui::TextStyle::Button)
+        .max(ui.text_style_height(&egui::TextStyle::Body));
+    let footer_height = ui
+        .spacing()
+        .interact_size
+        .y
+        .max(text_height + 2. * ui.spacing().button_padding.y)
+        .min(bounds.height());
+    let footer_rect = Rect::from_min_max(
+        pos2(bounds.left(), bounds.bottom() - footer_height),
+        bounds.max,
+    );
+    let rect = Rect::from_min_max(
+        bounds.min,
+        pos2(
+            bounds.right(),
+            (footer_rect.top() - ui.spacing().item_spacing.y).max(bounds.top() + 1.),
+        ),
+    );
+    let response = ui.interact(
+        rect,
+        ui.scope_id().with("auxiliary-book-page"),
+        Sense::click_and_drag(),
+    );
+    let mut footer = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("auxiliary-book-footer")
+            .max_rect(footer_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    footer.set_clip_rect(ui.clip_rect().intersect(footer_rect));
+    (rect, response, footer)
 }
 
 impl CefReader {
@@ -292,6 +334,7 @@ impl CefReader {
             highlight: None,
             captured_buttons: 0,
             cursor: egui::CursorIcon::Default,
+            auxiliary_location: None,
         })
     }
     fn poll_pane(
@@ -1203,14 +1246,8 @@ impl ReaderApp {
         p: Palette,
         document: &reader_core::LinkedDocument,
     ) -> Result<()> {
-        let footer_height = ui.spacing().interact_size.y.max(
-            ui.text_style_height(&egui::TextStyle::Button) + 2. * ui.spacing().button_padding.y,
-        );
-        let extent = vec2(
-            ui.available_width().max(120.),
-            (ui.available_height() - footer_height - ui.spacing().item_spacing.y).max(120.),
-        );
-        let (rect, response) = ui.allocate_exact_size(extent, Sense::click_and_drag());
+        let (rect, response, mut footer) = auxiliary_regions(ui);
+        let extent = rect.size();
         let chapter = &document.chapter;
         if reader
             .auxiliary
@@ -1228,6 +1265,7 @@ impl ReaderApp {
             )?);
         }
         let pane = reader.auxiliary.as_mut().unwrap();
+        pane.auxiliary_location.get_or_insert(document.locator);
         let mut layout_options = options(chapter, &self.settings, p, &reader.font_css);
         layout_options.measurement_marker = false;
         layout_options.margins = [20.; 4];
@@ -1240,6 +1278,12 @@ impl ReaderApp {
             || (pane.scale - scale).abs() > f32::EPSILON
             || serde_json::to_string(&pane.options)? != serde_json::to_string(&layout_options)?
         {
+            self.auxiliary_scroll_target = self
+                .auxiliary_scroll_target
+                .or(pane.auxiliary_location)
+                .or_else(|| pane.starts.get(pane.page).copied().flatten());
+            pane.requested_page = 0;
+            pane.awaiting_location = false;
             pane.surface.resize(size, scale)?;
             pane.size = size;
             pane.scale = scale;
@@ -1257,13 +1301,22 @@ impl ReaderApp {
         }
         Self::poll_chromium_input(ui, rect, pane)?;
         let mut events = Vec::new();
+        let previous_revision = pane.revision;
         CefReader::poll_pane(&reader.render, pane, &mut events, true)?;
+        if pane.revision != previous_revision {
+            // DOM/font invalidation also rebuilds pagination. Keep the original
+            // source position instead of applying a page number from the old layout.
+            self.auxiliary_scroll_target = self.auxiliary_scroll_target.or(pane.auxiliary_location);
+            pane.requested_page = 0;
+            pane.awaiting_location = false;
+        }
         if response.hovered() {
             ui.ctx().set_cursor_icon(pane.cursor);
         }
         if pane.ready
             && let Some(locator) = self.auxiliary_scroll_target.take()
         {
+            pane.auxiliary_location = Some(locator);
             pane.awaiting_location = true;
             events.retain(|event| !matches!(event, NavigatorEvent::Position { .. }));
             pane.surface.command(&BookCommand::Locate {
@@ -1273,9 +1326,14 @@ impl ReaderApp {
         }
         for event in events {
             match event {
-                NavigatorEvent::Position { page, .. } if pane.awaiting_location => {
+                NavigatorEvent::Position { page, start, .. } => {
                     pane.requested_page = page as usize;
-                    pane.awaiting_location = false;
+                    if pane.awaiting_location {
+                        pane.awaiting_location = false;
+                    } else if self.auxiliary_scroll_target.is_none() {
+                        pane.auxiliary_location =
+                            start.map(from_source).or(pane.auxiliary_location);
+                    }
                 }
                 NavigatorEvent::Link { href, x, y, .. } => {
                     let anchor = rect.min + vec2(x as f32, y as f32);
@@ -1347,7 +1405,8 @@ impl ReaderApp {
                 }
             }
         }
-        ui.horizontal(|ui| {
+        {
+            let ui = &mut footer;
             if ui
                 .add_enabled(pane.page > 0, egui::Button::new("前のページ"))
                 .clicked()
@@ -1364,7 +1423,7 @@ impl ReaderApp {
             {
                 pane.turns.push_back(true);
             }
-        });
+        }
         if pane.ready && !pane.awaiting_location && pane.waiting_paint.is_none() {
             if let Some(forward) = pane.turns.pop_front() {
                 pane.requested_page = if forward {
@@ -1724,5 +1783,66 @@ impl ReaderApp {
 impl Drop for CefReader {
     fn drop(&mut self) {
         self.reset();
+    }
+}
+
+#[cfg(test)]
+mod auxiliary_tests {
+    use super::auxiliary_regions;
+    use eframe::egui::{self, Id, Pos2, Rect, TextStyle, vec2};
+
+    #[test]
+    fn auxiliary_window_does_not_expand_between_frames() {
+        for body_size in [14., 28.] {
+            let ctx = egui::Context::default();
+            ctx.global_style_mut(|style| {
+                style.spacing.item_spacing = vec2(10., 10.);
+                style.spacing.button_padding = vec2(12., 7.);
+                style.text_styles.get_mut(&TextStyle::Body).unwrap().size = body_size;
+                style.text_styles.get_mut(&TextStyle::Button).unwrap().size = 11.;
+            });
+            let mut initial = None;
+            for frame in 0..60 {
+                let input = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1600., 1200.))),
+                    time: Some(frame as f64 / 8.),
+                    ..Default::default()
+                };
+                let mut window_size = None;
+                ctx.run_ui(input, |_| {
+                    let window = egui::Window::new("Supplement")
+                        .id(Id::unique("linked-auxiliary-document"))
+                        .default_size(vec2(620., 600.))
+                        .min_size(vec2(360., 260.))
+                        .constrain(true)
+                        .collapsible(false)
+                        .show(&ctx, |ui| {
+                            let (page, _, mut footer) = auxiliary_regions(ui);
+                            let footer_rect = footer.max_rect();
+                            let _ = footer.button("Previous page");
+                            footer.label("38 / 113");
+                            let _ = footer.button("Next page");
+                            assert!(page.bottom() < footer_rect.top());
+                            assert!(ui.min_rect().bottom() <= footer_rect.bottom() + 0.1);
+                            assert!(footer.min_rect().bottom() <= footer_rect.bottom() + 0.1);
+                        })
+                        .unwrap();
+                    window_size = Some(window.response.rect.size());
+                })
+                .drop_without_applying_deltas();
+                // Allow the initial sizing/font pass to settle, then check the
+                // same interactive Window repeatedly without user resizing.
+                if frame == 4 {
+                    initial = window_size;
+                } else if frame > 4 {
+                    let size = window_size.unwrap();
+                    assert!(
+                        (size - initial.unwrap()).length() <= 0.1,
+                        "window grew without user input: {:?} -> {size:?}",
+                        initial.unwrap()
+                    );
+                }
+            }
+        }
     }
 }

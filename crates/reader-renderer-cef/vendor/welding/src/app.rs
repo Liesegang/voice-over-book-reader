@@ -195,7 +195,9 @@ mod cef_backed {
                         | cef::SchemeOptions::SECURE.get_raw()
                         | cef::SchemeOptions::CORS_ENABLED.get_raw()
                         | cef::SchemeOptions::FETCH_ENABLED.get_raw();
-                    registrar.add_custom_scheme(Some(&scheme), options);
+                    // The flag enum's signedness differs across bindings;
+                    // the registrar accepts a C int on every platform.
+                    registrar.add_custom_scheme(Some(&scheme), options as _);
                 }
             }
 
