@@ -5,11 +5,11 @@
 With Python 3.12 or newer, run the wrapper from the repository root, for example:
 
 ```powershell
-python scripts/build-windows-installer.py --package target/packages/voice-over-book-reader-0.2.4-x86_64-pc-windows-msvc.zip --iscc 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' --output-dir target/installers
+python scripts/build-windows-installer.py --package target/packages/voice-over-book-reader-0.3.0-x86_64-pc-windows-msvc.zip --iscc 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' --output-dir target/installers
 python scripts/test-windows-installer.py
 ```
 
-`--package` also accepts the extracted package directory. Select the compiler with `--iscc`, `ISCC` / `INNO_SETUP_ISCC`, or `PATH`. The wrapper also searches standard Inno Setup 6 install locations. The wrapper checks the Windows architecture and all three native executables. It also checks required documentation and licenses. ZIP extraction rejects path traversal, Windows path aliases, links and duplicate paths. Publishing the installer and checksum refuses existing output files. The input ZIP or extracted package is unchanged.
+`--package` also accepts the extracted package directory. Select the compiler with `--iscc`, `ISCC` / `INNO_SETUP_ISCC`, or `PATH`. The wrapper also searches standard Inno Setup 6 install locations. The wrapper checks the Windows architecture and all three native executable entries. For 0.3 it verifies the Chromium client DLL, runtime manifest and locale/resource packs. It also checks browser notices, static CRT dependencies and required documentation/licenses. ZIP extraction rejects path traversal, Windows path aliases, links and duplicate paths. Publishing the installer and checksum refuses existing output files. The input ZIP or extracted package is unchanged.
 
 Prefer the original release ZIP. A folder used to run the app can contain WebView profiles or other user data. Validation rejects unknown files and extra top-level directories. This keeps user data out of the installer. Update the allowed package file list when adding release documents or notices.
 
@@ -21,7 +21,7 @@ Absolute directory containing the complete extracted native package.
 
 ### `AppVersion`
 
-Package version from `BUILD.json`, such as `0.2.1`.
+Package version from `BUILD.json`, such as `0.3.0`.
 
 ### `InstallerOutputDir`
 
@@ -76,3 +76,12 @@ Primary references:
 - [Microsoft: Register file types and OpenWithProgids](https://learn.microsoft.com/en-us/windows/win32/shell/fa-file-types)
 - [Microsoft: Application registration](https://learn.microsoft.com/en-us/windows/win32/shell/app-registration)
 - [Microsoft: Launch the Default Apps settings page](https://learn.microsoft.com/en-us/windows/apps/develop/launch/launch-default-apps-settings)
+
+## Chromium runtime in 0.3
+
+The portable ZIP and installer require the complete matching CEF runtime.
+The entry EXE is the official sandbox bootstrap.
+Its same-named client DLL exports RunWinMain.
+Libraries, locale packs, resources, CEF-MANIFEST.json, and original licenses stay together.
+The installer does not download Chromium or disable sandboxing.
+Speech models remain separate.

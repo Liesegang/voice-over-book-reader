@@ -1,0 +1,14 @@
+{
+  "cef_license": {
+    "url": "https://raw.githubusercontent.com/chromiumembedded/cef/14c5a08/LICENSE.txt",
+    "bytes": 1662,
+    "sha256": "058c3827ffb827ff3edda471ae7e1bb1d1aa5931985f0126043ccd33409e792f"
+  },
+  "chromium_notices": "Original CREDITS.html from the exact target CEF SDK is copied unmodified into each package.",
+  "welding": {
+    "license": "MPL-2.0",
+    "upstream": "https://github.com/merely-made/wgpu-weld/tree/7f04a38bb77696a8ca584565529f7c81fd8fddd4",
+    "modified_source": "crates/reader-renderer-cef/vendor/welding",
+    "source_delivery": "The matching public release source archive includes the modified covered files. The packaged CEF manifest gives the exact source commit URL."
+  }
+}

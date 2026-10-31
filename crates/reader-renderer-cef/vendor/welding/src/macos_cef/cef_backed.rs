@@ -112,6 +112,8 @@ cef::wrap_render_handler! {
             match frame {
                 Ok(frame) => {
                     slot.store(crate::native_frame::NativeFrame::MetalTextureRef(frame));
+                    drop(slot);
+                    self.handler.events.wake();
                 }
                 Err(error) => {
                     log::error!("failed to wrap retained CEF IOSurface: {error}");
@@ -367,6 +369,7 @@ cef::wrap_life_span_handler! {
             log::debug!("CEF on_before_close");
             self.scripts.fail_all("browser closed");
             self.cookies.fail_active("browser closed");
+            self.events.push(CefSurfaceEvent::Navigation(crate::surface::NavigationEvent::BrowserClosed));
         }
     }
 }

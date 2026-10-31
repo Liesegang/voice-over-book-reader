@@ -16,6 +16,8 @@ import struct
 import tempfile
 import zipfile
 from urllib.parse import urlsplit
+import stat
+import cef_bundle
 
 SUPPORTED_TARGETS = (
     "x86_64-pc-windows-msvc", "aarch64-apple-darwin",
@@ -49,7 +51,7 @@ def rewrite_document_links(text: str, source: str, paths: dict[str, str]) -> str
 
 def cargo_metadata(root: Path, target: str) -> dict:
     result = subprocess.run(
-        ["cargo", "+1.97.0", "metadata", "--locked", "--format-version", "1", "--filter-platform", target],
+        ["cargo", "+1.97.1", "metadata", "--locked", "--format-version", "1", "--filter-platform", target],
         cwd=root, check=True, stdout=subprocess.PIPE, text=True, encoding="utf-8",
     )
     return json.loads(result.stdout)
@@ -103,12 +105,14 @@ def third_party_notices(metadata: dict) -> str:
     return "\n".join(lines)
 
 
-def package(root: Path, target: str, output_dir: Path) -> Path:
+def package(root: Path, target: str, output_dir: Path, cef_path: Path | None = None) -> Path:
     if target not in SUPPORTED_TARGETS:
         raise ValueError(f"Unsupported package target: {target}")
     metadata = cargo_metadata(root, target)
     application = next(item for item in metadata["packages"] if item["name"] == "voice-over-book-reader")
     version = application["version"]
+    uses_cef = cef_bundle.required(version)
+    sdk = cef_bundle.sdk_path(target, cef_path) if uses_cef else None
     target_dir = Path(metadata["target_directory"]) / target / "release"
     extension = ".exe" if "windows" in target else ""
     binaries = [target_dir / f"{name}{extension}" for name in ("voice-over-book-reader", "reader-dictionary-popup")]
@@ -126,6 +130,8 @@ def package(root: Path, target: str, output_dir: Path) -> Path:
                 raise ValueError(f"VOICEROID2 bridge must be PE32 x86, not the 64-bit workspace stub: {bridge}")
         binaries.append(bridge)
     for binary in binaries:
+        if uses_cef and "windows" in target and binary.name == "voice-over-book-reader.exe":
+            continue  # The CEF sandbox bootstrap is the shipped executable.
         if not binary.is_file():
             raise FileNotFoundError(f"Build the release workspace with --target {target} first: {binary}")
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -149,7 +155,10 @@ def package(root: Path, target: str, output_dir: Path) -> Path:
             with (app / "Contents" / "Info.plist").open("wb") as file:
                 plistlib.dump(plist, file)
         for binary in binaries:
+            if uses_cef and "windows" in target and binary.name == "voice-over-book-reader.exe":
+                continue
             shutil.copy2(binary, executable_dir / binary.name)
+        engine = cef_bundle.stage(root, target, target_dir, staging, sdk, version) if uses_cef else None
         licenses = staging / "licenses"
         font_licenses = licenses / "fonts"
         font_licenses.mkdir(parents=True)
@@ -169,6 +178,8 @@ def package(root: Path, target: str, output_dir: Path) -> Path:
             "docs/license-audit-aivis-voicevox.md": "LICENSE-AUDIT-AIVIS-VOICEVOX.md",
             "docs/license-audit-kokoro.md": "LICENSE-AUDIT-KOKORO.md",
         }
+        if uses_cef:
+            documents["docs/chromium-runtime.md"] = "CHROMIUM.md"
         readme_links = {**documents, "README.md": "README.md", "README.ja.md": "README.ja.md",
                         "licenses/Apache-2.0.txt": "licenses/Apache-2.0.txt",
                         "crates/reader-speech/vendor/sonic/LICENSE": "licenses/Sonic-LICENSE.txt",
@@ -208,26 +219,39 @@ def package(root: Path, target: str, output_dir: Path) -> Path:
                 "Models and native inference libraries are obtained on first use, not bundled here.\n",
                 encoding="utf-8",
             )
-        (staging / "BUILD.json").write_text(json.dumps({
+        build_info = {
             "application": "voice-over-book-reader", "display_name": "Voice Over Book Reader",
             "version": version, "target": target,
-            "rust": "1.97.0", "commit": os.environ.get("GITHUB_SHA", "local"),
+            "rust": "1.97.1" if uses_cef else "1.97.0", "commit": os.environ.get("GITHUB_SHA", "local"),
             "native_smoke_tests_run": False,
             "native_processes": [binary.name for binary in binaries],
-        }, indent=2), encoding="utf-8")
+        }
+        if engine:
+            build_info["book_engine"] = {key: value for key, value in engine.items() if key not in {"files_before", "files"}}
+        (staging / "BUILD.json").write_text(json.dumps(build_info, indent=2), encoding="utf-8")
         if "apple-darwin" in target:
             # Ad-hoc signing needs no credentials. This is not Apple notarization.
             # Sign nested code inside out (Apple TN2206). Signing the main
             # CFBundleExecutable also inspects its enclosing .app, so unsigned
             # Intel helpers must already be signed before that bundle is sealed.
-            for binary in binaries:
-                if binary.name != "voice-over-book-reader":
-                    subprocess.run(["codesign", "--force", "--sign", "-", str(executable_dir / binary.name)], check=True)
-            subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True)
-            subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+            if uses_cef:
+                cef_bundle.sign_macos(app)
+            else:
+                for binary in binaries:
+                    if binary.name != "voice-over-book-reader":
+                        subprocess.run(["codesign", "--force", "--sign", "-", str(executable_dir / binary.name)], check=True)
+                subprocess.run(["codesign", "--force", "--sign", "-", str(app)], check=True)
+                subprocess.run(["codesign", "--verify", "--deep", "--strict", str(app)], check=True)
+        if engine:
+            cef_bundle.write_manifest(staging, engine)
         with zipfile.ZipFile(archive_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
             for path in sorted(staging.rglob("*")):
-                if path.is_file():
+                if path.is_symlink():
+                    entry = zipfile.ZipInfo(path.relative_to(staging.parent).as_posix())
+                    entry.create_system = 3
+                    entry.external_attr = (stat.S_IFLNK | 0o777) << 16
+                    archive.writestr(entry, os.readlink(path).encode("utf8"))
+                elif path.is_file():
                     archive.write(path, path.relative_to(staging.parent))
     with archive_path.open("rb") as file:
         digest = hashlib.file_digest(file, "sha256").hexdigest()
@@ -239,10 +263,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target", required=True, choices=SUPPORTED_TARGETS)
     parser.add_argument("--output-dir", type=Path, default=Path("target/packages"))
+    parser.add_argument("--cef-path", type=Path, help="Matching SDK prepared at build time (defaults to CEF_PATH)")
     arguments = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     output_dir = arguments.output_dir if arguments.output_dir.is_absolute() else root / arguments.output_dir
-    print(package(root, arguments.target, output_dir))
+    print(package(root, arguments.target, output_dir, arguments.cef_path))
 
 
 if __name__ == "__main__":

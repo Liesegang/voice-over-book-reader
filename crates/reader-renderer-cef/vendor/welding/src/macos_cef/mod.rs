@@ -154,7 +154,12 @@ impl MacosCefProducer {
                         .into(),
                 ));
             }
-            let mut request_context = crate::profile::create(_runtime, &config.surface)?;
+            // Match Windows/Linux: native book factories are registered on the
+            // global context, while random vobr hostnames isolate book origins.
+            let mut request_context =
+                cef::request_context_get_global_context().ok_or_else(|| {
+                    WeldError::SurfaceCreation("global CEF request context unavailable".into())
+                })?;
             return Self::new_with_request_context(&config, &mut request_context);
         }
 
@@ -370,10 +375,10 @@ impl MacosCefProducer {
                     } else {
                         cef::PermissionRequestResult::DENY
                     });
-                },
+                }
                 crate::permissions::Pending::Media(callback, requested) => {
                     callback.cont(if granted { requested } else { 0 });
-                },
+                }
             }
             return Ok(());
         }
@@ -445,6 +450,10 @@ impl MacosCefProducer {
 // needless_return: cfg-dispatch bodies end in `return X;` so the scaffold block can follow.
 #[allow(unreachable_code, unused_variables, clippy::needless_return)]
 impl CefSurfaceProducer for MacosCefProducer {
+    fn set_repaint_wake(&mut self, wake: Option<crate::surface::RepaintWake>) {
+        self.events.set_wake(wake);
+    }
+
     fn surface_mode(&self) -> CefSurfaceMode {
         CefSurfaceMode::AcceleratedPaint
     }
@@ -1173,7 +1182,7 @@ fn escape_js_string(s: &str) -> String {
             c if (c as u32) < 0x20 => {
                 use std::fmt::Write;
                 let _ = write!(out, "\\u{:04x}", c as u32);
-            },
+            }
             c => out.push(c),
         }
     }

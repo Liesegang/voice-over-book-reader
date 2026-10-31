@@ -23,7 +23,7 @@ jobs:
   native:
     name: ${{ matrix.platform }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 150
     strategy:
       fail-fast: false
       # Standard hosted labels checked against GitHub's runner reference:
@@ -58,50 +58,116 @@ jobs:
             build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev \
             libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev \
             libx11-dev libxi-dev libxcursor-dev libxrandr-dev libvulkan1 \
-            fonts-noto-cjk
+            fonts-noto-cjk libnss3 libnspr4 libgbm1 libxss1 ninja-build clang libclang-dev cmake
 
       - name: Pin the macOS deployment target
         if: runner.os == 'macOS'
         run: echo "MACOSX_DEPLOYMENT_TARGET=15.0" >> "$GITHUB_ENV"
 
-      - name: Rust 1.97.0
+      - name: Short native build directory
+        # CEF generates very long C++ test/object names. Keep them out of the
+        # checkout path so MSVC/CMake stay below the Windows MAX_PATH limit.
+        # rust-cache joins its target input to the workspace: pass a relative
+        # path there, while Cargo receives the matching absolute directory.
         run: |
-          rustup toolchain install 1.97.0 --profile minimal --component rustfmt --component clippy
-          rustup target add --toolchain 1.97.0 "${{ matrix.target }}"
-          rustc +1.97.0 --version
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          target = Path(os.environ["RUNNER_TEMP"]) / "vobr-target"
+          target.mkdir(parents=True, exist_ok=True)
+          relative = os.path.relpath(target, Path.cwd()).replace("\\", "/")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf8") as output:
+              output.write(f"CARGO_TARGET_DIR={target.as_posix()}\n")
+              output.write(f"VOBR_CACHE_TARGET_REL={relative}\n")
+          print("Using short Cargo build output; package artifacts remain under target/packages")
+          PY
+
+      - name: Windows C++ toolchain
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+
+      - name: Self-contained Windows CRT
+        if: runner.os == 'Windows'
+        # Every Cargo command has --target, so host proc macros remain unaffected.
+        run: echo 'RUSTFLAGS=-C target-feature=+crt-static' >> "$GITHUB_ENV"
+
+      - name: CEF build tools
+        run: |
+          if ! command -v ninja >/dev/null; then
+            if [[ "$RUNNER_OS" == "macOS" ]]; then brew install ninja; fi
+            if [[ "$RUNNER_OS" == "Windows" ]]; then choco install ninja --yes --no-progress; fi
+          fi
+          cmake --version
+          ninja --version
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            echo 'LIBCLANG_PATH=C:\Program Files\LLVM\bin' >> "$GITHUB_ENV"
+          fi
+
+      - name: Pinned CEF SDK cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ${{ runner.temp }}/vobr-cef-sdk/${{ matrix.target }}
+          key: cef154-${{ matrix.target }}-${{ hashFiles('scripts/cef-runtime-pins.json') }}
+
+      - name: Prepare bundled CEF SDK
+        run: python scripts/prepare-cef-sdk.py --target "${{ matrix.target }}" --directory "$RUNNER_TEMP/vobr-cef-sdk/${{ matrix.target }}" --github-env "$GITHUB_ENV"
+
+      - name: Rust 1.97.1
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+          rustup target add --toolchain 1.97.1 "${{ matrix.target }}"
+          rustc +1.97.1 --version
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ${{ matrix.target }}-release-1.97
+          workspaces: . -> ${{ env.VOBR_CACHE_TARGET_REL }}
           cache-bin: "false"
           cache-on-failure: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Formatting
-        run: cargo +1.97.0 fmt --all --check
+        run: cargo +1.97.1 fmt --all --check
 
       - name: Workspace build
         # Reuse the shipping profile for tests and packages. Building optimized
         # Japanese dictionaries in both dev and release doubles cold CI work.
-        run: cargo +1.97.0 build --workspace --all-targets --release --locked --target "${{ matrix.target }}"
+        run: cargo +1.97.1 build --workspace --all-targets --release --locked --target "${{ matrix.target }}"
 
       - name: Offline-capable unit and fixture tests
         # The default tests never synthesize speech, download neural models,
         # open a GUI, or require an audio device. Native PDF/TTS smokes are ignored.
-        run: cargo +1.97.0 test --workspace --all-targets --release --locked --target "${{ matrix.target }}"
+        run: cargo +1.97.1 test --workspace --all-targets --release --locked --target "${{ matrix.target }}"
 
       - name: Release binaries
-        run: cargo +1.97.0 build --workspace --release --bins --locked --target "${{ matrix.target }}"
+        run: |
+          cargo +1.97.1 build --workspace --release --bins --locked --target "${{ matrix.target }}"
+          cargo +1.97.1 build -p voice-over-book-reader --lib --release --locked --target "${{ matrix.target }}"
 
       - name: Windows 32-bit native VOICEROID2 DLL host
         if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x86
+
+      - name: Build and test the Windows 32-bit native VOICEROID2 DLL host
+        if: runner.os == 'Windows'
         run: |
-          rustup target add --toolchain 1.97.0 i686-pc-windows-msvc
-          cargo +1.97.0 test -p reader-voiceroid-bridge --release --locked --target i686-pc-windows-msvc
-          cargo +1.97.0 build -p reader-voiceroid-bridge --release --locked --target i686-pc-windows-msvc
+          rustup target add --toolchain 1.97.1 i686-pc-windows-msvc
+          cargo +1.97.1 test -p reader-voiceroid-bridge --release --locked --target i686-pc-windows-msvc
+          cargo +1.97.1 build -p reader-voiceroid-bridge --release --locked --target i686-pc-windows-msvc
+
+      - name: Book navigator protocol tests
+        # Pure Node tests; no browser, models, display or GPU is required.
+        run: |
+          node --version
+          node crates/reader-renderer-cef/navigator.test.mjs
 
       - name: Packaging fixture tests
-        run: python scripts/ci-test-package.py
+        run: |
+          python scripts/ci-test-package.py
+          python scripts/test-cef-bundle.py
+          python scripts/test-cef-sdk.py
 
       - name: Windows installer boundary tests
         if: runner.os == 'Windows'

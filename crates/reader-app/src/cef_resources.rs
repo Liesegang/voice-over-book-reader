@@ -12,6 +12,7 @@ pub struct BookOrigin {
     source: Arc<Book>,
     memory_resources: Arc<BTreeMap<String, Arc<Vec<u8>>>>,
     mime_types: Arc<BTreeMap<String, String>>,
+    static_resources: Arc<BTreeMap<String, &'static [u8]>>,
 }
 
 impl BookOrigin {
@@ -49,11 +50,29 @@ impl BookOrigin {
             source: Arc::new(book),
             memory_resources: Arc::new(memory_resources),
             mime_types: Arc::new(BTreeMap::new()),
+            static_resources: Arc::new(BTreeMap::new()),
         })
     }
 
     pub fn token(&self) -> &str {
         &self.token
+    }
+
+    pub fn add_static_resource(&mut self, path: String, bytes: &'static [u8]) -> Result<()> {
+        validate_path(&path)?;
+        Arc::make_mut(&mut self.static_resources).insert(path, bytes);
+        Ok(())
+    }
+
+    /// Add an application-owned control document without changing archive data.
+    pub fn add_control_document(&mut self, path: String, bytes: Vec<u8>) -> Result<()> {
+        validate_path(&path)?;
+        ensure!(
+            self.source.resource_bytes(&path)?.is_none(),
+            "Control document collides with a book resource"
+        );
+        Arc::make_mut(&mut self.memory_resources).insert(path, Arc::new(bytes));
+        Ok(())
     }
 
     /// `path` is a decoded archive name, not an already escaped URL.
@@ -118,7 +137,22 @@ impl BookOrigin {
             Ok(path) => path,
             Err(_) => return failure(403, "Forbidden"),
         };
-        let resource = if let Some(bytes) = self.memory_resources.get(&path) {
+        let resource = if let Some(bytes) = self.static_resources.get(&path) {
+            use std::sync::{Mutex, OnceLock, Weak};
+            type FontCache = Mutex<std::collections::HashMap<(usize, usize), Weak<Vec<u8>>>>;
+            static CACHE: OnceLock<FontCache> = OnceLock::new();
+            let mut cache = CACHE
+                .get_or_init(Default::default)
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let key = (bytes.as_ptr() as usize, bytes.len());
+            let data = cache.get(&key).and_then(Weak::upgrade).unwrap_or_else(|| {
+                let data = Arc::new(bytes.to_vec());
+                cache.insert(key, Arc::downgrade(&data));
+                data
+            });
+            Ok(Some(data))
+        } else if let Some(bytes) = self.memory_resources.get(&path) {
             Ok(Some(Arc::clone(bytes)))
         } else {
             self.source.resource_bytes(&path)
@@ -331,6 +365,7 @@ impl BookResponse {
             headers,
         }
     }
+    #[cfg(test)]
     pub fn body(&self) -> &[u8] {
         if self.head {
             &[]
@@ -343,7 +378,6 @@ impl BookResponse {
     }
 }
 
-#[cfg(windows)]
 mod native {
     use super::*;
     use cef::*;
@@ -528,18 +562,6 @@ mod native {
             );
             Ok(())
         }
-        pub fn register_in_context(&self, context: &RequestContext) -> Result<()> {
-            let mut factory = self.factory();
-            ensure!(
-                context.register_scheme_handler_factory(
-                    Some(&CefString::from("vobr")),
-                    Some(&CefString::from(self.token())),
-                    Some(&mut factory)
-                ) != 0,
-                "CEF rejected the contextual book resource factory"
-            );
-            Ok(())
-        }
     }
 
     #[cfg(test)]
@@ -563,7 +585,6 @@ mod native {
         }
     }
 }
-#[cfg(windows)]
 pub use native::pending_resource_reads;
 
 #[cfg(test)]

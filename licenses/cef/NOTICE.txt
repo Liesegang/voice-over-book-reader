@@ -1,0 +1,25 @@
+Voice Over Book Reader's book document engine uses Chromium Embedded Framework.
+The native application controls remain Rust/egui; this is not a web UI shell.
+
+CEF 154.0.34+g14c5a08, Chromium 154.0.8037.98:
+  https://github.com/chromiumembedded/cef/tree/14c5a08
+  Chromium source: https://chromium.googlesource.com/chromium/src/+/154.0.8037.98/
+  CEF-LICENSE.txt retains the original CEF BSD notice.
+  CHROMIUM-CREDITS.html retains the original SDK's complete third-party notices.
+  CEF-MANIFEST.json records the target SDK archive and distributed runtime hashes.
+
+cef-rs 154.5.0+154.0.34 (Apache-2.0 OR MIT):
+  https://github.com/tauri-apps/cef-rs
+  The complete resolved crate licenses and source archive URL are also recorded
+  in THIRD-PARTY-NOTICES.txt.
+
+welding 0.15.0 and the locally modified covered sources remain MPL-2.0.
+  Original project: https://github.com/merely-made/wgpu-weld
+  The package's CEF-MANIFEST.json points to the matching public source commit.
+  Obtain crates/reader-renderer-cef/vendor/welding from that commit or from the
+  source archive attached by GitHub to the corresponding release tag.
+  The complete MPL-2.0 text is included as welding-MPL-2.0.txt.
+
+CEF runtime libraries and resource packs are included with the application.
+No CEF download is performed on the user's machine. Speech models and separately
+licensed optional speech runtimes remain independent of this browser runtime.

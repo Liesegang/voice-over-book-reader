@@ -2,6 +2,9 @@
 #[path = "app_tests.rs"]
 mod tests;
 
+#[path = "cef_reader.rs"]
+mod cef_reader;
+
 use crate::{
     fonts::{self, FontSystem},
     icons::{self, Icon},
@@ -213,6 +216,8 @@ fn chapter_narration(
 }
 
 pub struct ReaderApp {
+    cef_reader: Option<cef_reader::CefReader>,
+    perf_driver: Option<crate::cef_perf::PerfDriver>,
     first_book_frame: Option<crate::latency::Pending>,
     page_count_ready: Option<crate::latency::Pending>,
     pagination_index: Option<crate::pagination::PageIndex>,
@@ -401,6 +406,12 @@ impl ReaderApp {
         let (tx, rx) = mpsc::channel();
         let covers = crate::covers::CoverCache::new(store.data_dir());
         let mut app = Self {
+            perf_driver: crate::cef_perf::PerfDriver::from_args(args),
+            cef_reader: if !cfg!(test) && !args.iter().any(|a| a == "--native-renderer") {
+                cc.wgpu_render_state.clone().map(cef_reader::CefReader::new)
+            } else {
+                None
+            },
             first_book_frame: None,
             page_count_ready: None,
             worker_context: cc.egui_ctx.clone(),
@@ -691,6 +702,9 @@ impl ReaderApp {
         Ok(())
     }
     fn open_path(&mut self, path: PathBuf) {
+        if let Some(reader) = self.cef_reader.as_mut() {
+            reader.close_book();
+        }
         self.clear_frame_caches();
         if path.extension().is_some_and(|extension| {
             ["mp3", "m4a", "m4b", "wav"]
@@ -1151,6 +1165,16 @@ impl ReaderApp {
     }
     fn turn_page(&mut self, forward: bool) {
         let _turn = crate::latency::span("page_turn_dispatch", self.open_generation);
+        if self.book.epub.is_some()
+            && let Some(reader) = self.cef_reader.as_mut()
+        {
+            if !reader.turn_ready() {
+                self.pending_wheel_turns.push_back(forward);
+                self.worker_context.request_repaint();
+                return;
+            }
+            reader.mark_turn();
+        }
         if self.opening || self.chapter_loading.is_some() {
             return;
         }
@@ -2300,6 +2324,10 @@ impl ReaderApp {
 
 impl ReaderApp {
     fn reader(&mut self, ui: &mut Ui, p: Palette) {
+        if self.cef_reader.is_some() && self.book.epub.is_some() {
+            self.chromium_reader(ui, p);
+            return;
+        }
         let rect = ui.available_rect_before_wrap();
         self.reading_extent = rect.size();
         let interaction_rect = Rect::from_min_max(
@@ -3409,7 +3437,9 @@ impl ReaderApp {
             }
             return;
         }
-        if ctx.egui_wants_keyboard_input() {
+        let book_has_focus = self.screen == Screen::Reader
+            && ctx.memory(|memory| memory.focused()) == Some(Id::unique("book-page"));
+        if ctx.egui_wants_keyboard_input() && !book_has_focus {
             return;
         }
         for action in crate::actions::pressed(ctx, &self.settings.key_bindings) {
@@ -3463,6 +3493,9 @@ impl ReaderApp {
                 !ctx.input(|i| i.viewport().maximized.unwrap_or(false)),
             )),
             A::CloseTransient => {
+                if let Some(reader) = self.cef_reader.as_mut() {
+                    reader.clear_selection();
+                }
                 self.link_request = self.link_request.wrapping_add(1);
                 self.auxiliary_document = None;
                 self.force_hide_dictionary();
@@ -3647,6 +3680,11 @@ impl eframe::App for ReaderApp {
             && self.chapter_loading.is_none()
             && !self.layout_key.is_empty()
             && !self.layout.pages.is_empty()
+            && (!self.book.epub.is_some()
+                || self
+                    .cef_reader
+                    .as_ref()
+                    .is_none_or(|reader| reader.turn_ready()))
             && let Some(forward) = self.pending_wheel_turns.pop_front()
         {
             self.wheel_paint_frame = ctx.cumulative_frame_nr();
@@ -3875,6 +3913,72 @@ impl eframe::App for ReaderApp {
                 );
             });
         }
+        if let Some(mut driver) = self.perf_driver.take() {
+            let chromium = self.book.epub.is_some() && self.cef_reader.is_some();
+            let marker = if chromium {
+                self.cef_reader
+                    .as_ref()
+                    .and_then(|reader| reader.measurement_marker())
+            } else if !self.layout.pages.is_empty() {
+                Some([
+                    16 + ((self.page & 7) * 32) as u8,
+                    16 + (((self.page >> 3) & 7) * 32) as u8,
+                    128,
+                ])
+            } else {
+                None
+            };
+            if !chromium && let Some(rgb) = marker {
+                let marker_rect =
+                    Rect::from_min_size(pos2(all.right() - 6., all.bottom() - 38.), vec2(4., 4.));
+                ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    Id::unique("measurement-marker"),
+                ))
+                .rect_filled(
+                    marker_rect,
+                    0.,
+                    Color32::from_rgb(rgb[0], rgb[1], rgb[2]),
+                );
+            }
+            let ready = !self.opening
+                && !self.layout.pages.is_empty()
+                && (!chromium
+                    || self
+                        .cef_reader
+                        .as_ref()
+                        .is_some_and(|reader| reader.turn_ready()));
+            let action = driver.tick(
+                &ctx,
+                [
+                    (all.width() * ctx.pixels_per_point()).round() as usize,
+                    (all.height() * ctx.pixels_per_point()).round() as usize,
+                ],
+                marker,
+                self.chapter,
+                self.page,
+                self.pagination_index.as_ref().map(|index| index.total),
+                ready,
+            );
+            self.perf_driver = Some(driver);
+            match action {
+                Some(crate::cef_perf::PerfAction::Turn(forward)) => self.turn_page(forward),
+                Some(crate::cef_perf::PerfAction::WheelBurst(count)) => {
+                    self.queue_wheel_pages(&[(
+                        egui::MouseWheelUnit::Line,
+                        vec2(0., -(count as f32)),
+                    )]);
+                }
+                Some(crate::cef_perf::PerfAction::ToggleChrome) => {
+                    self.focus = !self.focus;
+                    self.drawer_open = true;
+                }
+                Some(crate::cef_perf::PerfAction::Close) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close)
+                }
+                None => {}
+            }
+        }
         ctx.request_repaint_after(
             if self.speaking
                 || !self.pending_wheel_turns.is_empty()
@@ -3923,7 +4027,10 @@ fn strip_tags(html: &str) -> String {
 fn book_argument(args: &[String]) -> Option<PathBuf> {
     let mut args = args.iter();
     while let Some(arg) = args.next() {
-        if matches!(arg.as_str(), "--data-dir" | "--screenshot") {
+        if matches!(
+            arg.as_str(),
+            "--data-dir" | "--screenshot" | "--perf-output"
+        ) {
             args.next();
             continue;
         }
@@ -4156,8 +4263,15 @@ impl ReaderApp {
     }
     fn auxiliary_popup(&mut self, ctx: &egui::Context, p: Palette) {
         let Some(document) = self.auxiliary_document.clone() else {
+            if let Some(reader) = self.cef_reader.as_mut() {
+                reader.close_auxiliary();
+            }
             return;
         };
+        if self.cef_reader.is_some() && self.book.epub.is_some() {
+            self.chromium_auxiliary_popup(ctx, p, &document);
+            return;
+        }
         let mut open = true;
         let mut clicked = None;
         egui::Window::new(if document.chapter.title.is_empty() {
@@ -4383,6 +4497,21 @@ impl ReaderApp {
 
     fn speech_start_hit(&self) -> Option<Hit> {
         let page = self.layout.pages.get(self.page)?;
+        if self.cef_reader.is_some()
+            && self.book.epub.is_some()
+            && let Some(locator) = self.resume_locator
+            && page.first_locator().is_some_and(|start| start <= locator)
+            && self
+                .layout
+                .pages
+                .get(self.page + 1)
+                .and_then(|page| page.first_locator())
+                .is_none_or(|end| locator < end)
+            && locator.chapter as usize == self.chapter
+            && let Some(hit) = self.chromium_hit(locator, Pos2::ZERO)
+        {
+            return Some(hit);
+        }
         if let Some(locator) = self.resume_locator
             && let Some(hit) = page.hit_for_locator(locator)
         {

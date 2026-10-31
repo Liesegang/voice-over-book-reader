@@ -390,10 +390,10 @@ impl WindowsCefProducer {
                     } else {
                         cef::PermissionRequestResult::DENY
                     });
-                },
+                }
                 crate::permissions::Pending::Media(callback, requested) => {
                     callback.cont(if granted { requested } else { 0 });
-                },
+                }
             }
             return Ok(());
         }
@@ -465,6 +465,10 @@ impl WindowsCefProducer {
 // needless_return: cfg-dispatch bodies end in `return X;` so the scaffold block can follow.
 #[allow(unreachable_code, unused_variables, clippy::needless_return)]
 impl CefSurfaceProducer for WindowsCefProducer {
+    fn set_repaint_wake(&mut self, wake: Option<crate::surface::RepaintWake>) {
+        self.events.set_wake(wake);
+    }
+
     fn surface_mode(&self) -> CefSurfaceMode {
         CefSurfaceMode::AcceleratedPaint
     }
@@ -1231,7 +1235,7 @@ fn escape_js_string(s: &str) -> String {
             c if (c as u32) < 0x20 => {
                 use std::fmt::Write;
                 let _ = write!(out, "\\u{:04x}", c as u32);
-            },
+            }
             c => out.push(c),
         }
     }

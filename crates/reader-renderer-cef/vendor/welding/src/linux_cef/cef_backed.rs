@@ -85,14 +85,15 @@ cef::wrap_render_handler! {
                 return;
             }
 
-            // Map CEF color type → wgpu sRGB texture format. CEF emits
-            // sRGB pixel data; importing as UNORM would double-apply
-            // gamma at sample time. See cef#3687 thread.
+            // VOBR samples this texture through egui-wgpu, whose fragment
+            // shader expects gamma-encoded UNORM pixels and performs the
+            // framebuffer conversion itself. Match Windows/macOS here; an
+            // sRGB texture would decode before egui and darken the page twice.
             let format = match *info.format.as_ref() {
                 cef::sys::cef_color_type_t::CEF_COLOR_TYPE_RGBA_8888 => {
-                    wgpu::TextureFormat::Rgba8UnormSrgb
+                    wgpu::TextureFormat::Rgba8Unorm
                 }
-                _ => wgpu::TextureFormat::Bgra8UnormSrgb,
+                _ => wgpu::TextureFormat::Bgra8Unorm,
             };
 
             // dup(2) every plane fd. CEF closes the originals after the
@@ -136,6 +137,8 @@ cef::wrap_render_handler! {
             match image {
                 Ok(image) => {
                     slot.store(crate::native_frame::NativeFrame::DmaBufImage(image));
+                    drop(slot);
+                    self.handler.events.wake();
                 }
                 Err(error) => {
                     log::error!("failed to wrap CEF DMABUF image: {error}");
@@ -391,6 +394,7 @@ cef::wrap_life_span_handler! {
             log::debug!("CEF on_before_close");
             self.scripts.fail_all("browser closed");
             self.cookies.fail_active("browser closed");
+            self.events.push(CefSurfaceEvent::Navigation(crate::surface::NavigationEvent::BrowserClosed));
         }
     }
 }

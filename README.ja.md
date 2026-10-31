@@ -3,7 +3,11 @@
 [English](README.md) · [ダウンロード](https://github.com/Liesegang/voice-over-book-reader/releases) · [音声エンジン](docs/speech.md)
 
 日本語の書籍と読み上げに対応した、Rust製のデスクトップEPUBリーダーです。
-画面と現在の本文描画にはネイティブ実装を使い、辞書の定義は別プロセスのWebViewで表示します。
+0.3の統合ソースは、実行時の検証を進めている段階です。
+GUIはネイティブRustで実装しています。
+0.3では本文を同梱のChromium Embedded Framework（CEF）で描画し、書籍のXHTML、CSS、SVG、埋込フォントを使います。
+書籍内のスクリプトは実行しません。
+辞書の定義は別プロセスのWebViewで表示します。
 
 ## 読書
 
@@ -26,7 +30,7 @@
 選択した位置や本文の右クリックメニューから読み始められます。
 音声エンジンの位置情報、または生成音声への位置合わせを使って本文をハイライトします。
 再生速度は0.5〜10倍に対応し、先読みとキャッシュを使えます。
-登録した読みは、書籍のルビより優先できます。
+登録した読みは書籍のルビより優先できます。
 置き換えた読みも原文の位置へ対応付けます。
 
 | エンジン | 用意するもの |
@@ -58,14 +62,19 @@ ZIP版はフォルダー全体を展開し、次のファイルを同じ場所�
 
 ```text
 voice-over-book-reader.exe
+voice-over-book-reader.dll
+libcef.dll と同梱のChromium DLL
+locales/ とChromiumのリソースファイル
+CEF-MANIFEST.json
 reader-dictionary-popup.exe
 reader-voiceroid-bridge.exe
 licenses/ と同梱のライセンス表示・説明書
 ```
 
+本文描画用のChromiumはインストーラーとZIPに含まれ、別途ブラウザーを取得する必要はありません。
 辞書の表示にはMicrosoft Edge WebView2 Runtimeが必要です。
 ローカル音声の初回利用時には追加データを取得します。
-アプリのインストーラーやZIPにモデルの重みや外部の推論ランタイムは含めません。
+音声モデルの重みや追加の推論ランタイムは、アプリのインストーラーやZIPに含めません。
 
 **macOS:** Apple Silicon用またはIntel用のZIPを選び、`.app`を展開します。
 **Linux x64:** ZIPを展開し、GTK 3、WebKitGTK 4.1、ALSA、画面表示用のライブラリを用意します。
@@ -74,32 +83,32 @@ licenses/ と同梱のライセンス表示・説明書
 
 ## ビルド
 
-Rust **1.97.0**を使います。
-WindowsはVisual Studio C++ Build Tools、macOSはXcode Command Line Toolsが必要です。
-Ubuntuでは次を導入します。
+Rust **1.97.1**、Python 3.12以降、CMake、Ninja、C／C++コンパイラーを使います。
+WindowsはVisual Studio C++ Build Toolsとlibclang、macOSはXcode Command Line Toolsが必要です。
+ビルド時には、バージョンが一致するCEF SDKも用意します。
+SDKの準備と各OSの要件は[Chromiumのビルドと同梱](docs/chromium-runtime.md)を参照してください。
+
+各対象の基準となるビルド手順はCIにあります。
+固定したSDKを準備して`CEF_PATH`を設定し、実行ファイルとクライアントライブラリをビルドした後、必要なランタイムをまとめます。
 
 ```sh
-sudo apt-get install build-essential pkg-config libgtk-3-dev libwebkit2gtk-4.1-dev \
-  libasound2-dev libudev-dev libxkbcommon-dev libwayland-dev \
-  libx11-dev libxi-dev libxcursor-dev libxrandr-dev libvulkan1 fonts-noto-cjk
+python scripts/prepare-cef-sdk.py --target TARGET --directory CEF_SDK_DIRECTORY
+# CEF_PATHに、作成されたcef_<platform>ディレクトリーを設定する。
+cargo +1.97.1 build --workspace --release --bins --locked --target TARGET
+cargo +1.97.1 build -p voice-over-book-reader --lib --release --locked --target TARGET
+python scripts/ci-package.py --target TARGET --cef-path CEF_PATH --output-dir target/packages
 ```
 
-```sh
-cargo build --workspace --bins --locked
-cargo run -p voice-over-book-reader --locked -- --demo
-cargo test --workspace --locked
-```
+`TARGET`は対象のターゲットトリプルに、SDKの仮のパスは実際のパスに置き換えてください。
+Windowsの配布ビルドは`RUSTFLAGS=-C target-feature=+crt-static`を設定します。
+`reader-voiceroid-bridge`は`i686-pc-windows-msvc`向けにもビルドします。
+Windowsではパッケージに入った実行ファイルから起動します。
+CEF公式の起動プログラムがサンドボックスの情報を保って同名のアプリDLLを読み込みます。
+Cargoが作る通常の実行ファイルは、この起動プログラムとは異なります。
 
 書籍のパスを引用符で囲んだ引数として渡すと、その本を開けます。
 開発時は`--data-dir PATH`で別のアプリデータ保存先を選べます。
-WindowsのVOICEROID2には、対応するx86ホストも必要です。
 
-```sh
-rustup target add i686-pc-windows-msvc
-cargo build -p reader-voiceroid-bridge --release --locked --target i686-pc-windows-msvc
-```
-
-生成した実行ファイルをリーダーと同じ場所に置きます。
 [CI](.github/workflows/ci.yml)で各OSのビルドとテストを行い、[リリース処理](.github/workflows/release.yml)ではバージョンタグを確認してから全対象を作成します。
 すべて成功すると、Windowsインストーラー、各OSのZIP、チェックサムを公開します。
 
@@ -110,10 +119,10 @@ PDFiumは必要時に別途取得します。
 MOBI／AZW／AZW3は導入済みのCalibre `ebook-convert`で変換します。
 MP3／M4A／M4B／WAVの録音済み音声も再生できます。
 
-現在のネイティブ本文描画が扱うEPUBのHTMLとCSSには制約があり、完全準拠とは表明していません。
-複雑な組版やスクリプトを含む本には未対応の領域があります。
-専用Chromium描画の試作は別に置いており、配布するネイティブ版では有効にしていません。
-[EPUBの対応状況](docs/epub-support.md)、[表示指定](docs/layout.md)、[辞書の詳細](docs/dictionaries.md)に記載しています。
+本文は原文の文書とローカルリソースをChromiumで描画します。
+書籍内のスクリプトと外部ネットワークリソースは無効です。
+EPUB完全準拠とは表明しておらず、公式の閲覧システム試験とアクセシビリティの検証は別途必要です。
+[EPUBの対応状況](docs/epub-support.md)、[Chromiumの配布構成](docs/chromium-runtime.md)、[辞書の詳細](docs/dictionaries.md)を参照してください。
 
 Calibreの本棚、原本、ユーザー辞書は読み取り専用です。
 DRMの解除は行いません。
@@ -122,5 +131,6 @@ DRMの解除は行いません。
 
 プロジェクト自身のコードは[MIT](LICENSE-MIT)です。
 外部のコード、フォント、辞書データ、モデル、声、ランタイムは、それぞれのライセンスに従います。
+配布物にはCEFのBSDライセンス、Chromiumの原典クレジット、変更したweldingのMPL-2.0とソース参照先を含めます。
 [第三者ライセンス表示](COPYING-THIRD-PARTY.txt)と[TTSのライセンス確認](docs/license-audit.md)を参照してください。
 プロジェクトのMITは外部資産を再ライセンスするものではありません。

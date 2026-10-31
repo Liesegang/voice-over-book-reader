@@ -1,13 +1,13 @@
-# Chromium book surface — alpha integration
+# Chromium book surface
 
-Only the book document uses Chromium. Library, settings, menus, dictionaries, speech controls and window chrome remain native Rust. This crate is standalone, with `[workspace]` in its manifest. Remove that section when adding it to the application workspace. Stable 0.2.1 has no dependency on this crate.
+Only the book document uses Chromium. Library, settings, menus, speech controls and window chrome remain native Rust. Dictionary definitions may use a platform WebView in the separate helper. The 0.3 application integrates this crate as its required book renderer. Packages include Chromium. Users do not need a browser download.
 
 ## Versions and ownership
 
-- Rust 1.97.1 MSVC minimum; the probe used `1.97.1-x86_64-pc-windows-msvc`.
+- Rust 1.97.1; Windows builds use MSVC.
 - CEF Rust bindings `154.5.0+154.0.34`, Chromium `154.0.8037.98`.
 - wgpu `30.0.1`, matching eframe/egui-wgpu 0.37. Windows DX12 was measured.
-- Vendored welding 0.15.0 from commit `7f04a38bb77696a8ca584565529f7c81fd8fddd4` of <https://github.com/merely-made/wgpu-weld>. `vendor/welding/LICENSE` is MPL-2.0. The local change registers `vobr` in every subprocess via `WeldApp::on_register_custom_schemes`. Flags are STANDARD, SECURE, CORS_ENABLED, and FETCH_ENABLED. CSP bypass, local-file privilege and sandbox-disable switches are not enabled. Manifest workspace references were made explicit and grafting pinned to reviewed 0.6.0. A second Windows-only change uses CEF's global RequestContext when profile=None. This enables globally registered native factories. profile=Some retains upstream's independent RequestContext. Register factories in that context too.
+- Vendored welding 0.15.0 from commit `7f04a38bb77696a8ca584565529f7c81fd8fddd4` of <https://github.com/merely-made/wgpu-weld>. `vendor/welding/LICENSE` is MPL-2.0. The changes include registering `vobr` in every subprocess via `WeldApp::on_register_custom_schemes`. Flags are STANDARD, SECURE, CORS_ENABLED, and FETCH_ENABLED. CSP bypass, local-file privilege and sandbox-disable switches are not enabled. Manifest workspace references were made explicit and grafting pinned to reviewed 0.6.0. All platform producers use CEF's global RequestContext when profile=None. This enables globally registered native factories. profile=Some retains upstream's independent RequestContext. Register factories in that context too.
 - Wrapper/protocol/navigator sources are this project's MIT code.
 - This crate contains the renderer wrapper. App bootstrap, resource handling, and workspace integration belong to the host application.
 
@@ -26,7 +26,19 @@ let runtime = bootstrap.initialize(app_cache_root)?;
 // Register resources here, then create native app and GPU surface.
 ```
 
-For packaging, keep stable binaries untouched. Build a separate alpha client `cdylib` depending on the native app `rlib` plus this crate. Copy CEF bootstrap to `voice-over-book-reader-alpha.exe`. Copy the client DLL to the matching name `voice-over-book-reader-alpha.dll`. Keep matching CEF libraries, locale, and pak resources beside them. The bootstrap/client DLL basename must match. For a separate bundler, enable the CEF crate's `build-util` feature. It provides `cef::build_util::win::bundle`. The runtime API does not require that build-only feature. Set `CEF_PATH` to the pinned SDK directory while building. Validation used `C:\path\to\llvm\bin` for `LIBCLANG_PATH`.
+On Windows build the native app as an `rlib` and `cdylib` exporting `RunWinMain`.
+The packager copies CEF's matching bootstrap to `voice-over-book-reader.exe`.
+It copies the client DLL to `voice-over-book-reader.dll`.
+Matching CEF libraries, locales and pak resources are mandatory beside them.
+macOS packages contain the framework and five standard Helper.app bundles.
+Linux packages include libcef, chrome-sandbox and the dedicated helper.
+See [bundling and licenses](../../docs/chromium-runtime.md).
+The bootstrap/client DLL basename must match.
+For a separate bundler, enable the CEF crate's `build-util` feature.
+It provides `cef::build_util::win::bundle`.
+The runtime API does not require that build-only feature.
+Set `CEF_PATH` to the pinned SDK directory while building.
+Validation used `C:\path\to\llvm\bin` for `LIBCLANG_PATH`.
 
 ## Native book resource factory
 
@@ -84,7 +96,7 @@ GpuBookSurface::new(&runtime, state.device.clone(), state.queue.clone(), options
 egui_wgpu::Renderer::{register_native_texture, update_egui_texture_from_wgpu_texture}
 ``` Keep the surface/frame alive while used. Do not convert this texture to a CPU ColorImage. CEF uses GPU copies/shared handles; diagnostic CPU readback is confined to the performance probe.
 
-CEF emits Bgra8Unorm gamma-encoded pixels. The probe used a non-sRGB native target so they are not gamma-encoded twice. Honor the app renderer's texture color flags when registering the external view. A naive blit to an sRGB target makes text pale. Windows DX12 is the supported measured path. Other OS/backends have not been tested by this integration.
+CEF emits Bgra8Unorm gamma-encoded pixels. The probe used a non-sRGB native target so they are not gamma-encoded twice. Honor the app renderer's texture color flags when registering the external view. A naive blit to an sRGB target makes text pale. The historical probe measured Windows DX12. Native application tests and platform builds are separate evidence; do not infer GUI performance on untested GPUs or operating systems.
 
 ## Commands, locations and pagination
 
@@ -96,11 +108,11 @@ Configure carries a host revision and viewport/typography options. After fonts a
 
 `Invalidated { revision, reason }` reports viewport changes and author DOM/CSS mutations. It also reports late font/image loading. It pauses Page commands until the host sends Configure with a new revision and receives Pagination. The host can then Locate its saved source position. Native transforms and highlights do not invalidate pagination. Resize does not silently jump to page zero.
 
-The initial reflow adapter uses CSS columns on the original body. It retains author stylesheets, SVG, embedded fonts, ruby, relative resources, and scripts. Pagination controls the body's viewport box. Unusual scripted or floating layouts need book testing. Pre-paginated mode uses the author viewport and uniform scaling. It applies no user typography overrides. Source IDs are captured at navigator installation. If scripts already changed the DOM, validate native sources instead of guessing numbering.
+The reflow adapter uses CSS columns on the original body. It retains author stylesheets, SVG, embedded fonts, ruby and relative resources. Script elements remain in the original node table, but the application CSP disables author script execution. Pagination controls the body's viewport box. Unusual floating layouts need book testing. Pre-paginated mode uses the author viewport and uniform scaling. It applies no user typography overrides. Source IDs are captured at navigator installation. Validate native sources instead of guessing numbering when the original DOM and source facade differ.
 
 The host queues wheel/key commands in FIFO order. Paint each requested page before dispatching the next command. A JS Position event alone does not prove GPU presentation.
 
-Poll returns nonblocking events; the current alpha drains the async channel at 16 ms while serviced. Event-driven CEF repaint wakeups can reduce idle work later.
+Poll returns nonblocking events; the renderer drains the async channel at 16 ms while serviced. Event-driven CEF repaint wakeups can reduce idle work later.
 
 ## Validation
 

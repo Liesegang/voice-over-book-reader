@@ -1,7 +1,7 @@
 use crate::{Chapter, import::normalize_path};
 use anyhow::{Context, Result, anyhow, bail};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     fmt,
     io::{Read, Seek},
     sync::{
@@ -47,6 +47,7 @@ pub struct EpubSource {
     identity: String,
     resources: Mutex<ResourceCache>,
     specs: OnceLock<Vec<ChapterSpec>>,
+    media_types: OnceLock<BTreeMap<String, String>>,
     chapters: Mutex<VecDeque<(usize, Arc<Chapter>)>>,
     reads: AtomicU64,
     expanded: AtomicU64,
@@ -95,6 +96,7 @@ impl EpubSource {
             identity: hash.finalize().to_hex().to_string(),
             resources: Mutex::new(ResourceCache::default()),
             specs: OnceLock::new(),
+            media_types: OnceLock::new(),
             chapters: Mutex::new(VecDeque::new()),
             reads: AtomicU64::new(0),
             expanded: AtomicU64::new(0),
@@ -110,6 +112,18 @@ impl EpubSource {
         self.specs
             .set(specs)
             .map_err(|_| anyhow!("EPUB chapter metadata was already initialized"))
+    }
+
+    /// Declared manifest media types, keyed by decoded archive-relative paths.
+    /// These remain available without opening or expanding the listed resources.
+    pub fn media_types(&self) -> Option<&BTreeMap<String, String>> {
+        self.media_types.get()
+    }
+
+    pub(crate) fn set_media_types(&self, media_types: BTreeMap<String, String>) -> Result<()> {
+        self.media_types
+            .set(media_types)
+            .map_err(|_| anyhow!("EPUB resource media types were already initialized"))
     }
 
     pub(crate) fn document_spec(&self, id: u32) -> Option<&ChapterSpec> {

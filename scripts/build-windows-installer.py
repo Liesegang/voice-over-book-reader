@@ -15,6 +15,7 @@ import struct
 import subprocess
 import tempfile
 import zipfile
+import cef_bundle
 
 TARGET = "x86_64-pc-windows-msvc"
 PROCESSES = {
@@ -116,12 +117,12 @@ def validate_tree(root: Path) -> set[str]:
             seen.add(canonical)
             if path.is_file():
                 files_present.add(relative)
-            elif path.parent == root and name != "licenses":
+            elif path.parent == root and name not in ({"licenses", "locales"} if (root / "CEF-MANIFEST.json").is_file() else {"licenses"}):
                 raise ValueError(f"Unexpected package directory; use an untouched release ZIP: {relative}")
     return files_present
 
 
-def validate_pe(path: Path, expected: tuple[int, int] | None = None) -> tuple[int, int]:
+def validate_pe(path: Path, expected: tuple[int, int] | None = None, dll: bool = False) -> tuple[int, int]:
     with path.open("rb") as file:
         dos = file.read(64)
         if len(dos) != 64 or dos[:2] != b"MZ":
@@ -135,7 +136,7 @@ def validate_pe(path: Path, expected: tuple[int, int] | None = None) -> tuple[in
         optional_size, characteristics, magic = struct.unpack_from("<HHH", header, 20)
         if (header[:4] != b"PE\0\0" or optional_size < 2
                 or offset + 24 + optional_size > path.stat().st_size
-                or not characteristics & 0x2 or characteristics & 0x2000
+                or not characteristics & 0x2 or bool(characteristics & 0x2000) != dll
                 or (machine, magic) not in {(0x8664, 0x20B), (0x14C, 0x10B)}):
             raise ValueError(f"Unsupported PE executable: {path.name}")
         if expected is not None and (machine, magic) != expected:
@@ -146,8 +147,6 @@ def validate_pe(path: Path, expected: tuple[int, int] | None = None) -> tuple[in
 def validate_package(root: Path) -> str:
     files = validate_tree(root)
     allowed = set(PROCESSES) | set(REQUIRED_TEXT) | OPTIONAL_PACKAGE_FILES | {"BUILD.json"}
-    if unknown := files - allowed:
-        raise ValueError("Unexpected package files; use an untouched release ZIP: " + ", ".join(sorted(unknown)))
     if (root / "BUILD.json").stat().st_size > 64 * 1024:
         raise ValueError("BUILD.json is unexpectedly large")
     metadata = json.loads((root / "BUILD.json").read_text(encoding="utf-8"))
@@ -157,6 +156,28 @@ def validate_package(root: Path) -> str:
     if (not isinstance(version, str) or not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version)
             or any(int(part) > 65535 for part in version.split("."))):
         raise ValueError("BUILD.json version must be three numeric components from 0 to 65535")
+    if cef_bundle.required(version):
+        cef_bundle.validate_engine_info(json.loads((root / "CEF-MANIFEST.json").read_text(encoding="utf8")), TARGET)
+        runtime = cef_bundle.validate_manifest(root)
+        fixed = set(cef_bundle.COMMON + cef_bundle.WINDOWS) | {"voice-over-book-reader.exe", "voice-over-book-reader.dll", "voice-over-book-reader.exe.manifest", "libEGL.dll", "libGLESv2.dll", "CEF-MANIFEST.json", "CHROMIUM.md"}
+        fixed |= {"licenses/cef/" + n for n in ("CEF-LICENSE.txt", "CEF-SDK-LICENSE.txt", "CHROMIUM-CREDITS.html", "NOTICE.txt", "welding-MPL-2.0.txt", "SOURCES.json")}
+        fixed |= {name for name in runtime if re.fullmatch(r"locales/[A-Za-z0-9_-]+\.pak", name)}
+        if unknown_runtime := runtime - allowed - fixed:
+            raise ValueError("Unexpected CEF manifest files; use an untouched release ZIP: " + ", ".join(sorted(unknown_runtime)))
+        allowed |= fixed
+        mandatory = set(cef_bundle.COMMON + cef_bundle.WINDOWS) | {"voice-over-book-reader.dll", "locales/en-US.pak", "locales/ja.pak"}
+        if mandatory - runtime:
+            raise ValueError("Incomplete CEF runtime; use an untouched release ZIP")
+        if "RunWinMain" not in cef_bundle.pe_exported_names(root / "voice-over-book-reader.dll"):
+            raise ValueError("CEF client entry RunWinMain is missing")
+        for name in fixed:
+            if name.endswith(".dll") and (root / name).is_file():
+                validate_pe(root / name, (0x8664, 0x20B), dll=True)
+        if metadata.get("book_engine", {}).get("type") != "chromium-cef":
+            raise ValueError("BUILD.json must identify the bundled Chromium book engine")
+        cef_bundle.require_static_crt(root / name for name in ("voice-over-book-reader.dll", "reader-dictionary-popup.exe", "reader-voiceroid-bridge.exe"))
+    if unknown := files - allowed:
+        raise ValueError("Unexpected package files; use an untouched release ZIP: " + ", ".join(sorted(unknown)))
     processes = metadata.get("native_processes")
     if (not isinstance(processes, list) or len(processes) != 3
             or not all(isinstance(item, str) for item in processes)

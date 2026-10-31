@@ -4,7 +4,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 // SPDX-License-Identifier: MPL-2.0
 
-use std::{collections::VecDeque, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 use dpi::PhysicalSize;
 
@@ -97,28 +100,81 @@ pub enum CefSurfaceEvent {
 }
 
 /// Shared callback queue used by every platform producer.
-#[derive(Debug, Default)]
-pub(crate) struct WebEventQueue(Mutex<VecDeque<CefSurfaceEvent>>);
+pub type RepaintWake = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+pub(crate) struct WebEventQueue {
+    events: Mutex<VecDeque<CefSurfaceEvent>>,
+    wake: Mutex<Option<RepaintWake>>,
+}
+
+impl std::fmt::Debug for WebEventQueue {
+    fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        output.debug_struct("WebEventQueue").finish_non_exhaustive()
+    }
+}
 
 impl WebEventQueue {
     pub(crate) fn push(&self, event: CefSurfaceEvent) {
-        self.0
+        self.events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .push_back(event);
+        self.wake();
     }
 
     pub(crate) fn poll(&self) -> Option<CefSurfaceEvent> {
-        self.0
+        self.events
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .pop_front()
+    }
+
+    pub(crate) fn set_wake(&self, wake: Option<RepaintWake>) {
+        *self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = wake;
+    }
+
+    pub(crate) fn wake(&self) {
+        let wake = self
+            .wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        // Never invoke host callbacks while retaining any producer lock.
+        if let Some(wake) = wake {
+            wake();
+        }
     }
 }
 
 #[cfg(test)]
 mod web_event_tests {
     use super::*;
+
+    #[test]
+    fn host_wake_runs_after_callback_queue_and_waker_locks_are_released() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let events = Arc::new(WebEventQueue::default());
+        let callbacks = Arc::new(AtomicUsize::new(0));
+        let weak = Arc::downgrade(&events);
+        let observed = callbacks.clone();
+        events.set_wake(Some(Arc::new(move || {
+            let events = weak.upgrade().unwrap();
+            assert!(events.events.try_lock().is_ok());
+            assert!(events.wake.try_lock().is_ok());
+            observed.fetch_add(1, Ordering::Relaxed);
+        })));
+        events.push(CefSurfaceEvent::WebMessage("callback".into()));
+        events.wake(); // An accelerated paint also wakes without a JSON event.
+        assert_eq!(callbacks.load(Ordering::Relaxed), 2);
+        assert!(events.poll().is_some());
+        events.set_wake(None);
+        events.wake();
+        assert_eq!(callbacks.load(Ordering::Relaxed), 2);
+    }
 
     #[test]
     fn mixed_callbacks_keep_observation_order() {
@@ -698,7 +754,7 @@ impl CefSurfaceConfig {
         match self.background_color {
             Some([r, g, b]) => {
                 0xFF00_0000 | (u32::from(r) << 16) | (u32::from(g) << 8) | u32::from(b)
-            },
+            }
             None => 0,
         }
     }
@@ -712,6 +768,10 @@ impl CefSurfaceConfig {
 ///
 /// For single-platform code, use the [`crate::PlatformCefProducer`] alias.
 pub trait CefSurfaceProducer {
+    /// Wake the host event loop when a callback or GPU frame becomes available.
+    /// The callback may run on CEF's UI thread and must not block or call CEF.
+    fn set_repaint_wake(&mut self, _wake: Option<RepaintWake>) {}
+
     fn surface_mode(&self) -> CefSurfaceMode;
 
     fn capabilities(&self) -> CefSurfaceCapabilities {
@@ -1437,6 +1497,9 @@ pub enum FocusDirection {
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum NavigationEvent {
+    /// The browser's on_before_close callback completed. It is now safe for
+    /// the host to release the last browser reference before CEF shutdown.
+    BrowserClosed,
     LoadStart {
         url: String,
     },

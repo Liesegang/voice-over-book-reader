@@ -36,7 +36,8 @@ jobs:
 
   # Reuse exactly the normal four-target tests, release builds, ZIP licensing,
   # x86 VOICEROID2 helper build, and verified Windows Inno compiler/installer.
-  # No models, installed proprietary voices, or engine DLLs are distributed.
+  # No models, installed proprietary voices, or proprietary speech-engine DLLs
+  # are distributed. The book's pinned CEF runtime is bundled.
   native-packages:
     needs: validate-tag
     permissions:
@@ -65,7 +66,9 @@ jobs:
       - name: Verify all ten assets before creating a release
         run: |
           python - <<'PY'
-          import hashlib, json, os, pathlib, struct, zipfile
+          import hashlib, json, os, pathlib, struct, zipfile, sys
+          sys.path.insert(0, "scripts")
+          import cef_bundle
           version = os.environ['RELEASE_TAG'].removeprefix('v')
           root = pathlib.Path('release-assets')
           targets = ('x86_64-pc-windows-msvc', 'aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-gnu')
@@ -86,9 +89,12 @@ jobs:
                   names = archive.namelist()
                   assert len(names) == len(set(names)), 'Duplicate ZIP entries'
                   assert all(n.startswith(prefix) and '..' not in pathlib.PurePosixPath(n).parts for n in names)
-                  assert not any(n.lower().endswith(('.gguf', '.onnx', '.safetensors', '.dll', '.wav')) for n in names), 'Unexpected model or runtime asset'
+                  runtime_files = cef_bundle.validate_archive(archive, prefix, target)
+                  assert not any(n.lower().endswith(('.gguf', '.onnx', '.safetensors', '.wav')) for n in names), 'Unexpected speech model or recording'
+                  assert not any(n.lower().endswith('.dll') and n.removeprefix(prefix) not in runtime_files for n in names), 'Unexpected inference DLL'
                   metadata = json.loads(archive.read(prefix + 'BUILD.json'))
                   assert (metadata['application'], metadata['version'], metadata['target']) == ('voice-over-book-reader', version, target)
+                  assert metadata['book_engine']['type'] == 'chromium-cef'
                   for required in ('README.md', 'README.ja.md', 'SPEECH.md', 'EPUB-SUPPORT.md', 'THIRD-PARTY-NOTICES.txt',
                                    'LICENSE-AUDIT.md', 'LICENSE-AUDIT-AIVIS-VOICEVOX.md', 'LICENSE-AUDIT-KOKORO.md',
                                    'licenses/LICENSE-MIT', 'licenses/Apache-2.0.txt', 'licenses/Sonic-LICENSE.txt',
@@ -147,10 +153,10 @@ jobs:
           import os, pathlib
           base = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/blob/{os.environ['RELEASE_TAG']}"
           pathlib.Path('release-notes.md').write_text(
-              f"Native desktop EPUB reader with text-to-speech. [English guide]({base}/README.md) · [日本語ガイド]({base}/README.ja.md)\n\n"
+              f"Native Rust EPUB reader with a bundled Chromium book renderer and text-to-speech. [English guide]({base}/README.md) · [日本語ガイド]({base}/README.ja.md)\n\n"
               "Portable ZIPs: Windows x64, macOS Apple Silicon / Intel, Linux x64. Windows also has a per-user setup EXE. Each download has a SHA-256 file.\n\n"
               "Windows にはユーザー単位のインストーラーもあります。EPUB の既定アプリは Windows の設定で選べます。\n\n"
-              "Speech models, external inference runtimes, and proprietary voice assets are acquired separately and retain their own terms. See the guides and bundled notices.\n\n"
+              "Chromium libraries and resources are included in every package; no browser download is required. Speech models, external speech inference runtimes, and proprietary voice assets are acquired separately and retain their own terms. See the guides and bundled notices.\n\n"
               "macOS binaries are ad-hoc signed, not notarized. CI builds and fixture tests do not certify GUI, audio hardware, or every TTS backend on untested platforms.\n",
               encoding='utf-8')
           PY

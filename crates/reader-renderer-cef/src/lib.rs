@@ -5,11 +5,11 @@ pub use protocol::*;
 pub const NAVIGATOR_SCRIPT: &str = include_str!("navigator.js");
 pub const DRAIN_SCRIPT: &str = "globalThis.__vobrBook?.drain() ?? []";
 
-#[cfg(windows)]
-mod windows;
-#[cfg(windows)]
-pub use windows::*;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+mod desktop;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
+pub use desktop::*;
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub use {cef, welding, wgpu};
 
 #[derive(Debug, thiserror::Error)]

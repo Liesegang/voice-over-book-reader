@@ -130,6 +130,7 @@ cef::wrap_render_handler! {
                     } else {
                         *self.handler.frame_slot.lock().unwrap() = Some(frame);
                     }
+                    self.handler.events.wake();
                 }
                 Err(err) => {
                     log::error!("failed to copy CEF accelerated frame: {err}");
@@ -297,6 +298,7 @@ cef::wrap_life_span_handler! {
             *self.state.browser.lock().unwrap() = None;
             self.state.browser_id.store(0, Ordering::Release);
             self.state.closed.store(true, Ordering::Release);
+            self.events.push(CefSurfaceEvent::Navigation(crate::surface::NavigationEvent::BrowserClosed));
         }
     }
 }

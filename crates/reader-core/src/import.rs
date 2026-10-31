@@ -553,16 +553,19 @@ pub(crate) fn open_epub<R: Read + Seek + Send + 'static>(reader: R, id: String) 
         .map(Node::text_content)
         .unwrap_or_else(|| "und".into());
     let mut manifest = HashMap::new();
+    let mut media_types = BTreeMap::new();
     for item in package.descendants("item") {
+        let href = resolve_path(&opf_path, item.attr("href"))?;
+        let media_type = item.attr("media-type").to_owned();
+        if !media_type.is_empty() {
+            media_types.insert(href.clone(), media_type.clone());
+        }
         manifest.insert(
             item.attr("id").to_owned(),
-            (
-                resolve_path(&opf_path, item.attr("href"))?,
-                item.attr("media-type").to_owned(),
-                item.attr("properties").to_owned(),
-            ),
+            (href, media_type, item.attr("properties").to_owned()),
         );
     }
+    source.set_media_types(media_types)?;
     let cover_id = package
         .descendants("meta")
         .find(|node| node.attr("name") == "cover")
@@ -2295,6 +2298,48 @@ pub(crate) fn demo_book() -> Book {
 
 #[cfg(test)]
 mod charset_regression {
+    #[test]
+    fn manifest_media_types_preserve_extensionless_and_renamed_resources_without_reads() {
+        use std::io::{Cursor, Write};
+        let mut archive = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        for (path, content) in [
+            (
+                "META-INF/container.xml",
+                "<container><rootfiles><rootfile full-path='OPS/package.opf'/></rootfiles></container>",
+            ),
+            (
+                "OPS/package.opf",
+                "<package><metadata><title>Manifest types</title></metadata><manifest><item id='chapter' href='Text/chapter' media-type='application/xhtml+xml'/><item id='svg' href='../Artwork/formula%2Epayload' media-type='image/svg+xml'/><item id='font' href='Fonts/book.payload' media-type='font/woff2'/></manifest><spine><itemref idref='chapter'/></spine></package>",
+            ),
+            ("OPS/Text/chapter", "<html><body><p>本文</p></body></html>"),
+            (
+                "Artwork/formula.payload",
+                "<svg xmlns='http://www.w3.org/2000/svg'/>",
+            ),
+            ("OPS/Fonts/book.payload", "unused font payload"),
+        ] {
+            archive
+                .start_file(path, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(content.as_bytes()).unwrap();
+        }
+        let book = super::open_epub(archive.finish().unwrap(), String::new()).unwrap();
+        assert_eq!(book.chapters[0].href, "OPS/Text/chapter");
+        let source = book.epub.as_ref().unwrap();
+        let before = source.stats();
+        let media_types = source.media_types().unwrap();
+        assert_eq!(media_types.len(), 3);
+        assert_eq!(media_types["OPS/Text/chapter"], "application/xhtml+xml");
+        assert_eq!(media_types["Artwork/formula.payload"], "image/svg+xml");
+        assert_eq!(media_types["OPS/Fonts/book.payload"], "font/woff2");
+        assert_eq!(
+            before.resource_reads, 3,
+            "only container, package and first chapter are expanded"
+        );
+        assert_eq!(source.stats().resource_reads, before.resource_reads);
+        assert_eq!(source.stats().expanded_bytes, before.expanded_bytes);
+    }
+
     #[test]
     fn lazy_descendants_keep_document_order_for_titles_and_embedded_css() {
         let chapter = super::parse_html(

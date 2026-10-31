@@ -56,6 +56,31 @@ pub struct LayoutOptions {
     pub ruby_scale: Option<f64>,
     pub show_ruby: bool,
     pub fixed_viewport: Option<[f64; 2]>,
+    /// -1 aligns fixed artwork left, 0 centers, +1 aligns right.
+    /// A spread uses inside edges; a single cover remains centered.
+    #[serde(default)]
+    pub fixed_horizontal_align: i32,
+    /// Native reader palette. Fixed author artwork is not recolored.
+    #[serde(default)]
+    pub background: Option<[u8; 3]>,
+    #[serde(default)]
+    pub foreground: Option<[u8; 3]>,
+    #[serde(default)]
+    pub highlight_color: Option<[u8; 3]>,
+    /// Optional two-column text layout within one native viewport.
+    /// Image spreads are composed from separate fixed-page surfaces by the host.
+    #[serde(default = "single_column")]
+    pub columns: u32,
+    #[serde(default)]
+    pub page_gap: f64,
+    /// Reader defaults have a lower cascade layer than author stylesheets.
+    #[serde(default)]
+    pub default_css: Option<String>,
+    /// Diagnostic GPU marker. Off for ordinary reading and never persisted.
+    #[serde(default)]
+    pub measurement_marker: bool,
+    #[serde(default)]
+    pub adapt_monochrome_images: bool,
 }
 impl Default for LayoutOptions {
     fn default() -> Self {
@@ -70,8 +95,20 @@ impl Default for LayoutOptions {
             ruby_scale: None,
             show_ruby: true,
             fixed_viewport: None,
+            fixed_horizontal_align: 0,
+            background: None,
+            foreground: None,
+            highlight_color: None,
+            columns: 1,
+            page_gap: 0.,
+            default_css: None,
+            measurement_marker: false,
+            adapt_monochrome_images: false,
         }
     }
+}
+fn single_column() -> u32 {
+    1
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -80,7 +117,7 @@ pub enum Command {
         revision: Revision,
         chapter: u32,
         nodes: Vec<NodeBinding>,
-        options: LayoutOptions,
+        options: Box<LayoutOptions>,
     },
     Page {
         revision: Revision,
@@ -89,6 +126,10 @@ pub enum Command {
     Locate {
         revision: Revision,
         location: SourceLocator,
+    },
+    Fragment {
+        revision: Revision,
+        fragment: String,
     },
     HitTest {
         revision: Revision,
@@ -103,10 +144,17 @@ pub enum Command {
         revision: Revision,
         ranges: Vec<SourceRange>,
     },
+    Annotations {
+        revision: Revision,
+        ranges: Vec<SourceRange>,
+    },
     ClearHighlight {
         revision: Revision,
     },
     Selection {
+        revision: Revision,
+    },
+    ClearSelection {
         revision: Revision,
     },
     Refresh {
@@ -146,6 +194,8 @@ pub enum NavigatorEvent {
         page: u32,
         pages: u32,
         start: Option<SourceLocator>,
+        #[serde(default)]
+        marker: Option<[u8; 3]>,
     },
     Hit {
         revision: Revision,
@@ -161,8 +211,78 @@ pub enum NavigatorEvent {
         end: Option<SourceLocator>,
         text: String,
     },
+    Pointer {
+        revision: Revision,
+        kind: String,
+        x: f64,
+        y: f64,
+        location: Option<SourceLocator>,
+        text: String,
+        selection_start: Option<SourceLocator>,
+        selection_end: Option<SourceLocator>,
+    },
+    Link {
+        revision: Revision,
+        href: String,
+        x: f64,
+        y: f64,
+        location: Option<SourceLocator>,
+        user_gesture: bool,
+    },
     Error {
         revision: Revision,
         message: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn original_layout_json_keeps_one_column_and_author_colors() {
+        let value = serde_json::json!({
+            "flow":"reflowable", "writing":"author", "margins":[48,60,48,60],
+            "font_family":null, "font_size":null, "line_height":null,
+            "letter_spacing":null, "ruby_scale":null, "show_ruby":true,
+            "fixed_viewport":null
+        });
+        let options: LayoutOptions = serde_json::from_value(value).unwrap();
+        assert_eq!(options.columns, 1);
+        assert_eq!(options.fixed_horizontal_align, 0);
+        assert_eq!(options.page_gap, 0.);
+        assert!(options.background.is_none() && options.foreground.is_none());
+        assert!(options.default_css.is_none());
+    }
+
+    #[test]
+    fn context_and_internal_link_events_preserve_source_offsets() {
+        let events: Vec<NavigatorEvent> = serde_json::from_value(serde_json::json!([
+            {"type":"pointer","revision":12,"kind":"context_menu","x":84.5,"y":102.0,
+             "location":{"chapter":3,"node":10,"offset":3},"text":"😀",
+             "selection_start":{"chapter":3,"node":10,"offset":3},
+             "selection_end":{"chapter":3,"node":10,"offset":7}},
+            {"type":"link","revision":12,"href":"vobr://book/chapter.xhtml#note",
+             "x":84.5,"y":102.0,"location":null,"user_gesture":true}
+        ]))
+        .unwrap();
+        assert!(matches!(
+            &events[0],
+            NavigatorEvent::Pointer {
+                location: Some(SourceLocator { offset: 3, .. }),
+                selection_end: Some(SourceLocator { offset: 7, .. }),
+                ..
+            }
+        ));
+        assert!(
+            matches!(&events[1], NavigatorEvent::Link {href,user_gesture:true,..} if href.ends_with("#note"))
+        );
+        let fragment = Command::Fragment {
+            revision: Revision(12),
+            fragment: "注記\"\\".into(),
+        };
+        let json = serde_json::to_value(fragment).unwrap();
+        assert_eq!(json["type"], "fragment");
+        assert_eq!(json["fragment"], "注記\"\\");
+    }
 }

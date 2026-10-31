@@ -1,11 +1,12 @@
 [workspace]
-members = ["crates/reader-core", "crates/reader-library", "crates/reader-speech", "crates/reader-app", "crates/reader-dictionary-popup", "crates/reader-voiceroid-bridge"]
+members = ["crates/reader-core", "crates/reader-library", "crates/reader-speech", "crates/reader-app", "crates/reader-dictionary-popup", "crates/reader-voiceroid-bridge", "crates/reader-renderer-cef"]
+exclude = ["crates/reader-renderer-cef/vendor/welding"]
 resolver = "3"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.97"
-version = "0.2.4"
+rust-version = "1.97.1"
+version = "0.3.0"
 license = "MIT"
 
 [workspace.dependencies]

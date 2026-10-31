@@ -239,6 +239,14 @@ mod cef_backed {
     }
 
     impl CefRuntime {
+        /// Load the matching framework and enter a dedicated sandboxed child.
+        /// macOS must initialize libcef_sandbox before cef_execute_process.
+        #[cfg(not(target_os = "windows"))]
+        pub fn execute_helper_from(cef_path: &std::path::Path) -> Result<i32, WeldError> {
+            maybe_load_library(cef_path)?;
+            Self::try_run_subprocess(&Args::new(), CefSandboxMode::Sandboxed)
+        }
+
         /// Load libcef and call `cef_execute_process`. Must be the very first
         /// CEF call in `main()`.
         ///
@@ -294,7 +302,7 @@ mod cef_backed {
                 Err(error) => {
                     eprintln!("welding: {error}");
                     1
-                },
+                }
             }
         }
 
@@ -408,7 +416,7 @@ mod cef_backed {
         match sandbox {
             CefSandboxMode::UnsandboxedTrustedContent | CefSandboxMode::Sandboxed => {
                 std::ptr::null_mut()
-            },
+            }
         }
     }
 

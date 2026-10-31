@@ -1098,10 +1098,7 @@ fn extract_mecab(archive: &Path, root: &Path, library: &Path) -> Result<()> {
 #[cfg(windows)]
 fn set_native_mecab_environment(path: &Path) -> Result<()> {
     use std::os::windows::ffi::OsStrExt;
-    #[link(name = "ucrt")]
-    unsafe extern "C" {
-        fn _wputenv_s(name: *const u16, value: *const u16) -> i32;
-    }
+    type SetEnvironment = unsafe extern "C" fn(*const u16, *const u16) -> i32;
     let name: Vec<u16> = "AUDIOCPP_MECAB_LIBRARY"
         .encode_utf16()
         .chain(Some(0))
@@ -1112,8 +1109,16 @@ fn set_native_mecab_environment(path: &Path) -> Result<()> {
     // loading the phonemizer. Unix uses its installed soname; no setenv there.
     unsafe {
         std::env::set_var("AUDIOCPP_MECAB_LIBRARY", path);
+        // Update the native DLL's shared UCRT, even when the Rust application
+        // uses a static CRT. An import-library link would mix both CRTs in the
+        // application and fail when CEF's /MT wrapper is linked into the DLL.
+        let runtime = libloading::os::windows::Library::load_with_flags(
+            "ucrtbase.dll",
+            libloading::os::windows::LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )?;
+        let set_environment = runtime.get::<SetEnvironment>(b"_wputenv_s\0")?;
         ensure!(
-            _wputenv_s(name.as_ptr(), value.as_ptr()) == 0,
+            set_environment(name.as_ptr(), value.as_ptr()) == 0,
             "MeCabの環境設定を初期化できません"
         );
     }
@@ -1415,6 +1420,72 @@ fn install_download(partial: &Path, target: &Path) -> Result<()> {
 #[cfg(test)]
 mod voice_tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn native_mecab_environment_reaches_win32_and_shared_ucrt() {
+        use std::os::windows::ffi::OsStringExt;
+        if std::env::var_os("VOBR_TEST_NATIVE_CRT").as_deref() != Some(std::ffi::OsStr::new("1")) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "native::voice_tests::native_mecab_environment_reaches_win32_and_shared_ucrt",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("VOBR_TEST_NATIVE_CRT", "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "isolated UCRT test failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let temporary = tempfile::tempdir().unwrap();
+        let path = temporary
+            .path()
+            .join("音声ライブラリ𠮷野")
+            .join("libmecab.dll");
+        set_native_mecab_environment(&path).unwrap();
+        assert_eq!(
+            std::env::var_os("AUDIOCPP_MECAB_LIBRARY").unwrap(),
+            path.as_os_str()
+        );
+        let name: Vec<u16> = "AUDIOCPP_MECAB_LIBRARY"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        // The isolated child has no concurrent environment mutations. Keep the
+        // shared UCRT loaded while inspecting its NUL-terminated wide string.
+        unsafe {
+            let runtime = libloading::os::windows::Library::load_with_flags(
+                "ucrtbase.dll",
+                libloading::os::windows::LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+            .unwrap();
+            let get = runtime
+                .get::<unsafe extern "C" fn(*const u16) -> *mut u16>(b"_wgetenv\0")
+                .unwrap();
+            let actual = get(name.as_ptr());
+            assert!(
+                !actual.is_null(),
+                "shared UCRT did not receive MeCab environment"
+            );
+            let mut length = 0;
+            while *actual.add(length) != 0 {
+                length += 1;
+            }
+            assert_eq!(
+                PathBuf::from(std::ffi::OsString::from_wide(std::slice::from_raw_parts(
+                    actual, length
+                ))),
+                path
+            );
+        }
+    }
 
     #[test]
     fn qwen_punctuation_cleaning_keeps_exact_source_ranges_across_units() {

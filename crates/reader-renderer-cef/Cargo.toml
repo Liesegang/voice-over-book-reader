@@ -1,23 +1,21 @@
 [package]
 name = "reader-renderer-cef"
-version = "0.3.0-alpha.1"
-edition = "2024"
-rust-version = "1.97.1"
-license = "MIT"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
 publish = false
-
-# Standalone while the alpha bootstrap is integrated. Remove this section when
-# adding the package to the main workspace; the stable reader is unaffected.
-[workspace]
-resolver = "3"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(any(windows, target_os = "macos", target_os = "linux"))'.dependencies]
 welding = { path = "vendor/welding", features = ["cef-runtime"] }
 cef = { version = "=154.5.0", features = ["accelerated_osr", "sandbox"] }
 wgpu = "=30.0.1"
 dpi = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pollster = "0.4"

@@ -21,6 +21,12 @@
 #if !FileExists(PackageDir + "\reader-voiceroid-bridge.exe")
   #error PackageDir must contain the x86 reader-voiceroid-bridge.exe.
 #endif
+#if !FileExists(PackageDir + "\voice-over-book-reader.dll") || !FileExists(PackageDir + "\libcef.dll") || !FileExists(PackageDir + "\CEF-MANIFEST.json")
+  #error PackageDir must contain the sandboxed Chromium client and complete CEF runtime.
+#endif
+#if !FileExists(PackageDir + "\resources.pak") || !FileExists(PackageDir + "\locales\ja.pak")
+  #error PackageDir must contain the Chromium resources and locales.
+#endif
 #if !FileExists(PackageDir + "\licenses\LICENSE-MIT")
   #error PackageDir must contain the package licenses directory.
 #endif
@@ -85,7 +91,8 @@ english.AppDescription=EPUB reader with Japanese vertical text and text-to-speec
 Name: "registerepub"; Description: "{cm:RegisterEpub}"; GroupDescription: "{cm:AssociationGroup}"
 
 [Files]
-; Copy the complete audited package, including all three processes and notices.
+; Copy the complete audited package, including sandbox bootstrap/client, CEF
+; libraries/resources/locales, the three native processes and original notices.
 ; No app data, models, Calibre library, or imported books live under {app}.
 Source: "{#PackageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "assets\voice-over-book-reader.ico"; DestDir: "{app}"; Flags: ignoreversion

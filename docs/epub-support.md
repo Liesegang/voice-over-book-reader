@@ -1,188 +1,127 @@
 # EPUB対応状況と残っている課題
 
-2026-10-30時点の開発中ソースを確認した結果です。
-現在の独自ネイティブ描画系は、EPUB 3.3完全準拠を達成していません。
-自作テストの成功、仕様の一部の実装、公式テストの合格を区別します。
+0.3の本文描画は同梱のChromium Embedded Framework（CEF）を使います。
+統合ソースの実行時検証を進めており、配布版の動作確認完了を示す文書ではありません。
+本棚、設定、メニュー、音声操作はネイティブRustのままです。
+Chromiumを採用したことを、EPUB 3.3完全準拠や全書籍の互換性の根拠にはしていません。
 公式EPUBテスト一式の実行結果はまだありません。
 
 ## 基準と検証の扱い
 
-利用者が示した[W3C EPUBの案内](https://www.w3.org/publishing/epub3/)から、[EPUB 3.3](https://www.w3.org/TR/epub-33/)と[EPUB Reading Systems 3.3](https://www.w3.org/TR/epub-rs-33/)を基準にしています。
-仕様には必須、推奨、任意、条件付きの要件があり、例えばスクリプトを実行しない場合も代替内容の処理を別途確認する必要があります。
-全機能を有効化しても、準拠したことにはなりません。
+[EPUB 3.3](https://www.w3.org/TR/epub-33/)は書籍形式の要件を、[EPUB Reading Systems 3.3](https://www.w3.org/TR/epub-rs-33/)は閲覧システムの要件を定めています。
+[3.3のテスト表](https://w3c.github.io/epub-tests/epub33/index.html)から、試験のソースと対応する仕様を確認できます。
+自作fixtureの成功、Chromiumが備える機能、閲覧システムとしての公式試験合格は区別します。
 
-[公式テストの案内](https://w3c.github.io/epub-tests/index.html)は調査時点で3.4向けへ移っています。
-3.3の比較には[保存された3.3テスト表](https://w3c.github.io/epub-tests/epub33/index.html)を使います。
-そこから各テストのソースと仕様の対応箇所を辿れます。
-以下の公式IDは、実装と比較するテストを示します。
-本アプリの合格を示すものではありません。
+以下は現在の構成と、まだ確認できていない範囲です。
+自作テストの成功だけを公式試験の合格に数えません。
 
-## 現在の実装と不足
+## 本文の表示
 
-### OCF/ZIP・URL
+### XHTMLとCSS
 
-実装と自作テスト: ZIPの中央ディレクトリを使い、必要なファイルだけ展開。
-相対パス、ルート相対、UTF-8パーセント符号化、ルート外への移動拒否をテスト
+EPUB内のXHTMLを、元の要素構造と相対リソース参照を保ってChromiumへ渡します。
+段落を独自のテキストモデルへ平坦化して表示する方式から変更しています。
+著者CSS、埋込フォント、SVG、日本語の縦書きとルビを、同じ文書のレイアウトとして扱います。
+元ファイルへの書き込みやZIP全体の展開は行いません。
 
-制約と公式テスト: ZIP64、複数パッケージ、圧縮・暗号化の全要件は公式試験未実施。
-`ocf-package_multiple`、`ocf-zip-comp`、`ocf-zip-mult`、`ocf-url_*`
+アプリはページ分割、読者の文字設定、選択と読み上げのハイライトを文書へ適用します。
+これらの指定と著者CSSの組み合わせは、代表書籍と個別の回帰テストで検証します。
+CSS全体への完全な互換性や、すべてのページ分割規則の検証を終えたという意味ではありません。
 
-### Package/manifest/spine
+### フォントと書字方向
 
-実装と自作テスト: EPUB 2/3の主要メタデータ、主spine順、XHTML/SVGの遅延ロード。
-補助文書は通常の読書順へ混ぜずリンク先として登録
+ローカルのCSSと`@font-face`を、書籍ごとのリソースURLから読み込みます。
+文字の形、縦書き字形、ルビ、混在方向のレイアウトはChromiumが処理します。
+フォントと画像の準備後にページ数を返し、文書の変更時にはページ計算のバージョンを更新します。
 
-制約と公式テスト: 外部リソースを含むmanifest、foreign-resource fallbackの連鎖、重複spineのすべての挙動、全メタデータの意味処理は不足。
-`pkg-spine-*`、`pkg-manifest-*`、`pub-foreign_*`
+フォント難読化方式、壊れたフォント、各言語の組版、全フォント形式の公式試験は未完了です。
+OSフォントを選択できることと、書籍の埋込フォントを利用できることも区別します。
 
-### 内部リンク・注記
+### 固定レイアウトと画像
 
-実装と自作テスト: 別章、未ロード章、`linear="no"`、非spine注記へのリンクをcoreでテスト。
-`../`、query付きpath、日本語path/fragment、旧nameアンカー、注記から本文へのリンクも確認。
-noteref/ARIA doc-noterefの意味を保持
+packageとspineのlayout、spread、配置指定、XHTMLのviewport、SVGのviewBoxを読んで表示に渡します。
+固定ページでは著者のページ座標と縦横比を保ち、表示領域に合わせて縮小します。
+通常の文章に含まれる小さな画像を、画像が一枚あることだけで固定ページへ昇格させません。
 
-制約と公式テスト: EPUB CFIや全fragment方式は未対応。
-GUIでのすべての非spine移動と、CSSで隠した注記の扱いは追加検証が必要。
-`pkg-spine-nonlinear-activation`、`pkg-spine-duplicate-item-hyperlink`、`ocf-url_link-*`
+ChromiumはSVGと画像を文書内で描画します。
+外字の行内寸法も著者CSSを参照します。
+アニメーション、全画像形式、orientationやviewportの全構文、複雑な固定ページの網羅試験は未完了です。
+SVG内の文字すべてに、アプリの読み上げ用原文位置があるとは限りません。
 
-### Navigation
+### MathMLと埋込メディア
 
-実装と自作テスト: 階層TOC、NCX、アンカーを読む。
-ネイティブ目次を表示
+MathMLは元の文書に残してChromiumへ渡します。
+全表現とアクセシビリティの公式試験は未完了です。
 
-制約と公式テスト: page-list/landmarksの独立UI、画像だけのnavラベル、非spine対象TOC、nav文書の全表示要件は不足。
-`nav-access`、`nav-activation`、`nav-non-text_img*`、`nav-spine_*`
+EPUB内のaudioとvideoについて、再生形式、操作、ページとの同期を含む対応は保証していません。
+別ファイルのMP3／M4A／M4B／WAVを再生できることは、EPUBの埋込メディア対応の代わりにはなりません。
+SMILによるMedia Overlays、skippability、escapabilityは未実装です。
+アプリ独自のTTSもMedia Overlaysとは別の機能です。
 
-### XHTML/HTML
+## 書籍の読み込みと移動
 
-実装と自作テスト: 段落、見出し、引用、リスト、表、ルビ、リンク、画像などを独自モデルへ変換
+### ZIPとリソース
 
-制約と公式テスト: 完全なHTMLのDOM、要素の意味、フォーム、埋め込み、レイアウトの互換性はない。
-`cnt-xhtml-support`を合格扱いにしない
+ZIPの中央ディレクトリから、必要になった文書やリソースだけ読み込みます。
+各書籍には`vobr://<book-token>/<archive-path>`という別のoriginを割り当てます。
+リソースハンドラーは相対URLを解決し、文書、CSS、フォント、画像を適切なMIME typeで返します。
+書籍の外へ移動するパスは拒否します。
 
-### CSS
+ZIP64、複数パッケージ、圧縮と暗号化の全要件、foreign-resource fallbackの連鎖については、公式試験を完了していません。
+DRMの解除は行いません。
 
-標準スタイルは`assets/default-reader.css`をユーザーエージェント起源のCSSとして読みます。
-通常の著者CSSは、詳細度が低い`*`指定でも標準スタイルより優先します。
-標準のh1は1.4emで後余白0.8em、h2は1.25emで後余白0.65emです。
-h2には太字も指定します。
+### Package、spine、目次
 
-文字サイズはpx、em、rem、%、一般キーワードを扱い、親からの継承を計算してBlock/Atomに保持します。
-組版時には、計算したサイズを一度だけ適用します。
-`margin-block`とそのstart/end指定、物理方向のmarginと省略記法も、書字方向に応じて適用します。
-CSSの変更はページ数キャッシュにも反映します。
-標準CSSはソースに埋め込むため、変更には再ビルドが必要です。
-設定画面にCSSエディターを実装したものではありません。
+EPUB 2／3の主要メタデータとspine順、階層付きNAV目次、NCXを読みます。
+リンクを持たない親見出しも子を保持し、非spine文書への目次リンクは通常の章とは分けて解決します。
+page-listとlandmarksの独立UI、画像だけの目次ラベル、重複spineや全メタデータの意味処理は、追加の検証が必要です。
+書籍が目次に掲載していない章を推測して追加することはありません。
 
-実装と自作テスト: 対応プロパティのカスケード、詳細度、inline、important、インデント、画像寸法、縦書き、強調などの自作テスト
+### 原文の位置とページ数
 
-制約と公式テスト: CSS全般、flex/grid、float、absolute配置、複雑なセレクター、変数、メディアクエリー、各種分割、禁則、ハイフネーションなどを網羅しない。
-`cnt-xhtml-support`、`css-epub-*`
+選択、ブックマーク、検索、辞書、読み上げには、原文のノードとUTF-8バイト位置を共通で使います。
+元DOMのノード対応を確定してから表示用の指定を挿入し、DOM Rangeとの間でUTF-16位置を変換します。
+ルビの読みを選択した場合も、読み上げと辞書では対応する親文字の位置へ戻します。
+対応のない場所に原文位置を作りません。
 
-### フォント
+ページ数と各ページの原文開始位置は、現在のChromiumレイアウトから得ます。
+フォント、余白、画面サイズが変わると再計算し、古い計算結果を混ぜません。
+章の長さや画像の数を重みにした推定値で、正確な全体ページ数を代用しません。
+この計算は旧ネイティブ組版のページ数キャッシュとは別です。
 
-実装と自作テスト: アプリ内フォント、OSのフォント選択、字形・縦書き形の形成と描画
+### 内部リンクと注記
 
-制約と公式テスト: EPUB内の`@font-face`、TrueType/OpenType/WOFF/WOFF2、フォント難読化解除は未対応。
-OSフォントを選べることは埋込フォント対応の代わりにならない。
-`cnt-css-fonts`、`ocf-font_obfuscation*`
+別章、未ロード章、`linear="no"`、非spine文書、相対パスとfragmentを解決します。
+文書のリンクはネイティブ側へ通知し、対象の章と原文位置へ移動します。
+EPUB CFI、全fragment方式、CSSで隠された注記の全挙動は未対応または未検証です。
 
-### 言語・方向
+## スクリプトと安全性
 
-実装と自作テスト: 日本語ルビ、縦書き、縦中横、縦書き字形、左右のページ進行方向を実装・自作検証
+書籍内のJavaScriptは実行しません。
+CSPで`script-src 'none'`、`connect-src 'none'`、`form-action 'none'`を指定し、外部ネットワークリソースの読み込みを制限します。
+ページ分割と位置取得に使うアプリ自身のブリッジは、書籍のスクリプトとは分けて注入します。
+スクリプトを実行しない場合の代替内容、`epubReadingSystem`、originとstorageの全要件は未検証です。
 
-制約と公式テスト: Unicode Bidi、HTML dir/bdi/bdo、アラビア語等の混在方向処理全般、全Unicode組版は未検証。
-`pkg-dir_*`、`pkg-lang_but_not_content`、`pkg-spine-progression_*`
+Chromiumのサンドボックスを有効にした起動構成を使います。
+WindowsはCEF公式の起動プログラム、macOSとLinuxは同梱の子プロセスを使います。
+配布構成、LinuxのOS要件、ライセンスは[Chromiumランタイム](chromium-runtime.md)を参照してください。
+サンドボックスの使用だけで、EPUB全体の安全性監査を終えたとは扱いません。
 
-### 固定レイアウト
+## アクセシビリティと検証範囲
 
-実装と自作テスト: package/spineのlayout/spread/配置、XHTML viewport、SVG viewBoxを読む。
-自作fixtureと単体テストあり
+ネイティブGUIのキー操作とラベル、原文の見出し、alt、ruby、リンクの意味を利用します。
+GPU上の本文面からOSのスクリーンリーダーへ完全なアクセシビリティツリーを渡すこと、ARIAの全意味、EPUB Accessibility 1.1は検証を完了していません。
 
-制約と公式テスト: 任意の固定XHTML/CSSを原著どおり描く完全なエンジンではない。
-orientation指定、すべてのviewport構文・優先順位は網羅試験が必要。
-`fxl-*`、`lay-fxl-*`
-
-### 画像
-
-実装と自作テスト: PNG/JPEG/GIF/WebPと静的SVGの読み込み、インライン外字、縦横比、寸法、先読みを自作テスト
-
-制約と公式テスト: EPUB内data URL画像は現在の通常のimg処理で未対応。
-アニメーション、形式の全公式試験も未実施。
-`pub-cmt-*`、`pub-data-urls_*`
-
-### SVG
-
-実装と自作テスト: resvgで静的SVGを描画。
-外部画像解決とSVG spine、viewBox寸法を実装
-
-制約と公式テスト: SVG DOM、スクリプト、動的挙動、ホストCSSとの全相互作用、すべてのSVG/CSS要件は未検証。
-SVG内アンカーはページ単位。
-`cnt-svg-*`
-
-### MathML
-
-実装と自作テスト: 元のMathMLを数式として保持し、対応する数式をネイティブ描画する自作テスト
-
-制約と公式テスト: 全MathML表現とアクセシビリティは未検証。
-`cnt-mathml-support`の合格宣言はしない
-
-### JavaScript
-
-実装と自作テスト: 本文のscriptを実行しない
-
-制約と公式テスト: DOMイベント、epubReadingSystem、origin/storage、scripted-content fallbackの包括処理は未対応。
-実行しないことだけではfallback要件の確認にならない。
-`scr-support-fallback`、`scr-readingsystem-*`、`scr-support*`
-
-### 埋込メディア
-
-実装と自作テスト: 録音済みのMP3/AAC/ALAC/WAVは別のオーディオブック機能で再生
-
-制約と公式テスト: EPUB内audio/video要素、全core audio形式、動画や字幕との連携は別途未実装。
-`pub-cmt-mp3`、`pub-cmt-mp4`、`pub-cmt-opus`
-
-### Media overlays
-
-実装と自作テスト: アプリのTTSは実音声の境界から本文を強調
-
-制約と公式テスト: EPUBのSMIL、media-overlay属性、録音と本文の同期、skippability/escapabilityは未実装。
-独自TTSはMedia Overlays対応の代わりにならない。
-`mol-*`
-
-### 構造・アクセシビリティ
-
-実装と自作テスト: 一部の見出し、表、alt、ruby、noterefをモデルに保持し、GUIのキー操作とラベルを実装
-
-制約と公式テスト: 本文の完全なアクセシビリティツリー、ARIAの全意味、読み順、スクリーンリーダー、EPUB Accessibility 1.1は未検証。
-準拠とは表明しない
-
-### セキュリティ・ネットワーク
-
-実装と自作テスト: 書籍を変更せず、ZIPルート外や外部protocolを内部リンクとして読まない自作試験あり
-
-制約と公式テスト: 外部リンク同意、remote resource、XML/HTMLフォールバック、originと権限の全要件の監査は未完了。
-`pub-file-urls`、`pub-xml-*`、`pub-external-links*`、`ocf-url_origin`
-
-## 再実行できる自作テスト
-
-次のコマンドで自作テストを実行します。
+coreの読み込みとリンクの自作テストは、次のコマンドで実行します。
 
 ```sh
-cargo test -p reader-core --all-targets --locked
+cargo +1.97.1 test -p reader-core --all-targets --locked
 ```
 
-対象は`tests/documents.rs`、`tests/lazy_epub.rs`です。
-`tests/presentation.rs`と`tests/internal_links.rs`も含みます。
-内部リンクの追加テストは、元ファイルが変わらないことと補助文書が本の通常の章・検索順へ入り込まないことも確認します。
-GUIの画像、組版、見開きは`reader-app`側のテストと実画面確認を併用します。
+Chromiumのブリッジには、ノード位置、文字オフセット、ページ分割、リソース準備の回帰テストがあります。
+配布処理には、SDKの固定、必要ファイル、ライセンス、ハッシュ、Macの署名順を確認するfixtureテストがあります。
+ビルドやfixtureの成功と、実機でのGUI操作、表示速度、音声の確認を分けて記録します。
+未検証のOSやGPUの動作を、別の環境の結果から保証しません。
 
-これらは公式試験の代替ではありません。
-表示エンジンを変更する場合は、公式テスト表の版、テストID、viewport、設定、OS、実際の結果を記録し、未実行を合格へ数えないことを検証の基準にします。
-
-## 実装方針として残る判断
-
-CSS/HTML/SVG全般や埋込フォント、JavaScript、アクセシビリティへの対応には、表示エンジンの検討が必要です。
-現在の独自組版を拡張する案と、Servo等の文書エンジンを組み込む案では、実装量と動作の性質が大きく変わります。
-WebViewを本文に使わないという利用者の条件、エンジンの実現可能性、ライセンス、ページ分割、選択位置や読み上げ位置との対応を確認して決める必要があります。
-この文書は現在の実装を整理したもので、エンジンの変更や完全対応の達成を示すものではありません。
+公式試験を実行する場合は、試験表のバージョン、試験ID、viewport、設定、OS、実際の結果を記録します。
+未実行の項目は未実行のまま扱います。

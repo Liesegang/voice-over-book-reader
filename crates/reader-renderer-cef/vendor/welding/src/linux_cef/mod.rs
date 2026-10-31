@@ -198,10 +198,15 @@ impl LinuxCefProducer {
                 ..Default::default()
             };
             let url: cef::CefString = config.surface.initial_url.as_str().into();
-            // Passing no request context selects CEF's process-global profile.
-            // Build one even for the in-memory case so every producer owns its
-            // cookies, storage, and permission decisions.
-            let mut request_context = crate::profile::create(_runtime, &config.surface)?;
+            // Book resources are registered on CEF's global request context.
+            // Explicit persistent profiles retain independent upstream contexts.
+            let mut request_context = if config.surface.user_data_dir.is_none() {
+                cef::request_context_get_global_context().ok_or_else(|| {
+                    WeldError::SurfaceCreation("global CEF request context unavailable".into())
+                })?
+            } else {
+                crate::profile::create(_runtime, &config.surface)?
+            };
             // A disk-backed child context completes its initialization through
             // the host loop before it can create a browser.
             _runtime.do_message_loop_work();
@@ -285,10 +290,10 @@ impl LinuxCefProducer {
                     } else {
                         cef::PermissionRequestResult::DENY
                     });
-                },
+                }
                 crate::permissions::Pending::Media(callback, requested) => {
                     callback.cont(if granted { requested } else { 0 });
-                },
+                }
             }
             return Ok(());
         }
@@ -360,6 +365,10 @@ impl LinuxCefProducer {
 // needless_return: cfg-dispatch bodies end in `return X;` so the scaffold block can follow.
 #[allow(unreachable_code, unused_variables, clippy::needless_return)]
 impl CefSurfaceProducer for LinuxCefProducer {
+    fn set_repaint_wake(&mut self, wake: Option<crate::surface::RepaintWake>) {
+        self.events.set_wake(wake);
+    }
+
     fn surface_mode(&self) -> CefSurfaceMode {
         CefSurfaceMode::AcceleratedPaint
     }
