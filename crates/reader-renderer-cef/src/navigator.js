@@ -255,7 +255,11 @@
         if(!options.measurement_marker){measurementMarker?.remove();measurementMarker=null;return null;}
         if(!measurementMarker){
             measurementMarker=doc.createElementNS('http://www.w3.org/1999/xhtml','div');measurementMarker.setAttribute('popover','manual');
-            css(measurementMarker,{'position':'fixed','inset':'auto 2px 34px auto','width':'4px','height':'4px','padding':'0','margin':'0','border':'0','border-radius':'0','box-shadow':'none','opacity':'1','pointer-events':'none','transform':'none','filter':'none','mix-blend-mode':'normal','outline':'0'});
+            // Keep a large enough diagnostic marker below 100% UI zoom for a
+            // 3x3 GPU sample, including one-pixel outer viewport rounding.
+            const unit=Math.max(1,1/(doc.defaultView?.devicePixelRatio||1));
+            const [side,right,bottom]=unit>1?[8,0,32]:[4,2,34];
+            css(measurementMarker,{'position':'fixed','inset':`auto ${right*unit}px ${bottom*unit}px auto`,'width':`${side*unit}px`,'height':`${side*unit}px`,'padding':'0','margin':'0','border':'0','border-radius':'0','box-shadow':'none','opacity':'1','pointer-events':'none','transform':'none','filter':'none','mix-blend-mode':'normal','outline':'0'});
             root.append(measurementMarker);
             if(!measurementMarker.showPopover)throw Error('GPU measurement marker requires the Popover API');
             measurementMarker.showPopover();

@@ -153,7 +153,15 @@ jobs:
       - name: Offline-capable unit and fixture tests
         # The default tests never synthesize speech, download neural models,
         # open a GUI, or require an audio device. Native PDF/TTS smokes are ignored.
-        run: cargo +1.97.1 test --workspace --tests --release --locked --target "${{ matrix.target }}"
+        # Native-linked test executables still need the pinned CEF library in
+        # their loader path, even when none of their tests initialize Chromium.
+        run: |
+          case "$RUNNER_OS" in
+            Linux) export LD_LIBRARY_PATH="$CEF_PATH${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" ;;
+            macOS) export DYLD_FRAMEWORK_PATH="$CEF_PATH${DYLD_FRAMEWORK_PATH:+:$DYLD_FRAMEWORK_PATH}" ;;
+            Windows) export PATH="$(cygpath -u "$CEF_PATH"):$PATH" ;;
+          esac
+          cargo +1.97.1 test --workspace --tests --release --locked --target "${{ matrix.target }}"
 
       - name: Release binaries
         run: |

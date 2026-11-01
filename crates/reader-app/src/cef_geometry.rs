@@ -32,7 +32,8 @@ impl std::error::Error for GeometryError {}
 pub(super) struct ViewportGeometry {
     /// The integer DIP size answered by CEF GetViewRect and used by counters.
     pub css: [u32; 2],
-    /// The complete physical surface required by that DIP size at this scale.
+    /// Host surface size that roundtrips to the exact DIP viewport. Actual CEF
+    /// visible frames can differ by one pixel and are fitted using paint_rect.
     pub physical: [u32; 2],
     pub gap_px: u32,
     pub columns: usize,
@@ -48,9 +49,10 @@ fn pixel_budget(points: f32, scale: f32) -> Result<u32, GeometryError> {
 }
 
 fn fitting_axis(budget: u32, scale: f32) -> Result<(u32, u32), GeometryError> {
-    let mut css = (f64::from(budget) / f64::from(scale))
+    let largest = (f64::from(budget) / f64::from(scale))
         .floor()
         .min(f64::from(i32::MAX)) as u32;
+    let mut css = largest;
     while css > 0 {
         let physical = (f64::from(css) * f64::from(scale)).ceil();
         if physical <= f64::from(budget) {
@@ -62,6 +64,23 @@ fn fitting_axis(budget: u32, scale: f32) -> Result<(u32, u32), GeometryError> {
             }
         }
         css -= 1;
+    }
+    // Some valid keyboard zoom factors (notably 0.4) have no solution when
+    // host size is forced to ceil: f64 multiplication retains the f32 scale's
+    // tiny excess, while ViewMetrics divides and rounds in f32. Use a rounded
+    // host size that returns the exact DIP viewport instead. CEF may paint one
+    // more physical pixel; reserve its conservative ceil inside the budget.
+    // paint_rect places the actual visible frame without stretching it.
+    for css in (1..=largest).rev() {
+        let host = (css as f32 * scale).round() as u32;
+        let painted = (f64::from(css) * f64::from(scale)).ceil();
+        if host > 0
+            && host <= budget
+            && (host as f32 / scale).round() as u32 == css
+            && painted <= f64::from(budget)
+        {
+            return Ok((css, host));
+        }
     }
     Err(GeometryError::NoPixelBudget)
 }
@@ -270,6 +289,36 @@ mod tests {
         let a = geometry.pane_rect(available, 0).unwrap();
         let b = geometry.pane_rect(available, 1).unwrap();
         assert!(((b.left() - a.right()) * 1.25 - geometry.gap_px as f32).abs() < 0.001);
+    }
+
+    #[test]
+    fn keyboard_zoom_and_near_integer_scales_preserve_the_viewport_and_pixel_budget() {
+        for scale in [0.4_f32, 1. / 3., 2. / 3., 1.00001] {
+            for columns in [1, 2] {
+                let available = Rect::from_min_size(Pos2::ZERO, vec2(1280. / scale, 760. / scale));
+                let geometry = ViewportGeometry::new(available.size(), columns, 0., scale).unwrap();
+                let visible = geometry
+                    .css
+                    .map(|dip| (f64::from(dip) * f64::from(scale)).ceil() as u32);
+                for (axis, visible_axis) in visible.iter().enumerate() {
+                    assert_eq!(
+                        (geometry.physical[axis] as f32 / scale).round() as u32,
+                        geometry.css[axis],
+                        "the host must answer the exact intended DIP viewport"
+                    );
+                    assert!(*visible_axis <= geometry.physical[axis] + 1);
+                }
+                for slot in 0..columns {
+                    let painted = geometry.paint_rect(available, slot, visible).unwrap();
+                    assert_pixel_aligned(painted, scale);
+                    assert!(painted.left() >= available.left() - 0.001);
+                    assert!(painted.right() <= available.right() + 0.001);
+                    assert!(painted.top() >= available.top() - 0.001);
+                    assert!(painted.bottom() <= available.bottom() + 0.001);
+                    assert!((painted.width() * scale - visible[0] as f32).abs() < 0.001);
+                }
+            }
+        }
     }
 
     #[test]

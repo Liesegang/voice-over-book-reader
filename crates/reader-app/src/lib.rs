@@ -45,7 +45,7 @@ fn parse_diagnostic_viewport(value: &str) -> anyhow::Result<DiagnosticViewport> 
     anyhow::ensure!(
         (820..=4096).contains(&width)
             && (580..=4096).contains(&height)
-            && (0.75..=3.0).contains(&zoom),
+            && (0.25..=3.0).contains(&zoom),
         "Diagnostic viewport dimensions or zoom are outside the test range"
     );
     Ok(DiagnosticViewport {
@@ -157,6 +157,7 @@ mod diagnostic_tests {
                 zoom: 1.25
             }
         );
+        assert_eq!(parse_diagnostic_viewport("1281x761@0.4").unwrap().zoom, 0.4);
         for invalid in [
             "1281x761",
             "0x761@1",

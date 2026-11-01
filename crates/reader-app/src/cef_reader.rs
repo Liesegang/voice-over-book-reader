@@ -710,6 +710,7 @@ impl CefReader {
             .flatten()
             .filter_map(|pane| {
                 let rect = pane.last_rect?;
+                let marker_unit = pane.scale.recip().max(1.);
                 Some(crate::speech_smoke::PaneSample {
                     chapter: pane.chapter,
                     page: pane.page,
@@ -717,7 +718,10 @@ impl CefReader {
                     revision: pane.revision.0,
                     size: pane.size,
                     settled: pane.ready && pane.navigation_idle() && pane.displayed,
-                    marker_xy: [rect.right() - 4., rect.bottom() - 36.],
+                    marker_xy: [
+                        rect.right() - 4. * marker_unit,
+                        rect.bottom() - 36. * marker_unit,
+                    ],
                     marker: [
                         16 + ((pane.page & 7) * 32) as u8,
                         16 + (((pane.page >> 3) & 7) * 32) as u8,

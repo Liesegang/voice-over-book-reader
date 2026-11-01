@@ -848,6 +848,7 @@ fn sample_marker(
     expected: [u8; 3],
     scale: f32,
 ) -> (bool, [u8; 3], usize) {
+    let scale = scale.max(1.);
     let x = (image.width() as f32 - 4. * scale).round() as isize;
     let y = (image.height() as f32 - 36. * scale).round() as isize;
     let mut pixels = Vec::with_capacity(9);
@@ -1261,6 +1262,10 @@ mod tests {
         }
         assert_eq!(
             sample_marker(&image, [32, 64, 128], 1.),
+            (true, [31, 66, 127], 9)
+        );
+        assert_eq!(
+            sample_marker(&image, [32, 64, 128], 0.4),
             (true, [31, 66, 127], 9)
         );
         assert!(!sample_marker(&image, [52, 64, 128], 1.).0);
