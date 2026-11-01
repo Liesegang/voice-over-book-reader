@@ -179,6 +179,7 @@ jobs:
           node --version
           node crates/reader-renderer-cef/navigator.test.mjs
           node --test crates/reader-renderer-cef/tests/page-reply.test.mjs
+          node --test crates/reader-renderer-cef/tests/cef-counter.test.mjs
           node crates/reader-app/src/cef_counter.test.mjs
 
       - name: Packaging fixture tests
@@ -186,6 +187,7 @@ jobs:
           python scripts/ci-test-package.py
           python scripts/test-cef-bundle.py
           python scripts/test-cef-sdk.py
+          python scripts/test-tested-packages.py
 
       - name: Windows installer boundary tests
         if: runner.os == 'Windows'

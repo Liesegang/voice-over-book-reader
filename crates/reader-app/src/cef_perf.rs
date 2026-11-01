@@ -83,6 +83,7 @@ impl Clock {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Phase {
     Initial,
+    WaitBurst,
     WaitCount,
     Baseline,
     OverlayOn,
@@ -148,6 +149,8 @@ pub(crate) struct PerfDriver {
     marker_samples: Vec<Value>,
     count_only: bool,
     during_count: bool,
+    during_count_delay_ms: u64,
+    burst_not_before_ms: f64,
     chapter_turns: bool,
     index_observed_ms: Option<f64>,
     burst_index_pending_at_dispatch: Option<bool>,
@@ -172,6 +175,16 @@ impl PerfDriver {
             .iter()
             .position(|argument| argument == "--perf-output")?;
         let output = PathBuf::from(args.get(at + 1)?);
+        let during_count = args
+            .iter()
+            .any(|argument| argument == "--perf-during-count");
+        let during_count_delay_ms = parse_during_count_delay(
+            std::env::var("VOBR_PERF_DURING_COUNT_DELAY_MS")
+                .ok()
+                .as_deref(),
+            during_count,
+            args.iter().any(|argument| argument == "--data-dir"),
+        );
         Some(Self {
             output,
             requested_backend: if args.iter().any(|argument| argument == "--native-renderer") {
@@ -201,9 +214,9 @@ impl PerfDriver {
             rejected_captures: 0,
             marker_samples: Vec::new(),
             count_only: args.iter().any(|argument| argument == "--perf-count-only"),
-            during_count: args
-                .iter()
-                .any(|argument| argument == "--perf-during-count"),
+            during_count,
+            during_count_delay_ms,
+            burst_not_before_ms: 0.,
             chapter_turns: args
                 .iter()
                 .any(|argument| argument == "--perf-chapter-turns"),
@@ -305,14 +318,20 @@ impl PerfDriver {
                                 self.finish(Some("During-count wheel fixture must start at chapter page zero in single-page mode"));
                                 return next_action(ctx, PerfAction::Close);
                             }
-                            return self.begin_burst(
-                                ctx,
-                                current_chapter,
-                                capture.expected_rgb,
-                                total_pages.is_none(),
-                            );
+                            if self.during_count_delay_ms == 0 {
+                                return self.begin_burst(
+                                    ctx,
+                                    current_chapter,
+                                    capture.expected_rgb,
+                                    total_pages.is_none(),
+                                );
+                            }
+                            self.burst_not_before_ms =
+                                capture.callback_ms + self.during_count_delay_ms as f64;
+                            self.phase = Phase::WaitBurst;
+                        } else {
+                            self.phase = Phase::WaitCount;
                         }
-                        self.phase = Phase::WaitCount;
                     }
                     Phase::Baseline => {
                         // Pagination can replace its status label between the
@@ -355,7 +374,7 @@ impl PerfDriver {
                             }
                         }
                     }
-                    Phase::WaitCount | Phase::Burst | Phase::Finished => {}
+                    Phase::WaitBurst | Phase::WaitCount | Phase::Burst | Phase::Finished => {}
                 }
             }
         }
@@ -369,6 +388,20 @@ impl PerfDriver {
                         current_chapter,
                         current_page,
                     );
+                }
+            }
+            Phase::WaitBurst => {
+                if ready
+                    && self.clock.ms() >= self.burst_not_before_ms
+                    && let Some(marker) = expected_marker
+                {
+                    if current_page != 0 || self.initial_chapter != Some(current_chapter) {
+                        self.finish(Some(
+                            "During-count fixture changed before delayed burst dispatch",
+                        ));
+                        return next_action(ctx, PerfAction::Close);
+                    }
+                    return self.begin_burst(ctx, current_chapter, marker, total_pages.is_none());
                 }
             }
             Phase::WaitCount if self.total_ready_ms.is_some() && ready => {
@@ -478,10 +511,14 @@ impl PerfDriver {
         index_pending: bool,
     ) -> Option<PerfAction> {
         self.phase = Phase::Burst;
-        self.burst_started_ms = Some(self.clock.ms());
+        let dispatched_ms = self.clock.ms();
+        self.burst_started_ms = Some(dispatched_ms);
         self.burst_chapter = chapter;
         self.burst_blue = marker[2];
         self.burst_index_pending_at_dispatch = Some(index_pending);
+        tracing::info!(target:"vobr_perf",phase="cef_perf_burst_begin",chapter,
+            delay_ms=self.during_count_delay_ms,dispatched_ms,
+            first_readback_ms=self.first_frame_ms.unwrap_or(-1.),index_pending=u8::from(index_pending));
         // Arm the readback before enqueue, preserving the standard driver's
         // frame order and its proof that every wheel notch was displayed.
         self.capture_burst(ctx, chapter);
@@ -666,6 +703,7 @@ impl PerfDriver {
             .zip(self.burst_completed_ms)
             .map(|(start, end)| (self.index_observed_ms.unwrap_or(end).min(end) - start).max(0.));
         let rapid_wheel_burst = json!({
+            "delay_ms":self.during_count_delay_ms,
             "input_notches":if self.count_only {0} else {5},
             "enqueued_in_one_input_frame":self.burst_started_ms.is_some(),
             "dispatch_ms":self.burst_started_ms,
@@ -687,13 +725,13 @@ impl PerfDriver {
             "screenshot_cadence":"eframe applies screenshot commands after painting, so requests read a subsequent rendered frame; initial burst request is armed before wheel enqueue. Synthetic actions explicitly wake repaint as real input would",
             "marker_validation":"3x3 marker-center pixels, at least five matches, maximum channel error 8; ordered page fixture uses pages 0 through 5",
             "turn_input":if self.during_count {
-                "Five-notch wheel burst enqueued immediately after first confirmed page-zero GPU readback; no preliminary turns or overlay checks; then wait for the exact complete index"
+                "Five-notch wheel burst enqueued after confirmed page-zero GPU readback and the reported optional delay; no preliminary turns or overlay checks; then wait for the exact complete index"
             } else {
                 "30 sequential native actions followed by a separate five-notch wheel burst enqueued once; screenshot callbacks do not gate burst input dispatch"
             },
             "turn_endpoint":"First confirmed target-page GPU screenshot readback, sampled before host readiness barriers; subsequent turn dispatch still awaits host readiness",
             "overlay_validation":if self.during_count {
-                "Skipped: during-count mode dispatches its burst immediately after initial book pixels"
+                "Skipped: during-count mode dispatches its burst after initial book pixels and the reported optional delay"
             } else {
                 "Independent quality result after six settling frames: hidden baseline is refreshed after pagination; compare uncovered book plus a blank toolbar strip. Overlay hashes never gate turn/burst timing success; visible toolbar may cover marker"
             },
@@ -741,6 +779,17 @@ impl PerfDriver {
         if let Err(error) = result {
             eprintln!("Performance report could not be written: {error}");
         }
+    }
+}
+
+fn parse_during_count_delay(value: Option<&str>, during_count: bool, data_dir: bool) -> u64 {
+    if during_count && data_dir {
+        value
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value <= 1500)
+            .unwrap_or(0)
+    } else {
+        0
     }
 }
 
@@ -917,6 +966,109 @@ mod tests {
                 size: [80, 80],
             })
             .collect();
+    }
+
+    #[test]
+    fn during_count_delay_is_bounded_and_requires_isolated_diagnostics() {
+        for delay in [0, 300, 700, 1100, 1500] {
+            let value = delay.to_string();
+            assert_eq!(parse_during_count_delay(Some(&value), true, true), delay);
+            assert_eq!(parse_during_count_delay(Some(&value), false, true), 0);
+            assert_eq!(parse_during_count_delay(Some(&value), true, false), 0);
+        }
+        for value in [
+            None,
+            Some(""),
+            Some("-1"),
+            Some("1501"),
+            Some("300.0"),
+            Some("NaN"),
+            Some("18446744073709551616"),
+        ] {
+            assert_eq!(parse_during_count_delay(value, true, true), 0);
+        }
+    }
+
+    #[test]
+    fn delayed_burst_preserves_first_readback_and_observes_count_while_waiting() {
+        let scratch = tempfile::tempdir().unwrap();
+        let ctx = egui::Context::default();
+        for delay in [300, 700, 1100] {
+            let output = scratch.path().join(format!("delay-{delay}.json"));
+            let args = vec![
+                "--perf-output".to_owned(),
+                output.display().to_string(),
+                "--perf-during-count".to_owned(),
+            ];
+            let mut driver = PerfDriver::from_args(&args).unwrap();
+            driver.clock = Clock::Local(Instant::now());
+            driver.during_count_delay_ms = delay;
+            first_book_capture(&mut driver);
+            driver
+                .captured
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .callback_ms = 1234.;
+            assert_eq!(
+                driver.tick(&ctx, [80, 80], Some(page_marker(0, 128)), 8, 0, None, true),
+                None
+            );
+            assert!(matches!(driver.phase, Phase::WaitBurst));
+            assert_eq!(driver.first_frame_ms, Some(1234.));
+            assert_eq!(driver.burst_not_before_ms, 1234. + delay as f64);
+            assert!(driver.burst_started_ms.is_none());
+            assert_eq!(
+                driver.tick(
+                    &ctx,
+                    [80, 80],
+                    Some(page_marker(0, 128)),
+                    8,
+                    0,
+                    Some(1000),
+                    true
+                ),
+                None
+            );
+            assert_eq!(
+                driver.total_pages,
+                Some(1000),
+                "exact count remains observable while input is delayed"
+            );
+            assert!(driver.total_ready_ms.is_some());
+            driver.burst_not_before_ms = 0.;
+            assert_eq!(
+                driver.tick(
+                    &ctx,
+                    [80, 80],
+                    Some(page_marker(0, 128)),
+                    8,
+                    0,
+                    Some(1000),
+                    false
+                ),
+                None
+            );
+            assert_eq!(
+                driver.tick(
+                    &ctx,
+                    [80, 80],
+                    Some(page_marker(0, 128)),
+                    8,
+                    0,
+                    Some(1000),
+                    true
+                ),
+                Some(PerfAction::WheelBurst(5))
+            );
+            assert_eq!(driver.first_frame_ms, Some(1234.));
+            assert_eq!(driver.burst_index_pending_at_dispatch, Some(false));
+            driver.finish(Some("diagnostic test"));
+            let report: Value = serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+            assert_eq!(report["first_book_readback_ms"], 1234.);
+            assert_eq!(report["rapid_wheel_burst"]["delay_ms"], delay);
+        }
     }
 
     #[test]

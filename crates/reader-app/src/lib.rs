@@ -3,6 +3,7 @@ mod app;
 mod audiobook_ui;
 mod book_images;
 mod bootstrap;
+mod cef_counter_policy;
 mod cef_geometry;
 mod cef_perf;
 mod cef_resources;

@@ -1,10 +1,11 @@
-function countChapters(items) {
+function countChapters(items, activeLimit=3) {
+    if(!Number.isInteger(activeLimit)||activeLimit<1||activeLimit>3)throw Error('Invalid chapter counter active limit');
     globalThis.__vobrCountResults=[];
     globalThis.__vobrCountErrors=[];
     const pending=[],seen=new Set();
     let active=0,next=0;
     const launch=()=>{
-        while(active<3&&next<pending.length){
+        while(active<activeLimit&&next<pending.length){
         // A fixed-layout spine item is one source page even when the reader
         // displays it beside another item. Do not fetch/rasterize its artwork
         // just to rediscover the publisher's declared page count.

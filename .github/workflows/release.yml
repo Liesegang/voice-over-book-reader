@@ -15,53 +15,98 @@ jobs:
   validate-tag:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.tag.outputs.commit }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Match the tag, workspace, and locked application version
+        id: tag
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           python - <<'PY'
-          import os, pathlib, re, tomllib
+          import os, pathlib, re, subprocess, tomllib
           tag = os.environ['RELEASE_TAG']
           version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['workspace']['package']['version']
           assert re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+', tag), 'Use a stable vMAJOR.MINOR.PATCH tag'
           assert tag == f'v{version}', 'Tag and workspace version differ'
           locked = tomllib.loads(pathlib.Path('Cargo.lock').read_text())['package']
           assert next(p['version'] for p in locked if p['name'] == 'voice-over-book-reader') == version
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'commit={commit}\n')
           print(f'Validated release tag {tag}')
           PY
+
+  tested-packages:
+    needs: validate-tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      run_id: ${{ steps.packages.outputs.run_id }}
+      artifact_ids: ${{ steps.packages.outputs.artifact_ids }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Find complete successful CI packages for this commit
+        id: packages
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.validate-tag.outputs.commit }}
+        run: python scripts/find-tested-packages.py --commit "$RELEASE_COMMIT"
 
   # Reuse exactly the normal four-target tests, release builds, ZIP licensing,
   # x86 VOICEROID2 helper build, and verified Windows Inno compiler/installer.
   # No models, installed proprietary voices, or proprietary speech-engine DLLs
   # are distributed. The book's pinned CEF runtime is bundled.
   native-packages:
-    needs: validate-tag
+    needs: [validate-tag, tested-packages]
+    if: ${{ needs.tested-packages.outputs.run_id == '' }}
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
 
   publish:
-    needs: [validate-tag, native-packages]
+    needs: [validate-tag, tested-packages, native-packages]
+    if: ${{ always() && !cancelled() && needs.validate-tag.result == 'success' && needs.tested-packages.result == 'success' && (needs.native-packages.result == 'success' || needs.native-packages.result == 'skipped') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
       contents: write
+      actions: read
     env:
       RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_COMMIT: ${{ needs.validate-tag.outputs.commit }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+      - name: Download the tested immutable CI packages
+        if: ${{ needs.tested-packages.outputs.run_id != '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.tested-packages.outputs.artifact_ids }}
+          run-id: ${{ needs.tested-packages.outputs.run_id }}
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: release-assets
+          merge-multiple: true
+          digest-mismatch: error
+      - name: Download newly built packages
+        if: ${{ needs.tested-packages.outputs.run_id == '' }}
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: voice-over-book-reader-*
           path: release-assets
           merge-multiple: true
+          digest-mismatch: error
 
       - name: Verify all ten assets before creating a release
         run: |
@@ -94,6 +139,7 @@ jobs:
                   assert not any(n.lower().endswith('.dll') and n.removeprefix(prefix) not in runtime_files for n in names), 'Unexpected inference DLL'
                   metadata = json.loads(archive.read(prefix + 'BUILD.json'))
                   assert (metadata['application'], metadata['version'], metadata['target']) == ('voice-over-book-reader', version, target)
+                  assert metadata['commit'] == os.environ['RELEASE_COMMIT'], 'Package commit differs from the validated release tag'
                   assert metadata['book_engine']['type'] == 'chromium-cef'
                   for required in ('README.md', 'README.ja.md', 'SPEECH.md', 'EPUB-SUPPORT.md', 'THIRD-PARTY-NOTICES.txt',
                                    'LICENSE-AUDIT.md', 'LICENSE-AUDIT-AIVIS-VOICEVOX.md', 'LICENSE-AUDIT-KOKORO.md',

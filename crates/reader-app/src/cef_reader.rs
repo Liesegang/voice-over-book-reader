@@ -1,5 +1,6 @@
 //! Chromium draws book content into the same GPU device as the native controls.
 use super::*;
+use crate::cef_counter_policy::CounterPolicy;
 use crate::cef_geometry::{ViewportGeometry, crop_uv, view_point};
 use crate::cef_resources::BookOrigin;
 use anyhow::{Context, Result};
@@ -22,7 +23,9 @@ pub(super) struct CefReader {
     retiring: Vec<GpuBookSurface<'static>>,
     expected_panes: usize,
     auxiliary: Option<Pane>,
-    counter: Option<Counter>,
+    counters: Vec<Counter>,
+    counter_cursor: usize,
+    counter_policy: CounterPolicy,
     count_plan: Option<Receiver<Result<CountPlanMessage, String>>>,
     count_plan_started: bool,
     count_plan_finished: bool,
@@ -47,6 +50,25 @@ struct Counter {
     enqueuing: bool,
     polling: bool,
     next_poll: Instant,
+    in_flight: std::collections::BTreeSet<usize>,
+}
+
+fn take_count_batch(
+    pending: &mut std::collections::VecDeque<CountItem>,
+    counted: &[Option<Vec<Option<Locator>>>],
+    assigned: &mut std::collections::BTreeSet<usize>,
+    capacity: usize,
+) -> Vec<CountItem> {
+    let mut batch = Vec::new();
+    while batch.len() < capacity {
+        let Some(item) = pending.pop_front() else {
+            break;
+        };
+        if counted.get(item.chapter).is_some_and(Option::is_none) && assigned.insert(item.chapter) {
+            batch.push(item);
+        }
+    }
+    batch
 }
 enum CountPlanMessage {
     Item(Box<CountItem>),
@@ -613,6 +635,15 @@ fn auxiliary_regions(ui: &mut Ui) -> (Rect, egui::Response, Ui) {
 
 impl CefReader {
     pub(super) fn new(render: eframe::egui_wgpu::RenderState) -> Self {
+        let args: Vec<_> = std::env::args().collect();
+        let counter_policy = CounterPolicy::choose(
+            std::thread::available_parallelism()
+                .ok()
+                .map(|cpus| cpus.get()),
+            std::env::var("VOBR_DIAGNOSTIC_COUNTERS").ok().as_deref(),
+            args.iter().any(|arg| arg == "--data-dir"),
+            args.iter().any(|arg| arg == "--perf-output"),
+        );
         Self {
             render,
             runtime: None,
@@ -627,7 +658,9 @@ impl CefReader {
             retiring: Vec::new(),
             expected_panes: 1,
             auxiliary: None,
-            counter: None,
+            counters: Vec::new(),
+            counter_cursor: 0,
+            counter_policy,
             counted: Vec::new(),
             compatibility_stamp: None,
             count_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -707,10 +740,11 @@ impl CefReader {
         }
     }
     fn retire_counter(&mut self) {
-        if let Some(mut counter) = self.counter.take() {
+        for mut counter in self.counters.drain(..) {
             let _ = counter.surface.close();
             self.retiring.push(counter.surface);
         }
+        self.counter_cursor = 0;
     }
     fn poll_retiring(&mut self) {
         for index in (0..self.retiring.len()).rev() {
@@ -1241,7 +1275,7 @@ impl CefReader {
     fn configure(&mut self, app: &ReaderApp, extent: egui::Vec2, scale: f32, p: Palette) {
         self.display_scale = scale;
         let key = format!(
-            "chromium-layout-6:{}:{}:{:?}:{}:{}:{}:{:?}",
+            "chromium-layout-7:{}:{}:{:?}:{}:{}:{}:{:?}",
             reader_core::default_reader_css_revision(),
             self.book_key,
             extent,
@@ -1406,7 +1440,25 @@ impl CefReader {
                 }
             }
         }
-        if self.counter.is_none() && !self.count_pending.is_empty() {
+        let admission_allowed = !self.turn_pending && self.panes_ready();
+        let policy = self.counter_policy;
+        let counted = &self.counted;
+        self.count_pending
+            .retain(|item| counted[item.chapter].is_none());
+        let in_flight = self
+            .counters
+            .iter()
+            .map(|counter| counter.in_flight.len())
+            .sum();
+        let needed = policy.needed(self.count_pending.len(), in_flight);
+        // Start the first worker normally, then wait until it has admitted DOM
+        // work before adding another browser to the native startup path.
+        let can_create = self.counters.is_empty()
+            || self
+                .counters
+                .first()
+                .is_some_and(|first| policy.can_start_second(first.ready, first.in_flight.len()));
+        if admission_allowed && self.counters.len() < needed && can_create {
             let mut surface = GpuBookSurface::new(
                 self.runtime.as_ref().unwrap(),
                 self.render.device.clone(),
@@ -1414,29 +1466,39 @@ impl CefReader {
                 SurfaceOptions {
                     initial_url: self.counter_url.clone(),
                     physical_size: [2, 2],
-                    scale_factor: 1.,
+                    // Counter iframes must inherit the visible pane's density
+                    // for resolution media queries and responsive image sources.
+                    scale_factor: self.display_scale,
                     background: [250, 248, 242],
                     profile: None,
                 },
             )?;
             let ctx = app.worker_context.clone();
             surface.set_repaint_wake(Some(Arc::new(move || ctx.request_repaint())));
-            self.counter = Some(Counter {
+            let slot = self.counters.len();
+            self.counters.push(Counter {
                 surface,
                 started: false,
                 ready: false,
                 enqueuing: false,
                 polling: false,
                 next_poll: Instant::now(),
+                in_flight: Default::default(),
             });
+            tracing::info!(target:"vobr_perf",phase="chromium_counter_created",slot,
+                pool_limit=policy.surfaces,capacity=policy.capacity);
         }
-        if let Some(counter) = self.counter.as_mut() {
+        for counter in &mut self.counters {
             counter.surface.poll()?;
             while let Some(event) = counter.surface.event() {
                 match event {
                     SurfaceEvent::DocumentLoaded { .. } if !counter.started => {
                         counter.surface.install_navigator()?;
-                        let script = format!("({})([])", include_str!("cef_counter.js"));
+                        let script = format!(
+                            "({})([],{})",
+                            include_str!("cef_counter.js"),
+                            policy.capacity
+                        );
                         counter.surface.request_script_result(7000, &script)?;
                         counter.started = true;
                     }
@@ -1465,7 +1527,12 @@ impl CefReader {
                                     as usize;
                                 let starts: Vec<Option<SourceLocator>> =
                                     serde_json::from_value(result["starts"].clone())?;
-                                if chapter < self.counted.len() {
+                                anyhow::ensure!(
+                                    chapter < self.counted.len()
+                                        && counter.in_flight.remove(&chapter),
+                                    "Unexpected counted chapter"
+                                );
+                                if self.counted[chapter].is_none() {
                                     self.counted[chapter] = Some(
                                         starts.into_iter().map(|p| p.map(from_source)).collect(),
                                     );
@@ -1477,30 +1544,42 @@ impl CefReader {
                     _ => {}
                 }
             }
-            if counter.ready && !counter.enqueuing && !self.count_pending.is_empty() {
-                let mut batch = Vec::new();
-                while batch.len() < 3 {
-                    let Some(item) = self.count_pending.pop_front() else {
-                        break;
-                    };
-                    if self.counted[item.chapter].is_none() {
-                        batch.push(item);
-                    }
-                }
-                if !batch.is_empty() {
-                    let serialized = serde_json::to_string(&batch)?;
-                    counter.surface.request_script_result(
-                        7002,
-                        &format!("globalThis.__vobrEnqueueCountItems({serialized})"),
-                    )?;
-                    counter.enqueuing = true;
-                }
-            }
             if counter.ready && !counter.polling && Instant::now() >= counter.next_poll {
                 counter.surface.request_script_result(7001,"({results:globalThis.__vobrCountResults?.splice(0)??[],errors:globalThis.__vobrCountErrors??[]})")?;
                 counter.polling = true;
                 counter.next_poll = Instant::now() + Duration::from_millis(8);
             }
+        }
+        if admission_allowed && !self.counters.is_empty() {
+            let pool_len = self.counters.len();
+            let first = self.counter_cursor % pool_len;
+            let mut assigned: std::collections::BTreeSet<_> = self
+                .counters
+                .iter()
+                .flat_map(|counter| counter.in_flight.iter().copied())
+                .collect();
+            for offset in 0..pool_len {
+                let counter = &mut self.counters[(first + offset) % pool_len];
+                if !counter.ready || counter.enqueuing {
+                    continue;
+                }
+                let slots = policy.capacity.saturating_sub(counter.in_flight.len());
+                let batch =
+                    take_count_batch(&mut self.count_pending, &self.counted, &mut assigned, slots);
+                if batch.is_empty() {
+                    continue;
+                }
+                let serialized = serde_json::to_string(&batch)?;
+                counter.surface.request_script_result(
+                    7002,
+                    &format!("globalThis.__vobrEnqueueCountItems({serialized})"),
+                )?;
+                counter
+                    .in_flight
+                    .extend(batch.iter().map(|item| item.chapter));
+                counter.enqueuing = true;
+            }
+            self.counter_cursor = (first + 1) % pool_len;
         }
         if self.count_plan_finished && self.counted.iter().all(Option::is_some) {
             self.retire_counter();
@@ -2750,7 +2829,7 @@ mod auxiliary_tests {
         CompatibilityLayoutStamp, CountItem, CountPlanMessage, LocationFlight, Locator, PageFlight,
         PositionAck, PrewarmAction, Revision, WarmPaneState, auxiliary_regions,
         compatibility_layout, confirmed_page, discover_count_items, next_document_revision,
-        options, pane_target, prewarm_action, refresh_compatibility_layout,
+        options, pane_target, prewarm_action, refresh_compatibility_layout, take_count_batch,
     };
     use eframe::egui::{self, Id, Pos2, Rect, TextStyle, vec2};
 
@@ -2866,6 +2945,30 @@ mod auxiliary_tests {
             options: reader_renderer_cef::LayoutOptions::default(),
             known_starts: None,
         }
+    }
+
+    #[test]
+    fn counter_batches_bound_each_surface_and_never_assign_a_chapter_twice() {
+        use std::collections::{BTreeSet, VecDeque};
+        let counted = vec![Some(vec![None]), None, None, None, None, None];
+        let mut pending: VecDeque<_> = [0, 1, 1, 2, 3, 4, 5].into_iter().map(count_item).collect();
+        let mut assigned = BTreeSet::from([2]);
+        let first = take_count_batch(&mut pending, &counted, &mut assigned, 2);
+        assert_eq!(
+            first.iter().map(|item| item.chapter).collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        let second = take_count_batch(&mut pending, &counted, &mut assigned, 2);
+        assert_eq!(
+            second.iter().map(|item| item.chapter).collect::<Vec<_>>(),
+            vec![4, 5]
+        );
+        assert_eq!(assigned, BTreeSet::from([1, 2, 3, 4, 5]));
+        assert!(pending.is_empty());
+        assert!(take_count_batch(&mut pending, &counted, &mut assigned, 2).is_empty());
+        pending.push_back(count_item(1));
+        assert!(take_count_batch(&mut pending, &counted, &mut assigned, 0).is_empty());
+        assert_eq!(pending.len(), 1, "no capacity cannot consume pending work");
     }
 
     #[test]
